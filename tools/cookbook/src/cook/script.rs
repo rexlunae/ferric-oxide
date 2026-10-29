@@ -123,11 +123,22 @@ pub(crate) static BUILD_PRESCRIPT: &str = r#"
 # Add cookbook bins to path
 export PATH="${COOKBOOK_ROOT}/bin:${PATH}"
 
-# Add toolchain dir to path if exists
+# Add toolchain dir to path if exists.
+#
+# With build.build_tools = "guest" that directory holds Redox binaries, which
+# the host cannot run, so it is not put on PATH. Instead each of them gets a
+# shim of the same name in a directory that is, and the shim runs the real tool
+# in the guest build environment. A recipe keeps calling the tool by name.
 if [ ! -z "${COOKBOOK_TOOLCHAIN}" ]
 then
+if [ -n "${COOKBOOK_GUEST_TOOLS}" ]
+then
+export PATH="${COOKBOOK_GUEST_TOOLS_SHIMS}:${PATH}"
+export LD_LIBRARY_PATH="${COOKBOOK_SYSROOT}/lib:${LD_LIBRARY_PATH}"
+else
 export PATH="${COOKBOOK_TOOLCHAIN}/bin:${PATH}"
 export LD_LIBRARY_PATH="${COOKBOOK_TOOLCHAIN}/lib:${LD_LIBRARY_PATH}"
+fi
 fi
 
 # This puts cargo build artifacts in the build directory

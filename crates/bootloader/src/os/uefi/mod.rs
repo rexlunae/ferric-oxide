@@ -47,8 +47,16 @@ pub(crate) fn alloc_zeroed_page_aligned(size: usize) -> *mut u8 {
     let pages = size.div_ceil(page_size);
 
     let ptr = {
-        // Max address mapped by src/arch paging code (8 GiB)
-        let mut ptr = 0x2_0000_0000;
+        // The same bound the paging code maps, so what this returns is always
+        // addressable. A live disk larger than it cannot be loaded.
+        //
+        // `AllocatePages` takes the address through `&mut usize`, while the
+        // bound is a `u64` because the paging code shares it. The conversion is
+        // explicit for that reason: left to inference the literal stays a `u64`
+        // and the firmware call does not type-check. `ALLOCATION_LIMIT` is what
+        // this architecture actually maps, not the arch-neutral maximum.
+        let mut ptr = usize::try_from(crate::ALLOCATION_LIMIT)
+            .expect("ALLOCATION_LIMIT fits this target's usize");
         status_to_result((std::system_table().BootServices.AllocatePages)(
             1,                                  // AllocateMaxAddress
             MemoryType::EfiRuntimeServicesData, // Keeps this memory out of free space list

@@ -28,6 +28,8 @@ Using redox_installer as an installer:
     --size                Exact image size in MiB; fail before writing if the packages do not fit
                           (without it the image grows past filesystem_size to fit them)
     --config-name         Name of the filesystem configuration used for os-release VARIANT
+    --build-tools-list    File naming the recipes the image builds with, one per line;
+                          installed alongside the packages when general.build_tools is set
     --fox                 Host fox binary to finish the image root with: sync a
                           package set and write the image SBOM
     --fox-packages        With --fox: fox package set to sync into the image
@@ -156,7 +158,8 @@ fn main() {
         .add_flag(&["filesystem-size"])
         .add_flag(&["l", "list-packages"])
         .add_flag(&["live"])
-        .add_flag(&["no-mount"]);
+        .add_flag(&["no-mount"])
+        .add_opt("", "build-tools-list");
     parser.parse(env::args());
 
     let skip_partition = parser.found("skip-partition");
@@ -252,6 +255,21 @@ fn main() {
         }
         if parser.found("no-mount") {
             config.general.no_mount = Some(true);
+        }
+        // The build tools are listed by `repo build-tools-list`, in a file the
+        // build generates; passing the path keeps the installer from having to
+        // read recipes. Only a configuration that asks for build tools
+        // (`general.build_tools`) installs any.
+        if let Some(list) = parser.get_opt("build-tools-list") {
+            match config.general.build_tools.as_mut() {
+                Some(build_tools) => build_tools.list = Some(list),
+                None => {
+                    eprintln!(
+                        "installer: --build-tools-list needs general.build_tools in the configuration"
+                    );
+                    process::exit(1);
+                }
+            }
         }
         let write_bootloader = parser.get_opt("write-bootloader");
         if write_bootloader.is_some() {

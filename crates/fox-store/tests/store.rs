@@ -588,3 +588,272 @@ fn failed_removal_is_recorded_and_can_be_finished() {
     env.install(&path, false).unwrap();
     assert_eq!(env.store.list().unwrap()[0].state, PackageState::Installed);
 }
+
+/// A package that installs an info page and its own copy of the shared
+/// generated index, whose contents differ per package.
+fn info_package(env: &Env, name: &str, version: &str, page: &str, index: &str) -> PathBuf {
+    env.package(
+        name,
+        version,
+        &[],
+        &[
+            FixtureEntry::file(
+                &format!("usr/share/info/{page}.info"),
+                page.as_bytes(),
+                0o644,
+            ),
+            FixtureEntry::file("usr/share/info/dir", index.as_bytes(), 0o644),
+        ],
+    )
+}
+
+/// The files the database records for an installed package.
+fn recorded(env: &Env, package: &str) -> Vec<String> {
+    let mut paths: Vec<String> = env
+        .store
+        .get(&name(package))
+        .unwrap()
+        .expect("installed")
+        .files
+        .into_iter()
+        .map(|file| file.path)
+        .collect();
+    paths.sort();
+    paths
+}
+
+#[test]
+fn the_infos_index_owner_keeps_it_and_a_later_package_skips_it() {
+    let env = Env::new();
+    let first = info_package(&env, "bash", "1", "bash", "bash index\n");
+    let second = info_package(&env, "sed", "1", "sed", "sed index\n");
+
+    let report = env.install(&first, false).unwrap();
+    // The info page, the index and the manifest.
+    assert_eq!(report.installed, 3);
+    let report = env.install(&second, false).unwrap();
+    // The skipped index is not counted as installed.
+    assert_eq!(report.installed, 2);
+    assert_eq!(
+        recorded(&env, "bash"),
+        [
+            "usr/share/fox/manifest/bash.toml",
+            "usr/share/info/bash.info",
+            "usr/share/info/dir",
+        ]
+    );
+    assert!(!recorded(&env, "sed").contains(&"usr/share/info/dir".to_owned()));
+    assert_eq!(
+        fs::read(env.root().join("usr/share/info/dir")).unwrap(),
+        b"bash index\n"
+    );
+
+    // Both packages verify straight after the install, even though the
+    // second one's signed index is not the one on disk.
+    for package in ["bash", "sed"] {
+        let verify = env
+            .store
+            .verify(&name(package), &env.key.trusted())
+            .unwrap();
+        assert!(
+            verify.problems.is_empty(),
+            "{package}: {:?}",
+            verify.problems
+        );
+    }
+    assert_eq!(
+        env.store
+            .verify(&name("bash"), &env.key.trusted())
+            .unwrap()
+            .checked,
+        3
+    );
+    assert_eq!(
+        env.store
+            .verify(&name("sed"), &env.key.trusted())
+            .unwrap()
+            .checked,
+        2
+    );
+
+    // Removing the package that did not install the index leaves it alone.
+    env.store.remove(&name("sed"), false).unwrap();
+    assert!(env.root().join("usr/share/info/dir").exists());
+    env.store.remove(&name("bash"), false).unwrap();
+    assert!(!env.root().join("usr/share/info/dir").exists());
+}
+
+#[test]
+fn reinstalling_the_index_owner_keeps_ownership() {
+    let env = Env::new();
+    let v1 = info_package(&env, "bash", "1", "bash", "bash v1\n");
+    env.install(&v1, false).unwrap();
+
+    // Reinstalling the same archive keeps the index in the record, and the
+    // file on disk, so the removal still finds it.
+    env.install(&v1, false).unwrap();
+    assert!(recorded(&env, "bash").contains(&"usr/share/info/dir".to_owned()));
+    env.store.remove(&name("bash"), false).unwrap();
+    assert!(!env.root().join("usr/share/info/dir").exists());
+
+    // An upgrade of the owner replaces the index with the version the new
+    // archive carries, and still records it.
+    let v1 = info_package(&env, "bash", "1", "bash", "bash v1\n");
+    env.install(&v1, false).unwrap();
+    let v2 = info_package(&env, "bash", "2", "bash", "bash v2\n");
+    let report = env.install(&v2, false).unwrap();
+    assert_eq!(report.previous.as_deref(), Some("1"));
+    assert_eq!(report.removed, 0);
+    assert_eq!(
+        fs::read(env.root().join("usr/share/info/dir")).unwrap(),
+        b"bash v2\n"
+    );
+    assert!(recorded(&env, "bash").contains(&"usr/share/info/dir".to_owned()));
+    let verify = env.store.verify(&name("bash"), &env.key.trusted()).unwrap();
+    assert!(verify.problems.is_empty(), "{:?}", verify.problems);
+    env.store.remove(&name("bash"), false).unwrap();
+    assert!(!env.root().join("usr/share/info/dir").exists());
+}
+
+#[test]
+fn an_owner_that_drops_its_index_drops_the_stale_file() {
+    let env = Env::new();
+    let with = info_package(&env, "bash", "1", "bash", "bash index\n");
+    env.install(&with, false).unwrap();
+    // Version 2 no longer carries the index at all.
+    let without = env.package(
+        "bash",
+        "2",
+        &[],
+        &[FixtureEntry::file(
+            "usr/share/info/bash.info",
+            b"bash",
+            0o644,
+        )],
+    );
+    // The file the previous version owned and this one does not carry any
+    // more is dropped with the rest of the stale files, so nobody records it
+    // and nobody keeps it.
+    let report = env.install(&without, false).unwrap();
+    assert_eq!(report.removed, 1);
+    assert!(!recorded(&env, "bash").contains(&"usr/share/info/dir".to_owned()));
+    assert!(!env.root().join("usr/share/info/dir").exists());
+}
+
+#[test]
+fn an_unowned_index_with_other_content_needs_force() {
+    let env = Env::new();
+    let path = info_package(&env, "bash", "1", "bash", "bash index\n");
+    fs::create_dir_all(env.root().join("usr/share/info")).unwrap();
+    fs::write(env.root().join("usr/share/info/dir"), b"someone else\n").unwrap();
+
+    assert!(matches!(
+        env.install(&path, false).unwrap_err(),
+        StoreError::UnownedFile { .. }
+    ));
+    assert_eq!(
+        fs::read(env.root().join("usr/share/info/dir")).unwrap(),
+        b"someone else\n"
+    );
+
+    // With --force the file is replaced and becomes this package's, so the
+    // removal takes it too.
+    env.install(&path, true).unwrap();
+    assert_eq!(
+        fs::read(env.root().join("usr/share/info/dir")).unwrap(),
+        b"bash index\n"
+    );
+    assert!(recorded(&env, "bash").contains(&"usr/share/info/dir".to_owned()));
+    let verify = env.store.verify(&name("bash"), &env.key.trusted()).unwrap();
+    assert!(verify.problems.is_empty(), "{:?}", verify.problems);
+    env.store.remove(&name("bash"), false).unwrap();
+    assert!(!env.root().join("usr/share/info/dir").exists());
+}
+
+#[test]
+fn an_unowned_index_with_the_same_content_is_taken_over() {
+    let env = Env::new();
+    let path = info_package(&env, "bash", "1", "bash", "same index\n");
+    fs::create_dir_all(env.root().join("usr/share/info")).unwrap();
+    fs::write(env.root().join("usr/share/info/dir"), b"same index\n").unwrap();
+
+    env.install(&path, false).unwrap();
+    assert!(recorded(&env, "bash").contains(&"usr/share/info/dir".to_owned()));
+    env.store.remove(&name("bash"), false).unwrap();
+    assert!(!env.root().join("usr/share/info/dir").exists());
+}
+
+#[test]
+fn a_symlinked_index_is_never_written_through() {
+    let env = Env::new();
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("dir");
+    fs::write(&victim, b"outside\n").unwrap();
+    fs::create_dir_all(env.root().join("usr/share/info")).unwrap();
+    symlink(&victim, env.root().join("usr/share/info/dir")).unwrap();
+
+    let path = info_package(&env, "bash", "1", "bash", "bash index\n");
+    for force in [false, true] {
+        assert!(matches!(
+            env.install(&path, force).unwrap_err(),
+            StoreError::IndexIsSymlink { .. }
+        ));
+    }
+    assert_eq!(fs::read(&victim).unwrap(), b"outside\n");
+
+    // A dangling symlink is refused the same way, so the install cannot
+    // follow it out of the root either.
+    fs::remove_file(env.root().join("usr/share/info/dir")).unwrap();
+    symlink(
+        outside.path().join("missing"),
+        env.root().join("usr/share/info/dir"),
+    )
+    .unwrap();
+    assert!(matches!(
+        env.install(&path, true).unwrap_err(),
+        StoreError::IndexIsSymlink { .. }
+    ));
+    assert!(!outside.path().join("missing").exists());
+    assert!(env.store.list().unwrap().is_empty());
+}
+
+#[test]
+fn skipping_the_index_leaves_the_owners_mode_alone() {
+    let env = Env::new();
+    let owner = env.package(
+        "bash",
+        "1",
+        &[],
+        &[
+            FixtureEntry::file("usr/share/info/bash.info", b"bash", 0o644),
+            FixtureEntry::file("usr/share/info/dir", b"bash index\n", 0o644),
+        ],
+    );
+    env.install(&owner, false).unwrap();
+    let index = env.root().join("usr/share/info/dir");
+    assert_eq!(
+        fs::metadata(&index).unwrap().permissions().mode() & 0o7777,
+        0o644
+    );
+
+    // A second package signs the same path executable; the index it does
+    // not own keeps its owner's mode, and the owner still verifies.
+    let other = env.package(
+        "sed",
+        "1",
+        &[],
+        &[
+            FixtureEntry::file("usr/share/info/sed.info", b"sed", 0o644),
+            FixtureEntry::file("usr/share/info/dir", b"sed index\n", 0o755),
+        ],
+    );
+    env.install(&other, false).unwrap();
+    assert_eq!(
+        fs::metadata(&index).unwrap().permissions().mode() & 0o7777,
+        0o644
+    );
+    let verify = env.store.verify(&name("bash"), &env.key.trusted()).unwrap();
+    assert!(verify.problems.is_empty(), "{:?}", verify.problems);
+    let verify = env.store.verify(&name("sed"), &env.key.trusted()).unwrap();
+    assert!(verify.problems.is_empty(), "{:?}", verify.problems);
+}

@@ -33,6 +33,27 @@ mod serial_16550;
 const KIBI: usize = 1024;
 const MIBI: usize = KIBI * KIBI;
 
+/// The highest physical address the bootloader addresses.
+///
+/// The paging code identity maps this much memory and the allocator will not
+/// place a buffer above it, so both use this one number. The bootloader loads
+/// the whole disk image below the bound, which means an image larger than it
+/// cannot boot: it has to stay above the largest live disk with room for the
+/// firmware, the kernel and the tables built while loading.
+pub(crate) const MAX_PHYSICAL_ADDRESS: u64 = 0x4_0000_0000;
+
+/// The same bound, but never above what this architecture identity-maps.
+///
+/// The page tables are built before the kernel runs and only cover
+/// [`MAX_PHYSICAL_ADDRESS`] on x86_64. aarch64 and the RISC-V maps still cover
+/// 8 GiB, so a buffer allocated above that would be unmapped when the kernel
+/// takes over and entry would fault. Ask for the smaller of the two instead of
+/// growing three page-table builders that only a real boot can check.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub(crate) const ALLOCATION_LIMIT: u64 = 0x2_0000_0000;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+pub(crate) const ALLOCATION_LIMIT: u64 = MAX_PHYSICAL_ADDRESS;
+
 //TODO: allocate this in a more reasonable manner
 static mut AREAS: [OsMemoryEntry; 1024] = [OsMemoryEntry {
     base: 0,

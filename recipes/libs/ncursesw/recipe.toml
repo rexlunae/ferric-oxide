@@ -24,6 +24,9 @@ then
     COOKBOOK_CONFIGURE_FLAGS+=(--with-shared)
 fi
 cookbook_configure
+
+# See ../ncurses: coreutils owns clear and reset.
+rm -fv "${COOKBOOK_STAGE}/usr/bin/clear" "${COOKBOOK_STAGE}/usr/bin/reset"
 """
 
 [package]

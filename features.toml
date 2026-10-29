@@ -1833,6 +1833,65 @@ default = false
 make_var = "REPO_NONSTOP"
 help = "Try to build every package even when some fail. Sets REPO_NONSTOP."
 
+[[option]]
+id = "build.build_tools"
+menu = "build"
+type = "choice"
+title = "Where build tools are built"
+default = "host"
+defaults = [{ when = "host.arch == target.arch", value = "guest" }]
+choices = ["host", "guest"]
+make_var = "FERRIC_BUILD_TOOLS"
+rebuild = ["*"]
+help = """
+Build tools that a recipe needs at compile time but that should not stay in the
+image (its `build.dev-dependencies`, the "host:" recipes) are themselves built
+for the target and run inside a guest, so the host does not need them and the
+build exercises them.
+
+guest boots one guest build environment for the whole image build and reuses
+it, as long as the guest architecture matches the host's. Building the tools
+for a different architecture than the host would need those tools to run under
+emulation inside the guest, so cross-compiled images (host.arch != target.arch)
+always use host and the build warns about it.
+
+host keeps the inherited behaviour: the tools are compiled for, and run on,
+the host. Sets FERRIC_BUILD_TOOLS."""
+
+[[option]]
+id = "build.keep_build_tools"
+menu = "build"
+type = "bool"
+title = "Keep build tools in the image"
+default = false
+selects = ["build.guest_env"]
+make_var = "FERRIC_KEEP_BUILD_TOOLS"
+rebuild = ["*"]
+help = """
+Ship the guest's build tools in the finished image as the `build-tools`
+meta-package, instead of keeping them in a scratch environment that is thrown
+away. Only meaningful with build.build_tools = "guest". Sets
+FERRIC_KEEP_BUILD_TOOLS."""
+
+[[option.effect]]
+when = "value"
+override = true
+general = { build_tools = { keep = true } }
+
+[[option]]
+id = "build.guest_env"
+menu = "build"
+type = "bool"
+title = "Reuse the guest build environment"
+default = true
+depends = "build.build_tools == 'guest'"
+make_var = "FERRIC_GUEST_BUILD_ENV"
+help = """
+Keep one guest build environment for the whole image build and reuse it,
+rather than booting a fresh guest per tool. On whenever
+build.build_tools = "guest" is active, which is what keeping the tools in the
+image implies. Sets FERRIC_GUEST_BUILD_ENV."""
+
 # ---------------------------------------------------------------- qemu
 
 [[option]]
@@ -1982,3 +2041,13 @@ message = "The Ferric hardware bring-up configuration requires x86_64."
 level = "error"
 when = "build.toolchain == 'llvm' && target.arch == 'riscv64gc'"
 message = "The native LLVM toolchain supports x86_64 and aarch64; select build.toolchain = 'recipe' for RISC-V."
+
+[[rule]]
+level = "warn"
+when = "build.build_tools == 'guest' && host.arch != target.arch"
+message = "Build tools are built for the guest, but this build runs on host.arch and targets target.arch. The guest cannot run the tools it builds for a foreign architecture, so the build uses host tools instead; set build.build_tools = \"host\" to say so, or build natively."
+
+[[rule]]
+level = "error"
+when = "build.keep_build_tools && build.build_tools != 'guest'"
+message = "build.keep_build_tools ships the guest's build tools, so it needs build.build_tools = \"guest\"."

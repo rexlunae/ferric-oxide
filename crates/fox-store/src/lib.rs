@@ -47,6 +47,35 @@
 //!   removed before any file is touched, so an interrupted removal shows
 //!   in the database and can be run again.
 //!
+//! Shared generated files ([`SHARED_GENERATED_FILES`]) are the one exception
+//! to "a path owned by another package is a conflict". Each package builds
+//! its own version of such a file from its own contents, so the database
+//! records exactly one owning package, and ownership is decided once:
+//!
+//! - a package that is already installed keeps the file: reinstalling or
+//!   upgrading it replaces the index with the version the new archive
+//!   carries, and the entry stays in its record;
+//! - a package that does not own it skips the entry, leaves the file alone
+//!   and does not record it, so removing the skip never takes the owner's
+//!   file with it;
+//! - a file no installed package records is an ordinary existing file: it is
+//!   kept only if its content already matches, it needs
+//!   [`InstallOptions::force`] otherwise, and the installing package then
+//!   records it as its own;
+//! - an existing symlink where the file should go is refused
+//!   ([`StoreError::IndexIsSymlink`]), since the store never writes through a
+//!   symlink inside the root.
+//!
+//! Keeping only the owner's index means `info` lists only the pages of the
+//! package that installed the file; the pages of the other packages that
+//! ship one are absent from its directory listing until something rebuilds
+//! the index from the installed pages. The store does not do that: the
+//! format of the index, the set of packages it should list and the moment it
+//! should be rebuilt are a separate feature, and a partial rebuild would
+//! leave an index that lies about what is installed. [`Store::verify`]
+//! checks the files a package's record lists, not the entries the rest of
+//! its archived index would have.
+//!
 //! # Examples
 //!
 //! ```
@@ -70,6 +99,35 @@
 //! assert!(store.verify(&manifest.name, &key.trusted())?.problems.is_empty());
 //! store.remove(&manifest.name, false)?;
 //! assert!(!root.path().join("usr/bin/hello").exists());
+//!
+//! // Two packages that each build their own info index: the first keeps it
+//! // and both verify against what each of them actually installed.
+//! let entries = |page: &'static str, index: &'static [u8]| {
+//!     [
+//!         FixtureEntry::file(page, page.as_bytes(), 0o644),
+//!         FixtureEntry::file("usr/share/info/dir", index, 0o644),
+//!     ]
+//! };
+//! let mut installed = Vec::new();
+//! for (name, page, index) in [
+//!     ("bash", "usr/share/info/bash.info", b"bash index\n".as_slice()),
+//!     ("sed", "usr/share/info/sed.info", b"sed index\n".as_slice()),
+//! ] {
+//!     let manifest = Manifest::new(PackageName::new(name)?, "1.0.0");
+//!     let dir = work.path().join(name);
+//!     std::fs::create_dir_all(&dir)?;
+//!     let path = build_package(&dir, &key, Some(&manifest), &entries(page, index), false)?;
+//!     let archive = Archive::open(&path, &key.trusted())?;
+//!     store.install(&archive, InstallOptions::default())?;
+//!     assert!(store.verify(&manifest.name, &key.trusted())?.problems.is_empty());
+//!     installed.push(manifest.name);
+//! }
+//! assert_eq!(
+//!     std::fs::read(root.path().join("usr/share/info/dir"))?,
+//!     b"bash index\n"
+//! );
+//! store.remove(&installed[1], false)?;
+//! assert!(root.path().join("usr/share/info/dir").exists());
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
@@ -92,7 +150,7 @@ use fox_core::keys::TRUSTED_KEYS_DIR;
 use fox_core::policy::POLICY_FILE;
 use fox_core::registries::REGISTRIES_FILE;
 use fox_core::trust::TRUST_FILE;
-use fox_core::{Blake3Digest, FileKind, PackageName, TrustedKeys, VerifyError, verify_head};
+use fox_core::{FileKind, FileRecord, PackageName, TrustedKeys, VerifyError, verify_head};
 use pkgar::Transaction;
 
 pub use adopt::{
@@ -116,6 +174,34 @@ pub const RESERVED_DIRS: [&str; 5] = [
     POLICY_FILE,
     REGISTRIES_FILE,
 ];
+
+/// Paths whose content each package generates for itself, so several packages
+/// legitimately produce a different version of the same path.
+///
+/// `/usr/share/info/dir` is GNU info's directory index: every package that
+/// installs info pages writes it, built from that package's own entries. The
+/// package that installs it first owns it and keeps it across reinstalls and
+/// upgrades; a later package that carries its own version skips it rather
+/// than failing the install, and does not record it as one of its files. A
+/// path in this list is not a conflict with another package, but the file is
+/// still never written through a symlink. See the module documentation for
+/// the full rule.
+pub const SHARED_GENERATED_FILES: [&str; 1] = ["usr/share/info/dir"];
+
+/// Whether `path` is one of [`SHARED_GENERATED_FILES`].
+fn is_shared_generated(path: &str) -> bool {
+    SHARED_GENERATED_FILES.contains(&path)
+}
+
+/// Whether this install places `path`: every archive entry is installed
+/// except a shared generated file that another installed package owns.
+fn takes_entry(
+    path: &str,
+    owners: &BTreeMap<&str, &PackageName>,
+    installing: &PackageName,
+) -> bool {
+    !is_shared_generated(path) || owners.get(path).is_none_or(|owner| *owner == installing)
+}
 
 /// Mode bits the store sets and checks on installed files (permissions,
 /// setuid, setgid and sticky), the bits pkgar signs.
@@ -232,6 +318,14 @@ pub enum StoreError {
         /// The symlink.
         link: PathBuf,
     },
+    /// The path of a shared generated file that no package owns is a symlink.
+    /// Replacing it would write wherever it points, and pkgar would follow
+    /// it too, so the install refuses instead.
+    #[error("{path} is a symlink; a shared generated file is not written through one")]
+    IndexIsSymlink {
+        /// The shared generated path.
+        path: String,
+    },
     /// Other installed packages depend on the one being removed.
     #[error("package {name} is required by {}", list(dependents))]
     RequiredBy {
@@ -308,7 +402,8 @@ pub struct InstallReport {
     pub version: String,
     /// The version it replaced, if it was already installed.
     pub previous: Option<String>,
-    /// Files written.
+    /// Files written, which is every archive entry except a shared generated
+    /// file another installed package owns (see [`SHARED_GENERATED_FILES`]).
     pub installed: usize,
     /// Files of the previous version that were removed.
     pub removed: usize,
@@ -495,9 +590,9 @@ impl Store {
     ///   [`StoreError::UnsignedReplacesSigned`] if the archive has no
     ///   signed manifest and that is not allowed;
     /// - [`StoreError::ReservedPath`], [`StoreError::FileConflict`],
-    ///   [`StoreError::UnownedFile`], [`StoreError::NotAFile`] or
-    ///   [`StoreError::SymlinkInPath`] if a file cannot be placed (nothing
-    ///   is written in that case);
+    ///   [`StoreError::UnownedFile`], [`StoreError::NotAFile`],
+    ///   [`StoreError::SymlinkInPath`] or [`StoreError::IndexIsSymlink`] if a
+    ///   file cannot be placed (nothing is written in that case);
     /// - [`StoreError::Archive`] if the archive changed since it was
     ///   verified;
     /// - [`StoreError::Extract`] if extraction fails;
@@ -531,7 +626,25 @@ impl Store {
         let manifest = archive.manifest();
         let previous = db.take(&manifest.name);
         check_identity(archive, previous.as_ref(), options)?;
-        self.check_placement(archive, &db, previous.as_ref(), options)?;
+        let owners = file_owners(&db);
+        self.check_placement(archive, &owners, previous.as_ref(), options)?;
+
+        // A shared generated file stays with the package that already owns it:
+        // dropping another package's entry from the transaction leaves the file
+        // and its recorded owner alone, and keeps it out of this package's
+        // record. The owner's own entry is always placed, so reinstalling or
+        // upgrading the owner replaces the index with the version its archive
+        // carries.
+        let entries: Vec<pkgar_core::Entry> = archive
+            .head()
+            .raw_entries()
+            .iter()
+            .filter(|entry| {
+                std::str::from_utf8(entry.path_bytes())
+                    .is_ok_and(|path| takes_entry(path, &owners, &manifest.name))
+            })
+            .cloned()
+            .collect();
 
         let mut package = archive
             .reopen()
@@ -541,23 +654,28 @@ impl Store {
             source: Box::new(source),
         };
         let mut transaction = Transaction::new();
-        if let Err(error) = transaction.install_with_entries(
-            &mut package,
-            archive.head().raw_entries(),
-            &self.root,
-            true,
-        ) {
+        if let Err(error) =
+            transaction.install_with_entries(&mut package, &entries, &self.root, true)
+        {
             // Best effort: the original error is the one worth reporting.
             let _ = transaction.abort();
             return Err(extract_error(error));
         }
         transaction.commit().map_err(extract_error)?;
-        self.apply_modes(archive)?;
+        self.apply_modes(archive, &entries)?;
 
         let new_paths: BTreeSet<&str> = archive.files().iter().map(|f| f.path.as_str()).collect();
+        let installed_paths: BTreeSet<&str> = entries
+            .iter()
+            .filter_map(|entry| std::str::from_utf8(entry.path_bytes()).ok())
+            .collect();
         let (mut removed, mut kept) = (0, Vec::new());
         for old in previous.iter().flat_map(|p| &p.files) {
-            if new_paths.contains(old.path.as_str()) {
+            // Only a file this install placed can be superseded: one this
+            // package skipped belongs to another package, and its owner keeps
+            // it even if this archive no longer carries it.
+            if new_paths.contains(old.path.as_str()) && installed_paths.contains(old.path.as_str())
+            {
                 continue;
             }
             match remove_if_unchanged(&self.root, &old.path, old.kind, old.blake3)? {
@@ -585,7 +703,7 @@ impl Store {
         db.legacy_pending.remove(manifest.name.as_str());
         db.packages.push(InstalledPackage {
             origin,
-            ..record(archive)
+            ..record(archive, &entries)
         });
         db.save(&db_path)?;
 
@@ -593,7 +711,7 @@ impl Store {
             name: manifest.name.clone(),
             version: manifest.version.clone(),
             previous: previous.map(|p| p.version),
-            installed: archive.files().len(),
+            installed: installed_paths.len(),
             removed,
             kept,
             missing_depends,
@@ -601,19 +719,16 @@ impl Store {
     }
 
     /// Checks every archive path can be written without clobbering
-    /// something it should not.
+    /// something it should not. `owners` is [`file_owners`] of the database
+    /// without the package being installed.
     fn check_placement(
         &self,
         archive: &Archive,
-        db: &Database,
+        owners: &BTreeMap<&str, &PackageName>,
         previous: Option<&InstalledPackage>,
         options: InstallOptions,
     ) -> Result<(), StoreError> {
-        let owners: BTreeMap<&str, &PackageName> = db
-            .packages
-            .iter()
-            .flat_map(|p| p.files.iter().map(move |f| (f.path.as_str(), &p.name)))
-            .collect();
+        let installing = &archive.manifest().name;
         let previous_paths: BTreeSet<&str> = previous
             .iter()
             .flat_map(|p| p.files.iter().map(|f| f.path.as_str()))
@@ -625,11 +740,20 @@ impl Store {
                     reserved,
                 });
             }
-            if let Some(owner) = owners.get(file.path.as_str()) {
-                return Err(StoreError::FileConflict {
-                    path: file.path.clone(),
-                    owner: (*owner).clone(),
-                });
+            let shared = is_shared_generated(&file.path);
+            match owners.get(file.path.as_str()) {
+                // A shared generated file keeps the owner it has, because each
+                // package builds a different version by design; this package
+                // skips it. Any other file another package records is a
+                // conflict.
+                Some(owner) if shared && **owner != *installing => continue,
+                Some(owner) => {
+                    return Err(StoreError::FileConflict {
+                        path: file.path.clone(),
+                        owner: (*owner).clone(),
+                    });
+                }
+                None => {}
             }
             if let Some(link) = symlinked_parent(&self.root, &file.path)? {
                 return Err(StoreError::SymlinkInPath {
@@ -641,6 +765,14 @@ impl Store {
                 OnDisk::Missing => {}
                 OnDisk::Directory | OnDisk::Other => {
                     return Err(StoreError::NotAFile {
+                        path: file.path.clone(),
+                    });
+                }
+                // pkgar would write a regular file over a symlink's target,
+                // and could be made to write outside the root that way, so a
+                // shared generated file no package owns must not be a symlink.
+                OnDisk::Hashed(FileKind::Symlink, _) if shared => {
+                    return Err(StoreError::IndexIsSymlink {
                         path: file.path.clone(),
                     });
                 }
@@ -658,9 +790,23 @@ impl Store {
     }
 
     /// Sets every installed regular file to its signed mode bits. pkgar
-    /// creates files through the process umask, which can drop bits.
-    fn apply_modes(&self, archive: &Archive) -> Result<(), StoreError> {
-        for file in archive.files().iter().filter(|f| f.kind == FileKind::File) {
+    /// creates files through the process umask, which can drop bits. Only
+    /// the entries this install placed are touched: a shared generated file
+    /// this package skipped keeps the owner's mode.
+    fn apply_modes(
+        &self,
+        archive: &Archive,
+        entries: &[pkgar_core::Entry],
+    ) -> Result<(), StoreError> {
+        let installed: BTreeSet<&str> = entries
+            .iter()
+            .filter_map(|entry| std::str::from_utf8(entry.path_bytes()).ok())
+            .collect();
+        for file in archive
+            .files()
+            .iter()
+            .filter(|f| f.kind == FileKind::File && installed.contains(f.path.as_str()))
+        {
             let path = self.root.join(&file.path);
             let permissions = fs::Permissions::from_mode(file.mode & MODE_BITS);
             fs::set_permissions(&path, permissions).map_err(|e| StoreError::io(&path, e))?;
@@ -738,8 +884,14 @@ impl Store {
     }
 
     /// Re-checks an installed package: the stored head must still verify
-    /// against `keys` and match the database, and every file must still
-    /// hash to its signed value.
+    /// against `keys` and match the database, and every file the database
+    /// records for it must still hash to its signed value.
+    ///
+    /// The whole signed head is checked, but only the entries the package
+    /// installed are re-hashed. A shared generated file that this package
+    /// skipped when it was installed belongs to another package, so the
+    /// version of it in this package's head is not what should be on disk
+    /// and is not reported as a problem.
     ///
     /// # Errors
     ///
@@ -770,14 +922,25 @@ impl Store {
         if head.entries_blake3() != package.entries_blake3 || head.signer().key != package.signer {
             return Err(StoreError::HeadMismatch { name: name.clone() });
         }
+        let files: BTreeMap<&str, &FileRecord> = package
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file))
+            .collect();
         let mut report = VerifyReport {
             name: name.clone(),
             checked: 0,
             problems: Vec::new(),
         };
         for entry in head.entries() {
+            // A file installed by no other package is not checked, and a
+            // recorded file the head does not describe has no signed value to
+            // check it against; the record is what was installed either way.
+            let Some(file) = files.get(entry.path) else {
+                continue;
+            };
             report.checked += 1;
-            if let Some(kind) = self.check_file(entry.path, entry.kind, entry.mode, entry.blake3)? {
+            if let Some(kind) = self.check_file(file)? {
                 report.problems.push(FileProblem {
                     path: entry.path.to_owned(),
                     kind,
@@ -787,21 +950,19 @@ impl Store {
         Ok(report)
     }
 
-    fn check_file(
-        &self,
-        path: &str,
-        kind: FileKind,
-        mode: u32,
-        blake3: Blake3Digest,
-    ) -> Result<Option<ProblemKind>, StoreError> {
-        if symlinked_parent(&self.root, path)?.is_some() {
+    /// Checks the recorded file the package's head describes is still there,
+    /// with its recorded kind, content and mode.
+    fn check_file(&self, file: &FileRecord) -> Result<Option<ProblemKind>, StoreError> {
+        if symlinked_parent(&self.root, &file.path)?.is_some() {
             return Ok(Some(ProblemKind::SymlinkInPath));
         }
-        let full = self.root.join(path);
+        let full = self.root.join(&file.path);
         Ok(match inspect(&full)? {
             OnDisk::Missing => Some(ProblemKind::Missing),
-            OnDisk::Hashed(found_kind, _) if found_kind != kind => Some(ProblemKind::WrongType),
-            OnDisk::Hashed(_, found) if found != blake3 => Some(ProblemKind::Modified),
+            OnDisk::Hashed(found_kind, _) if found_kind != file.kind => {
+                Some(ProblemKind::WrongType)
+            }
+            OnDisk::Hashed(_, found) if found != file.blake3 => Some(ProblemKind::Modified),
             // Symlink modes carry no meaning, so only files are compared.
             OnDisk::Hashed(FileKind::File, _) => {
                 let found = fs::symlink_metadata(&full)
@@ -809,13 +970,26 @@ impl Store {
                     .permissions()
                     .mode()
                     & MODE_BITS;
-                let expected = mode & MODE_BITS;
+                let expected = file.mode & MODE_BITS;
                 (found != expected).then_some(ProblemKind::Mode { expected, found })
             }
             OnDisk::Hashed(..) => None,
             OnDisk::Directory | OnDisk::Other => Some(ProblemKind::WrongType),
         })
     }
+}
+
+/// Every path an installed package records, and the package that records it.
+fn file_owners(db: &Database) -> BTreeMap<&str, &PackageName> {
+    db.packages
+        .iter()
+        .flat_map(|package| {
+            package
+                .files
+                .iter()
+                .map(move |file| (file.path.as_str(), &package.name))
+        })
+        .collect()
 }
 
 /// The reserved directory `path` would write into, replace or redirect.
@@ -855,7 +1029,7 @@ fn check_identity(
 }
 
 /// The database record for a verified archive.
-fn record(archive: &Archive) -> InstalledPackage {
+fn record(archive: &Archive, installed: &[pkgar_core::Entry]) -> InstalledPackage {
     let manifest = archive.manifest();
     let signer = archive.head().signer();
     InstalledPackage {
@@ -873,7 +1047,19 @@ fn record(archive: &Archive) -> InstalledPackage {
         },
         state: PackageState::Installed,
         origin: None,
-        files: archive.files().to_vec(),
+        // Only the files this install placed belong to this package, both
+        // because that is what the store verifies and because a shared
+        // generated file installed by another package stays that one's.
+        files: archive
+            .files()
+            .iter()
+            .filter(|file| {
+                installed
+                    .iter()
+                    .any(|entry| entry.path_bytes() == file.path.as_bytes())
+            })
+            .cloned()
+            .collect(),
     }
 }
 
@@ -909,6 +1095,26 @@ mod tests {
             "var/log/x",
         ] {
             assert_eq!(reserved_dir(path), None, "{path}");
+        }
+    }
+
+    /// The GNU info directory index is written by every package that installs
+    /// info pages, from that package's own entries, so several packages produce
+    /// a different one. It is an index of what is installed rather than content
+    /// that belongs to a package, so the first one installed keeps it.
+    #[test]
+    fn only_the_info_directory_is_a_shared_generated_file() {
+        assert!(is_shared_generated("usr/share/info/dir"));
+        for path in [
+            // The package's own info pages stay its own.
+            "usr/share/info/bash.info",
+            "usr/share/info/sed.info",
+            // A directory named "dir" elsewhere is ordinary content.
+            "usr/share/doc/dir",
+            "usr/bin/dir",
+            "etc/dir",
+        ] {
+            assert!(!is_shared_generated(path), "{path}");
         }
     }
 }

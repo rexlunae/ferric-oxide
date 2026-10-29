@@ -173,6 +173,21 @@ Installed verification checks the retained signed head against currently
 trusted keys and compares installed files with the signed entry records. The
 database supplies management state, not a replacement trust root.
 
+`usr/share/info/dir` is the one shared generated file. GNU info's directory
+index is rebuilt by every package that installs info pages, from that package's
+own entries alone, so different packages legitimately ship a different one. The
+package that installs it first owns it and keeps it across reinstalls and
+upgrades; a later package that also ships one skips the entry, leaves the file
+and its mode alone, and does not record it as its own. A file no package records
+is an ordinary existing file, so it is taken over silently only when its content
+matches and otherwise needs `--force`; an existing symlink at that path is
+refused rather than written through. Because only the owner's index is kept,
+`info` lists only that package's pages: the pages of the other packages that
+shipped an index are absent from the listing until something rebuilds it. The
+store does not rebuild it, and installed verification re-hashes the files each
+package records, not the index version in a package's signed head that the
+install skipped.
+
 ## Adopting pkg's packages
 
 `fox adopt-pkg` (`Store::adopt_pkg`) takes over a root that upstream `pkg`

@@ -4,14 +4,84 @@ use std::{
     process,
 };
 
+/// One thing a redoxer run puts into a guest: a file, or a directory to make.
+///
+/// The kind is explicit rather than inferred from the contents. A `--folder`
+/// source may contain an empty file, and "empty" must not also mean "make a
+/// directory" without turning that file into one.
+#[derive(Debug)]
+pub(crate) struct GuestEntry {
+    /// Absolute path inside the guest.
+    pub(crate) path: PathBuf,
+    /// Contents for a file; ignored for a directory.
+    pub(crate) data: Vec<u8>,
+    /// Permission bits.
+    pub(crate) mode: u16,
+    /// Whether this path is a file or a directory.
+    pub(crate) kind: GuestKind,
+}
+
+impl GuestEntry {
+    /// A regular file with `data` and `mode`.
+    pub(crate) fn file(path: impl Into<PathBuf>, data: Vec<u8>, mode: u16) -> Self {
+        Self {
+            path: path.into(),
+            data,
+            mode,
+            kind: GuestKind::File,
+        }
+    }
+
+    /// A directory. Its contents are ignored, so an empty file is never taken
+    /// for one.
+    pub(crate) fn directory(path: impl Into<PathBuf>, mode: u16) -> Self {
+        Self {
+            path: path.into(),
+            data: Vec::new(),
+            mode,
+            kind: GuestKind::Directory,
+        }
+    }
+}
+
+/// Whether a [`GuestEntry`] is a file or a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuestKind {
+    /// A regular file; `data` is written to it.
+    File,
+    /// A directory; `data` must be empty.
+    Directory,
+}
+
 static INIT_ENV: &str = include_str!("../res/run_redoxer.ion");
 static INIT_REDOXER: &str = include_str!("../res/30_redoxer");
 
-pub fn write_redoxerd_config(
-    dest_dir: &Path,
+/// The files the guest needs for `redoxerd` to run `arguments`.
+///
+/// These are written into a booted image instead of onto a staging directory,
+/// so the same content serves both an installed image and a prepared one. Each
+/// entry is a path inside the guest, its contents and its permission bits.
+///
+/// `arguments` is the guest command and its arguments, one per line, with the
+/// first line naming the program inside the guest. A recipe's build tools run
+/// their command by **name** (the guest has it on `PATH`), so nothing here
+/// needs to name a host path; when `root_dir` is given, any argument that names
+/// a path inside it is rewritten to the `/root` the folder is copied to.
+///
+/// The guest runs the command from `/root`, so an image that does not have it
+/// gets an empty `/root` from here: a prepared image holds the build tools and
+/// not necessarily a home directory, and a command that cannot start in the
+/// directory it was given would resolve its relative paths somewhere else.
+/// Creating it is what keeps the working directory identical to the one an
+/// image that does have `/root` already uses.
+///
+/// # Errors
+/// Returns an I/O error when `root_dir` cannot be canonicalised or is not valid
+/// UTF-8.
+pub fn redoxerd_config_files(
     arguments: &[String],
     root_dir: Option<&str>,
-) -> Result<(), io::Error> {
+) -> io::Result<Vec<GuestEntry>> {
     let mut redoxerd_config = String::new();
     for arg in arguments.iter() {
         // Replace absolute path to folder with /root in command name
@@ -21,7 +91,11 @@ pub fn write_redoxerd_config(
             let folder_canonical = folder_canonical_path
                 .to_str()
                 .ok_or(io::Error::other("folder path is not valid UTF-8"))?;
-            if arg.starts_with(folder_canonical) {
+            // A bare name such as `mdbook` is resolved by the guest's `PATH`
+            // and must stay bare: prefixing it would look for
+            // `/root/mdbook`, and `redoxerd` would try to run a directory when
+            // the path names the copied `/root` folder itself.
+            if arg.starts_with(folder_canonical) && !Path::new(arg).is_dir() {
                 let arg_replace = arg.replace(folder_canonical, "/root");
                 eprintln!("redoxer: replacing '{arg}' with '{arg_replace}' in arguments");
                 redoxerd_config.push_str(&arg_replace);
@@ -33,28 +107,89 @@ pub fn write_redoxerd_config(
         redoxerd_config.push_str(arg);
         redoxerd_config.push('\n');
     }
-    let etc_dir = dest_dir.join("etc");
-    if !etc_dir.is_dir() {
-        fs::create_dir_all(&etc_dir)?;
-    }
-    fs::write(etc_dir.join("redoxerd"), redoxerd_config)?;
-    let init_dir = dest_dir.join("usr/lib/init.d");
-    let lib_dir = dest_dir.join("usr/lib");
-    if !init_dir.is_dir() {
-        fs::create_dir_all(&init_dir)?;
-    }
-    let init_env_path = lib_dir.join("run_redoxer.ion");
-    if !init_env_path.is_file() {
-        fs::write(&init_env_path, INIT_ENV)?;
-    }
-    let init_redoxer_path = init_dir.join("30_redoxer");
-    if !init_redoxer_path.is_file() {
-        fs::write(&init_redoxer_path, INIT_REDOXER)?;
-    }
-    let root_dir = dest_dir.join("root");
-    if !root_dir.is_dir() {
-        // needed for cwd
-        fs::create_dir(&root_dir)?;
+    Ok(vec![
+        GuestEntry::file(redoxerd_config::CONFIG, redoxerd_config.into_bytes(), 0o644),
+        GuestEntry::file(redoxerd_config::SCRIPT, INIT_ENV.as_bytes().to_vec(), 0o755),
+        GuestEntry::file(
+            redoxerd_config::UNIT,
+            INIT_REDOXER.as_bytes().to_vec(),
+            0o644,
+        ),
+        // The directory the command runs from, made when the image has none.
+        GuestEntry::directory(redoxerd_config::WORKING_DIR, 0o755),
+    ])
+}
+
+/// Sets `path` to `mode`, the permission bits the entry carries.
+///
+/// # Errors
+/// Returns an I/O error when the mode cannot be set.
+fn set_mode(path: &Path, mode: u16) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(u32::from(mode)))
+}
+
+/// Where the guest keeps the files a redoxer run installs, and the directory
+/// the command runs from.
+pub(crate) mod redoxerd_config {
+    /// The command `redoxerd` reads and runs, one line per argument.
+    pub(crate) const CONFIG: &str = "/etc/redoxerd";
+    /// The init unit that starts `/usr/lib/run_redoxer.ion`.
+    pub(crate) const UNIT: &str = "/usr/lib/init.d/30_redoxer";
+    /// The script that sets the guest environment and starts `redoxerd`.
+    pub(crate) const SCRIPT: &str = "/usr/lib/run_redoxer.ion";
+    /// The directory a command starts in, which `SCRIPT` enters with `cd`.
+    pub(crate) const WORKING_DIR: &str = "/root";
+}
+
+/// Writes the guest's `/etc/redoxerd` command description and the init units
+/// that start it into a staging directory.
+///
+/// See [`redoxerd_config_files`] for what the files contain. A file the guest
+/// image already provides — the init unit, which an install configuration may
+/// also declare — is left alone, and so is a directory, which is what the entry
+/// for the working directory becomes here.
+///
+/// # Errors
+/// Returns an I/O error when `root_dir` cannot be canonicalised, is not valid
+/// UTF-8, or when a file or directory cannot be written.
+pub fn write_redoxerd_config(
+    dest_dir: &Path,
+    arguments: &[String],
+    root_dir: Option<&str>,
+) -> Result<(), io::Error> {
+    for entry in redoxerd_config_files(arguments, root_dir)? {
+        let target = dest_dir.join(
+            entry
+                .path
+                .strip_prefix("/")
+                .map_err(|err| io::Error::other(err.to_string()))?,
+        );
+        if let Some(parent) = target.parent()
+            && !parent.is_dir()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        if target.is_file() || target.is_dir() {
+            // The image's own copy wins: an install configuration may declare
+            // the same unit, and overwriting it would change what was signed.
+            continue;
+        }
+        match entry.kind {
+            // The staging tree needs the working directory just as a prepared
+            // image does.
+            GuestKind::Directory => {
+                fs::create_dir_all(&target)?;
+                set_mode(&target, entry.mode)?;
+            }
+            GuestKind::File => {
+                fs::write(&target, &entry.data)?;
+                // The stage is the tree an install copies into the image, so a
+                // file keeps the mode a prepared image would give it. Without
+                // this `run_redoxer.ion` would not be executable in the guest.
+                set_mode(&target, entry.mode)?;
+            }
+        }
     }
     Ok(())
 }
@@ -115,5 +250,92 @@ pub fn main(args: &[String]) {
             eprintln!("redoxer write-exec: {err:#}");
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A build tool is run by name: the guest has it on `PATH`, so a bare name
+    /// must reach `redoxerd` unchanged rather than becoming `/root/<name>`.
+    #[test]
+    fn a_bare_command_name_is_not_rewritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let dest = temp.path().join("image");
+
+        write_redoxerd_config(
+            &dest,
+            &["mdbook".to_string(), "build".to_string()],
+            Some(root.to_str().unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dest.join("etc/redoxerd")).unwrap(),
+            "mdbook\nbuild\n"
+        );
+    }
+
+    /// A path inside the copied folder is rewritten to the `/root` the folder
+    /// is copied to, which is what makes a recipe's script see its files.
+    #[test]
+    fn a_path_in_the_root_folder_is_rewritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let dest = temp.path().join("image");
+        let script = root.canonicalize().unwrap().join("build.sh");
+        fs::write(&script, "true").unwrap();
+
+        write_redoxerd_config(
+            &dest,
+            &[
+                "sh".to_string(),
+                script.display().to_string(),
+                "arg".to_string(),
+            ],
+            Some(root.to_str().unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dest.join("etc/redoxerd")).unwrap(),
+            "sh\n/root/build.sh\narg\n"
+        );
+    }
+
+    /// The `/root` a folder is copied to is a directory, so naming it as the
+    /// command would make `redoxerd` try to execute a directory; it is not
+    /// rewritten into an indistinguishable one.
+    #[test]
+    fn the_root_folder_itself_is_not_rewritten_into_a_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let dest = temp.path().join("image");
+        let root_path = root.canonicalize().unwrap();
+
+        write_redoxerd_config(
+            &dest,
+            &[root_path.display().to_string()],
+            Some(root.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let config = fs::read_to_string(dest.join("etc/redoxerd")).unwrap();
+        assert_eq!(config, format!("{}\n", root_path.display()));
+        assert_ne!(config, "/root\n");
+    }
+
+    /// The init unit that starts `redoxerd` waits for the blocking DHCP unit,
+    /// which redoxer supplies in its own file rather than overwriting the one
+    /// the `base` package signs.
+    #[test]
+    fn the_redoxer_unit_waits_for_the_blocking_dhcp_unit() {
+        assert!(INIT_REDOXER.contains("requires_weak 10_redoxer_dhcp.service"));
+        assert!(!INIT_REDOXER.contains("10_dhcpd.service"));
     }
 }

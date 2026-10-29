@@ -1,21 +1,24 @@
 use anyhow::{bail, Context};
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "fuse")]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::{fs, io};
 
-use crate::redoxfs::{
-    archive_image, expand_disk, extract_tar, run_install_mount, run_install_to_dir, shrink_disk,
-    RedoxFs,
-};
-use crate::writer::write_redoxerd_config;
+#[cfg(feature = "fuse")]
+#[cfg(feature = "fuse")]
+use crate::redoxfs::to_qcow2;
+use crate::redoxfs::{archive_image, extract_tar};
+#[cfg(feature = "fuse")]
+use crate::redoxfs::{run_install_mount, RedoxFs};
+use crate::writer::{redoxerd_config_files, write_redoxerd_config, GuestEntry};
 use crate::{host_target, parse_bool_env, redoxer_dir, status_error, target};
 
 // extra disk space to fit large projects
 const DISK_SIZE: u64 = 3 * 1024 * 1024 * 1024;
 // need to fit under the default RAM
-const DISK_SIZE_LIVE: u64 = 1024 * 1024 * 1024;
+const DISK_SIZE_LIVE: u64 = 4 * 1024 * 1024 * 1024;
 
 pub fn qemu_executable() -> &'static str {
     match target() {
@@ -42,14 +45,179 @@ pub fn qemu_has_kvm() -> bool {
         }
 }
 
-pub fn qemu_use_uefi() -> bool {
-    match target() {
-        "x86_64-unknown-redox" => false,
-        "i586-unknown-redox" | "i686-unknown-redox" => false,
-        "aarch64-unknown-redox" => true,
-        "riscv64gc-unknown-redox" => true,
+/// The file a BIOS boot path needs, beside the UEFI boot images: a bootloader
+/// package's stage directory or an installed image has it exactly when a BIOS
+/// guest can start from that tree.
+const BIOS_BOOTLOADER: &str = "usr/lib/boot/bootloader.bios";
+
+/// Which boot image a guest boots, and the kind of firmware that is.
+///
+/// One value is threaded through every selection: [`bootloader`] picks the
+/// image from it, and [`qemu_use_uefi`] reports it to the QEMU arguments and to
+/// the installer, so the image extracted and the firmware loading it cannot
+/// disagree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Firmware {
+    /// The UEFI boot image, loaded by OVMF/AAVMF/EDK2 firmware.
+    Uefi,
+    /// The BIOS boot image, loaded by QEMU's own firmware.
+    Bios,
+}
+
+impl std::fmt::Display for Firmware {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Uefi => "UEFI",
+            Self::Bios => "BIOS",
+        })
+    }
+}
+
+/// The firmware a guest of `arch` boots with, given whether the checkout has a
+/// [`BIOS_BOOTLOADER`].
+///
+/// This is the one rule that decides BIOS versus UEFI; every other decision
+/// asks it instead of working it out again. Ferric Oxide builds a UEFI-only x86
+/// image, so it has no BIOS bootloader and a guest needs UEFI firmware. An
+/// upstream-style checkout still builds that file, and a build that has it
+/// boots through BIOS the way it always did, even when its package also carries
+/// a UEFI image. The other architectures in [`SUPPORTED_TARGETS`] have no BIOS
+/// boot path to keep, so they stay UEFI regardless.
+///
+/// # Panics
+/// Panics for a target architecture QEMU is not configured for.
+///
+/// [`SUPPORTED_TARGETS`]: crate::SUPPORTED_TARGETS
+fn firmware_for(arch: &str, bios_bootloader: bool) -> Firmware {
+    match arch {
+        "i586-unknown-redox" | "i686-unknown-redox" => Firmware::Bios,
+        "x86_64-unknown-redox" => {
+            if bios_bootloader {
+                Firmware::Bios
+            } else {
+                Firmware::Uefi
+            }
+        }
+        "aarch64-unknown-redox" | "riscv64gc-unknown-redox" => Firmware::Uefi,
         _ => panic!("Unknown target architecture for QEMU"),
     }
+}
+
+/// Whether the guest boots through UEFI rather than legacy BIOS.
+///
+/// Ferric Oxide builds a UEFI-only x86_64 image: the bootloader recipe skips the
+/// BIOS binaries when `FERRIC_UEFI_ONLY` is set, which the native toolchain
+/// does, and the build errors instead of falling back to BIOS when firmware is
+/// missing. Upstream Redox still ships a BIOS bootloader for x86_64, so a
+/// checkout that has one keeps using it.
+///
+/// # Panics
+/// Panics for a target architecture QEMU is not configured for.
+pub fn qemu_use_uefi() -> bool {
+    // The image the bootloader was extracted from outranks a fresh look at the
+    // checkout: it is what the guest will actually start.
+    if let Some(firmware) = bootloader_firmware::get() {
+        return firmware == Firmware::Uefi;
+    }
+    firmware_for(target(), bootloader_bios_available()) == Firmware::Uefi
+}
+
+/// Which boot image a guest boots, between what is installed and what decides.
+///
+/// [`qemu_use_uefi`] is asked while building the image, before the bootloader
+/// is extracted, so it cannot always answer from what was installed. The answer
+/// is cached here once [`bootloader`] has chosen an image, and a non-UEFI
+/// architecture decides until then.
+mod bootloader_firmware {
+    use super::Firmware;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// Nothing discovered yet: the architecture's default decides.
+    const UNKNOWN: u8 = 0;
+    static FIRMWARE: AtomicU8 = AtomicU8::new(UNKNOWN);
+
+    /// Records the firmware the chosen boot image needs.
+    pub(super) fn set(firmware: Firmware) {
+        let value = match firmware {
+            Firmware::Uefi => 1,
+            Firmware::Bios => 2,
+        };
+        FIRMWARE.store(value, Ordering::Relaxed);
+    }
+
+    /// The firmware discovered in this run, if a boot image was chosen.
+    pub(super) fn get() -> Option<Firmware> {
+        match FIRMWARE.load(Ordering::Relaxed) {
+            1 => Some(Firmware::Uefi),
+            2 => Some(Firmware::Bios),
+            _ => None,
+        }
+    }
+}
+
+/// The images a bootloader package installs, relative to where it is unpacked.
+const INSTALLED_UEFI_IMAGE: &str = "usr/lib/boot/bootloader-live.efi";
+const INSTALLED_BIOS_IMAGE: &str = "usr/lib/boot/bootloader-live.bios";
+
+/// The boot image `package` provides that this build can boot, and the
+/// firmware it needs.
+///
+/// [`firmware_for`] decides, and the package only narrows it: the checkout's
+/// BIOS bootloader says the build boots BIOS, but that is only possible when
+/// the package also has a BIOS image. A package with neither image is an error
+/// naming `cookbook`, and one lacking the image the rule chose is an error too,
+/// because booting the other one would need a boot image that is not there.
+///
+/// # Errors
+/// Returns an error when `package` has no image the target architecture can
+/// boot, naming the file it looked for.
+fn installed_bootloader(cookbook: &Path, package: &Path) -> anyhow::Result<(PathBuf, Firmware)> {
+    let efi = package.join(INSTALLED_UEFI_IMAGE);
+    let bios = package.join(INSTALLED_BIOS_IMAGE);
+    // The rule decides, and a BIOS decision additionally needs a BIOS image.
+    let has_bios_image = bios.is_file();
+    let firmware = firmware_for(target(), bootloader_bios_available() && has_bios_image);
+    let image = match firmware {
+        Firmware::Uefi => &efi,
+        Firmware::Bios => &bios,
+    };
+    if image.is_file() {
+        return Ok((image.clone(), firmware));
+    }
+    anyhow::bail!(
+        "the bootloader package in {} has no {firmware} boot image; it needs {}",
+        cookbook.display(),
+        image.display()
+    )
+}
+
+/// Whether the cookbook can supply the BIOS bootloader.
+///
+/// Ferric Oxide builds a UEFI-only x86_64 image: the bootloader recipe skips its
+/// BIOS binaries when `FERRIC_UEFI_ONLY` is set, which the native toolchain
+/// does, and the build errors instead of falling back to BIOS when firmware is
+/// missing. Upstream Redox still builds them, so a checkout that has them boots
+/// the way it always did. The recipe's staged output is what the repository is
+/// published from, so it answers the question without unpacking a package.
+fn bootloader_bios_available() -> bool {
+    let Ok(cookbook) = crate::cookbook_dir() else {
+        return false;
+    };
+    let stage = cookbook
+        .join("recipes/core/bootloader/target")
+        .join(target())
+        .join("stage");
+    // A stage with a BIOS image can boot BIOS, whatever else it also holds:
+    // that is what the checkout built, and preferring UEFI there would demand
+    // OVMF from a host that has a loader it could already use. `firmware_for`
+    // makes the decision; this only answers "is BIOS available here".
+    bios_bootloader(&stage).is_some()
+}
+
+/// The BIOS bootloader in `root`, if the tree has one.
+fn bios_bootloader(root: &Path) -> Option<PathBuf> {
+    let path = root.join(BIOS_BOOTLOADER);
+    path.is_file().then_some(path)
 }
 
 pub fn qemu_use_live_disk() -> bool {
@@ -68,6 +236,16 @@ pub fn qemu_disk_device() -> &'static str {
         _ => "virtio",
     }
 }
+/// The size the base image is built at.
+///
+/// The base is the disk a run boots: the bootloader reads the whole image into
+/// memory before the kernel runs, so it has to fit beside the kernel in the
+/// guest's RAM.
+#[cfg(feature = "fuse")]
+pub fn qemu_base_disk_size() -> u64 {
+    DISK_SIZE_LIVE
+}
+
 pub fn qemu_disk_size() -> u64 {
     if qemu_use_live_disk() {
         DISK_SIZE_LIVE
@@ -93,63 +271,277 @@ fn kvm_accessible() -> Result<(), io::Error> {
 #[allow(unused)]
 pub fn fuse_accessible() -> Result<(), io::Error> {
     // TODO: A faster way than actually try to mount?
-    let t = tempfile::tempdir()?;
-    fuser::Session::new(crate::redoxfs::DummyFS, t.path(), &[])?.unmount();
-    Ok(())
+    #[cfg(feature = "fuse")]
+    {
+        let t = tempfile::tempdir()?;
+        fuser::Session::new(crate::redoxfs::DummyFS, t.path(), &[])?.unmount();
+        Ok(())
+    }
+    // Without the probe this cannot tell whether FUSE works, so it reports the
+    // conservative answer: images are installed through the RedoxFS writer
+    // instead of a mount, which needs neither FUSE nor root.
+    #[cfg(not(feature = "fuse"))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "redoxer was built without the fuse-probe feature",
+    ))
 }
 
 #[rustfmt::skip]
-pub fn qemu_default_args() -> Vec<&'static str> {
-    let mut default_args = vec![
-        "-cpu", "max",
-        "-m", "2048",
-        "-smp", "4",
-        "-netdev", "user,id=net0",
-        "-device", "e1000,netdev=net0",
-    ];
-    default_args.extend(match target() {
-        "i586-unknown-redox" | "i686-unknown-redox" | "x86_64-unknown-redox" => vec![
-            "-machine", "q35",
-            "-serial", "mon:stdio",
-            "-device", "isa-debugcon,chardev=log",
-            "-device", "isa-debug-exit",
+/// The firmware images a UEFI guest can boot from, best first.
+///
+/// Each entry is a candidate file and the argument that loads it. `-bios` maps
+/// the firmware at the reset vector and is what QEMU's `virt` machines want;
+/// `-drive if=pflash` exposes it as flash, which is how the x86 and RISC-V
+/// machines take it. Nothing here is architecture-neutral, so the table keeps
+/// the per-architecture argument choice alongside the paths.
+///
+/// The packages column names what to install: a missing firmware is a setup
+/// problem the user can fix, so it becomes an error rather than a panic or a
+/// silent boot of the wrong firmware.
+type FirmwareCandidates = &'static [(&'static str, &'static str)];
+
+const FIRMWARE_SEARCHES: &[(&str, FirmwareCandidates, &str)] = &[
+    (
+        "x86_64-unknown-redox",
+        &[
+            (
+                "/usr/share/OVMF/OVMF_CODE_4M.fd",
+                "if=pflash,format=raw,unit=0,file=/usr/share/OVMF/OVMF_CODE_4M.fd,readonly=on",
+            ),
+            (
+                "/usr/share/OVMF/OVMF_CODE.fd",
+                "if=pflash,format=raw,unit=0,file=/usr/share/OVMF/OVMF_CODE.fd,readonly=on",
+            ),
+            (
+                "/usr/share/qemu/OVMF.fd",
+                "if=pflash,format=raw,unit=0,file=/usr/share/qemu/OVMF.fd,readonly=on",
+            ),
         ],
-        "aarch64-unknown-redox" => {
-            let (efi_arg, efi_file) = if Path::new("/usr/share/AAVMF/AAVMF_CODE.fd").exists() {
-                ("-bios", "/usr/share/AAVMF/AAVMF_CODE.fd")
-            } else if Path::new("/usr/share/qemu/edk2-aarch64-code.fd").exists() {
-                ("-drive", "if=pflash,format=raw,unit=0,file=/usr/share/qemu/edk2-aarch64-code.fd,readonly=on")
+        "ovmf (Debian/Ubuntu), edk2-ovmf (Fedora), or qemu (macOS with QEMU installed)",
+    ),
+    (
+        "aarch64-unknown-redox",
+        &[
+            (
+                "/usr/share/AAVMF/AAVMF_CODE.fd",
+                // The virt machine takes the firmware as a `-bios` image.
+                "AAVMF",
+            ),
+            (
+                "/usr/share/qemu/edk2-aarch64-code.fd",
+                "if=pflash,format=raw,unit=0,file=/usr/share/qemu/edk2-aarch64-code.fd,readonly=on",
+            ),
+        ],
+        "qemu-efi-aarch64 (Debian/Ubuntu) or edk2-aarch64 (Fedora)",
+    ),
+    (
+        "riscv64gc-unknown-redox",
+        &[
+            (
+                "/usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd",
+                "if=pflash,format=raw,unit=0,file=/usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd,readonly=on",
+            ),
+            (
+                "/usr/share/qemu/edk2-riscv-code.fd",
+                "if=pflash,format=raw,unit=0,file=/usr/share/qemu/edk2-riscv-code.fd,readonly=on",
+            ),
+        ],
+        "qemu-efi-riscv64 (Debian/Ubuntu) or edk2-riscv (Fedora)",
+    ),
+];
+
+/// The firmware of `arch` to boot, as the argument and its value.
+///
+/// The first candidate in [`FIRMWARE_SEARCHES`] that exists wins, so the order
+/// is the preference order.
+///
+/// # Errors
+/// Returns an error when none of the candidates exists, naming the packages
+/// that provide one. Boot firmware cannot be defaulted: QEMU's built-in BIOS
+/// cannot start a UEFI-only image, so guessing would fail later with an
+/// unrelated message, and a panic would give no way to fix it.
+fn uefi_firmware(arch: &str) -> anyhow::Result<(&'static str, &'static str)> {
+    let Some((_, candidates, packages)) =
+        FIRMWARE_SEARCHES.iter().find(|(name, _, _)| *name == arch)
+    else {
+        anyhow::bail!("no UEFI firmware is known for {arch}");
+    };
+    uefi_firmware_among(arch, candidates)
+        .map_err(|error| anyhow::anyhow!("{error}; install {packages}"))
+}
+
+/// Picks the first candidate of `candidates` that exists.
+///
+/// Split from [`uefi_firmware`] so the "nothing found" path can be tested
+/// without depending on which firmware the host has: a caller can pass
+/// candidates that cannot exist.
+///
+/// # Errors
+/// Returns an error naming `arch` and every path that was tried.
+fn uefi_firmware_among(
+    arch: &str,
+    candidates: FirmwareCandidates,
+) -> anyhow::Result<(&'static str, &'static str)> {
+    for (path, argument) in candidates.iter() {
+        if Path::new(path).exists() {
+            // AArch64's `virt` machine wants the raw image through `-bios`,
+            // which is what the marker records; the rest use pflash.
+            let flag = if *argument == "AAVMF" {
+                "-bios"
             } else {
-                todo!("Can't figure out where is the EFI file!")
+                "-drive"
             };
+            let value = if *argument == "AAVMF" {
+                *path
+            } else {
+                *argument
+            };
+            return Ok((flag, value));
+        }
+    }
+    anyhow::bail!(
+        "no UEFI firmware found for {arch}; QEMU looked in {}",
+        candidates
+            .iter()
+            .map(|(path, _)| *path)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// The machine, console and firmware arguments for `arch`.
+///
+/// Split out so the firmware lookup is the single fallible step: every arm
+/// builds the same shape of list, and a missing firmware is reported once,
+/// with the architecture that needed it.
+///
+/// # Errors
+/// Returns an error when a UEFI architecture has no firmware installed.
+fn machine_args(arch: &str) -> anyhow::Result<Vec<String>> {
+    // The debug console every machine exports; the serial consoles differ.
+    let debugcon = [
+        "-serial",
+        "mon:stdio",
+        "-device",
+        "isa-debugcon,chardev=log",
+    ];
+    Ok(match arch {
+        "i586-unknown-redox" | "i686-unknown-redox" => {
             vec![
-                "-machine", "virt",
-                "-serial", "chardev:debug",
-                "-mon", "chardev=debug",
-                efi_arg, efi_file,
-                "-chardev", "stdio,id=debug,signal=off,mux=on",
-                "-semihosting-config", "enable=on,target=native,userspace=on"
+                "-machine".to_string(),
+                "q35".to_string(),
+                debugcon[0].to_string(),
+                debugcon[1].to_string(),
+                debugcon[2].to_string(),
+                debugcon[3].to_string(),
+                "-device".to_string(),
+                "isa-debug-exit".to_string(),
+            ]
+        }
+        // Ferric Oxide is UEFI-only on x86_64, so its guests need an OVMF image
+        // rather than QEMU's default BIOS. An upstream-style build still has the
+        // BIOS bootloader, which is what the default firmware boots.
+        "x86_64-unknown-redox" if qemu_use_uefi() => {
+            let (flag, value) = uefi_firmware(arch)?;
+            vec![
+                "-machine".to_string(),
+                "q35".to_string(),
+                debugcon[0].to_string(),
+                debugcon[1].to_string(),
+                debugcon[2].to_string(),
+                debugcon[3].to_string(),
+                "-device".to_string(),
+                "isa-debug-exit".to_string(),
+                flag.to_string(),
+                value.to_string(),
+            ]
+        }
+        "x86_64-unknown-redox" => {
+            vec![
+                "-machine".to_string(),
+                "q35".to_string(),
+                debugcon[0].to_string(),
+                debugcon[1].to_string(),
+                debugcon[2].to_string(),
+                debugcon[3].to_string(),
+                "-device".to_string(),
+                "isa-debug-exit".to_string(),
+            ]
+        }
+        "aarch64-unknown-redox" => {
+            let (flag, value) = uefi_firmware(arch)?;
+            vec![
+                "-machine".to_string(),
+                "virt".to_string(),
+                "-serial".to_string(),
+                "chardev:debug".to_string(),
+                "-mon".to_string(),
+                "chardev=debug".to_string(),
+                flag.to_string(),
+                value.to_string(),
+                "-chardev".to_string(),
+                "stdio,id=debug,signal=off,mux=on".to_string(),
+                "-semihosting-config".to_string(),
+                "enable=on,target=native,userspace=on".to_string(),
             ]
         }
         "riscv64gc-unknown-redox" => {
-            let (efi_arg, efi_file) = if Path::new("/usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd").exists() {
-                ("-drive", "if=pflash,format=raw,unit=0,file=/usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd,readonly=on")
-            } else if Path::new("/usr/share/qemu/edk2-riscv-code.fd").exists() {
-                ("-drive", "if=pflash,format=raw,unit=0,file=/usr/share/qemu/edk2-riscv-code.fd,readonly=on")
-            } else {
-                todo!("Can't figure out where is the EFI file!")
-            };
+            let (flag, value) = uefi_firmware(arch)?;
             vec![
-                "-machine", "virt,acpi=off",
-                "-serial", "chardev:debug",
-                "-mon", "chardev=debug",
-                efi_arg, efi_file,
-                "-chardev", "stdio,id=debug,signal=off,mux=on",
+                "-machine".to_string(),
+                "virt,acpi=off".to_string(),
+                "-serial".to_string(),
+                "chardev:debug".to_string(),
+                "-mon".to_string(),
+                "chardev=debug".to_string(),
+                flag.to_string(),
+                value.to_string(),
+                "-chardev".to_string(),
+                "stdio,id=debug,signal=off,mux=on".to_string(),
             ]
-        },
-        _ => panic!("Unknown target architecture for QEMU"),
-    });
-    default_args
+        }
+        other => anyhow::bail!("unknown target architecture for QEMU: {other}"),
+    })
+}
+
+/// The memory the guest is given, in MiB.
+///
+/// The bootloader reads the whole image into RAM before the kernel runs, so the
+/// guest needs room for a disk-sized buffer plus the kernel, the firmware and
+/// the tables built while doing it. A working image is a gigabyte, which leaves
+/// too little at 2048.
+const GUEST_MEMORY_MIB: u32 = 8192;
+
+/// The arguments that do not depend on the architecture or on firmware.
+fn common_qemu_args() -> Vec<String> {
+    [
+        "-cpu",
+        "max",
+        "-m",
+        &GUEST_MEMORY_MIB.to_string(),
+        "-smp",
+        "4",
+        "-netdev",
+        "user,id=net0",
+        "-device",
+        "e1000,netdev=net0",
+    ]
+    .iter()
+    .map(|argument| argument.to_string())
+    .collect()
+}
+
+/// QEMU's arguments for a guest of this build's target.
+///
+/// # Errors
+/// Returns an error when a UEFI architecture has no firmware installed; see
+/// [`uefi_firmware`].
+pub fn qemu_default_args() -> anyhow::Result<Vec<String>> {
+    let arch = target();
+    let mut default_args = common_qemu_args();
+    default_args.extend(machine_args(arch)?);
+    Ok(default_args)
 }
 
 static BASE_TOML: &str = include_str!("../res/base.toml");
@@ -202,6 +594,20 @@ fn clear_stale(name: &str, stamp_file: &Path, stamp: &str, files: &[&Path]) -> i
     Ok(())
 }
 
+/// Extracts the bootloader's boot image into `~/.redoxer/<target>` and records
+/// which firmware it needs.
+///
+/// The chosen image outlives one run: when the stamp says it is current the
+/// extraction is skipped, so the firmware decision has to be restored from the
+/// stamp as well. A stamp written before the firmware was recorded still names
+/// the bootloader package, which is enough for [`firmware_for`] to reach the
+/// same decision, so an existing cache keeps a coherent answer instead of
+/// falling back to staged-file detection.
+///
+/// # Errors
+/// Returns an error when the package cannot be installed, the stamp cannot be
+/// written, the extracted image cannot be moved into place, or the package has
+/// no boot image this build can start.
 fn bootloader(cookbook: &Path) -> anyhow::Result<PathBuf> {
     let bootloader_bin = redoxer_dir().join("bootloader.bin");
     let stamp_file = redoxer_dir().join("bootloader.stamp");
@@ -225,22 +631,65 @@ fn bootloader(cookbook: &Path) -> anyhow::Result<PathBuf> {
         redox_installer::install(config, &bootloader_dir)
             .map_err(|err| io::Error::other(format!("{err}")))?;
 
-        fs::rename(
-            bootloader_dir.join(if qemu_use_uefi() {
-                "usr/lib/boot/bootloader-live.efi"
-            } else {
-                "usr/lib/boot/bootloader.bios"
-            }),
-            &bootloader_bin,
-        )?;
+        let (image, firmware) = installed_bootloader(cookbook, &bootloader_dir)?;
+        fs::rename(image, &bootloader_bin)?;
+        // The stamp is what `clear_stale` compares byte for byte, so the
+        // firmware is recorded beside it: another line in the same file would
+        // make every later run see a mismatch and rebuild the bootloader.
+        fs::write(firmware_file(), firmware.to_string())?;
         fs::write(&stamp_file, stamp)?;
+        bootloader_firmware::set(firmware);
+    } else {
+        let stamp = fs::read_to_string(&stamp_file).unwrap_or_default();
+        bootloader_firmware::set(recorded_firmware(
+            &stamp,
+            fs::read_to_string(firmware_file()).ok().as_deref(),
+            target(),
+        ));
     }
     Ok(bootloader_bin)
 }
 
+/// Where the firmware of the extracted boot image is recorded.
+fn firmware_file() -> PathBuf {
+    redoxer_dir().join("bootloader.firmware")
+}
+
+/// The firmware a cached boot image was extracted for.
+///
+/// `record` is the `bootloader.firmware` file when the cache has one. A cache
+/// written before that file existed has none, and then the `stamp`'s package
+/// list stands in: the archives it names are what [`firmware_for`] reasons
+/// about, so an old cache gets the same answer as a fresh decision instead of
+/// leaving the firmware unknown.
+fn recorded_firmware(stamp: &str, record: Option<&str>, arch: &str) -> Firmware {
+    match record.map(str::trim) {
+        Some("UEFI") => Firmware::Uefi,
+        Some("BIOS") => Firmware::Bios,
+        // A missing or unreadable record is no record at all.
+        _ => firmware_from_packages(stamp, arch),
+    }
+}
+
+/// The firmware implied by the bootloader packages a `stamp` lists.
+///
+/// The stamp records the archives the image was built from, so a package named
+/// `bootloader.*` in it is the boot image that was extracted. Ferric Oxide's
+/// single package cannot boot BIOS, and one carrying a `bios` variant only
+/// boots BIOS when the checkout kept that path. A UEFI architecture with no
+/// record keeps UEFI; a BIOS-only one keeps BIOS without needing one.
+fn firmware_from_packages(stamp: &str, arch: &str) -> Firmware {
+    let has_bios_package = stamp.lines().any(|line| {
+        let name = line.split(' ').next().unwrap_or_default();
+        name.starts_with("bootloader.") && name.contains("bios")
+    });
+    firmware_for(arch, has_bios_package && bootloader_bios_available())
+}
+
 /// creating a base image, returns the base image, bool if orbital exists
 fn base(
-    bootloader_bin: &Path,
+    // Only the mounting path reads it; the archive path does not.
+    #[cfg_attr(not(feature = "fuse"), allow(unused_variables))] bootloader_bin: &Path,
     name: &str,
     mut config: redox_installer::Config,
     config_str: &str,
@@ -280,39 +729,47 @@ fn base(
         config.general.live_disk = Some(qemu_use_live_disk());
         config.general.cookbook = Some(cookbook.display().to_string());
 
+        #[cfg(feature = "fuse")]
         if fuse {
             run_install_mount(
                 config,
                 bootloader_bin,
                 qemu_use_uefi(),
-                qemu_disk_size(),
+                qemu_base_disk_size(),
                 &base_tar,
                 &base_dir,
                 &base_partial,
             )?;
 
-            // only shrink disk outside CI
-            if !base_tar.exists() {
-                eprintln!("redoxer: shrinking {name}");
-                // TODO: The bootloader unable to boot
-                if !qemu_use_uefi() {
-                    shrink_disk(&base_partial)?;
-                }
-            }
+            // The disk is written as raw and then stored as qcow2: only the
+            // blocks the install touched are kept, so the base stays small even
+            // though the guest sees a disk with room for a project.
+            let raw = base_partial.with_extension("raw");
+            fs::rename(&base_partial, &raw)?;
+            eprintln!("redoxer: compressing {name} to qcow2");
+            // A failed conversion must not leave the raw disk behind: it is
+            // hundreds of megabytes, it is not what `base_file` means, and the
+            // next run only clears the `.partial` output, so it would sit there
+            // for good. The conversion writes its own partial output, so
+            // removing ours on the way out leaves the cache as it was.
+            let converted = to_qcow2(&raw, &base_partial);
+            let unpacked = fs::remove_file(&raw);
+            converted?;
+            unpacked?;
         } else {
-            run_install_to_dir(config, &base_dir)?;
-
-            eprintln!("redoxer: compressing {name}");
-            Command::new("tar")
-                .arg("-c")
-                .arg("-p")
-                .arg("-f")
-                .arg(&base_partial)
-                .arg("-C")
-                .arg(&base_dir)
-                .arg(".")
-                .status()
-                .and_then(status_error)?;
+            #[cfg(not(feature = "fuse"))]
+            require_no_fuse(fuse)?;
+            // Without FUSE the tree is installed into a directory and written
+            // into a whole-disk image here; that layout is the one QEMU runs.
+            redox_installer::install(config, &base_dir)
+                .map_err(|err| io::Error::other(format!("{err}")))?;
+            archive_image(
+                &base_partial,
+                &base_dir,
+                bootloader_bin,
+                qemu_use_uefi(),
+                DISK_SIZE_LIVE,
+            )?;
         }
 
         fs::rename(&base_partial, &base_file)?;
@@ -322,6 +779,62 @@ fn base(
         fs::write(base_toml, stamp)?;
     }
     Ok((base_file, has_orbital))
+}
+
+/// A mounted image, which unmounts when dropped.
+#[cfg(feature = "fuse")]
+type MountedImage = RedoxFs;
+
+/// A build without the `fuse` feature never mounts an image.
+#[cfg(not(feature = "fuse"))]
+type MountedImage = core::convert::Infallible;
+
+/// Puts the image's contents in `dest_dir`, mounting the image when FUSE is
+/// asked for and extracting the archive otherwise.
+///
+/// A build without the `fuse` feature has no mounting code, so asking for FUSE
+/// there is a configuration error rather than a silent fallback to the other
+/// path: the two produce different images, and quietly changing which one runs
+/// would hide the mistake.
+fn install_into_disk(
+    fuse: bool,
+    redoxer_bin: &Path,
+    dest_dir: &Path,
+    base_file: &Path,
+) -> anyhow::Result<Option<MountedImage>> {
+    #[cfg(feature = "fuse")]
+    {
+        if fuse {
+            return Ok(Some(
+                RedoxFs::new(redoxer_bin, dest_dir).context("unable to init redoxfs")?,
+            ));
+        }
+        let _ = redoxer_bin;
+        extract_tar(base_file, dest_dir)?;
+        Ok(None)
+    }
+    // Without FUSE the archive path is the only one; it needs no mount.
+    #[cfg(not(feature = "fuse"))]
+    {
+        let _ = redoxer_bin;
+        if fuse {
+            return require_no_fuse(true);
+        }
+        extract_tar(base_file, dest_dir)?;
+        Ok(None)
+    }
+}
+
+/// Fails when a build without the `fuse` feature is asked to mount an image.
+#[cfg(not(feature = "fuse"))]
+fn require_no_fuse(fuse: bool) -> anyhow::Result<Option<MountedImage>> {
+    if fuse {
+        anyhow::bail!(
+            "redoxer was built without the fuse feature, so it cannot mount images; \
+             rebuild without REDOXER_USE_FUSE or with --features fuse"
+        );
+    }
+    Ok(None)
 }
 
 fn apply_qemu_args(cmd: &mut Command, default: Vec<&str>, args_opt: Option<Vec<&str>>) {
@@ -369,7 +882,294 @@ fn installed(program: &str) -> io::Result<bool> {
         .map(|x| x.success())
 }
 
+/// Boots `image` and returns the guest's exit code as redoxer reports it.
+///
+/// `image` is the whole disk to boot. The log goes to a temporary file so the
+/// caller can echo it back, and `--output -` hides the guest's console instead.
+///
+/// # Errors
+/// Returns an error when QEMU cannot be started, its status cannot be read, the
+/// log cannot be copied, or the UEFI firmware is missing.
+fn run_qemu(
+    config: &RedoxerExecConfig,
+    qemu_binary: &str,
+    image: &Path,
+    gui: bool,
+    qemu_verbose: bool,
+) -> anyhow::Result<i32> {
+    // The log lives beside the image, which is inside the caller's tempdir, so
+    // it is removed with it.
+    let redoxer_log = image.with_extension("log");
+    let mut command = Command::new(qemu_binary);
+
+    let chardev = format!("file,id=log,path={}", redoxer_log.display());
+    // The image is qcow2: raw would make QEMU read the header as disk content.
+    // The image QEMU boots is always raw: the stored base is qcow2, but a run
+    // unpacks its copy before mounting and rewriting it, and the install leaves
+    // raw bytes behind.
+    let drive = format!(
+        "file={},format=raw,if={}",
+        image.display(),
+        qemu_disk_device()
+    );
+    let mut default_args = qemu_default_args()?;
+    default_args.push("-chardev".to_string());
+    default_args.push(chardev);
+    default_args.push("-drive".to_string());
+    default_args.push(drive);
+    if config.kvm {
+        default_args.push("-accel".to_string());
+        default_args.push("kvm".to_string());
+    }
+    if !gui {
+        default_args.push("-nographic".to_string());
+        default_args.push("-vga".to_string());
+        default_args.push("none".to_string());
+    }
+
+    let default_args: Vec<&str> = default_args.iter().map(String::as_str).collect();
+    apply_qemu_args(
+        &mut command,
+        default_args,
+        config.qemu_args.as_ref().map(|s| s.split(' ').collect()),
+    );
+
+    if config.output.as_ref().is_some_and(|s| s == "-") {
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+    }
+
+    if qemu_verbose {
+        eprintln!("{command:?}");
+    }
+    let status = command.status().context("unable to get redoxer status")?;
+
+    eprintln!();
+
+    let code = match status.code() {
+        Some(51) => {
+            eprintln!("## redoxer (success) ##");
+            0
+        }
+        Some(53) => {
+            eprintln!("## redoxer (failure) ##");
+            1
+        }
+        _ => {
+            eprintln!("## redoxer (failure, qemu exit status {status}) ##");
+            2
+        }
+    };
+
+    match config.output.as_deref() {
+        Some("-") => print!("{}", fs::read_to_string(&redoxer_log)?),
+        Some(output) => fs::copy(&redoxer_log, output).map(|_| {})?,
+        None => {}
+    }
+
+    Ok(code)
+}
+
+/// Boots an already-installed whole-disk image and runs the command in it.
+///
+/// This is `--image`: the caller prepared the image, so nothing is installed
+/// and no bootloader is extracted into it. Booting a copy keeps the prepared
+/// image exactly as it was — a build reuses it for every tool it runs, and
+/// recipes cook in parallel — while the per-invocation files (`/etc/redoxerd`,
+/// the init units that start it and the folders to copy) go into the copy
+/// alone.
+///
+/// This mode never mounts the image, so `REDOXER_USE_FUSE` has no effect on it.
+/// It writes through the RedoxFS writer in [`crate::redoxfs::write_files`],
+/// which needs neither FUSE nor root, and mounting would defeat the point:
+/// every invocation gets its own copy of the disk, whereas a mount is a second
+/// view of one image. The test `image_mode_ignores_the_fuse_setting` pins the
+/// fact that nothing in this function reads that flag.
+///
+/// # Errors
+/// Returns an error when the image does not exist, QEMU is missing, the copy
+/// fails, a file cannot be written into the copy, or QEMU cannot be run.
+/// `--artifact` is refused: redoxer writes into an image but does not mount
+/// it, so it cannot read files back out of one.
+fn inner_image(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
+    artifact_refusal(config)?;
+    let path = config
+        .image
+        .as_ref()
+        .context("--image needs a path to a guest image")?;
+    // The mode boots what is there. A missing image is an environment that was
+    // never installed, not a request to install a new one, so it fails where it
+    // is noticed rather than silently building another image.
+    if !path.is_file() {
+        anyhow::bail!(
+            "guest image {} does not exist; install it before running a command in it \
+             (`make build_tools`)",
+            path.display()
+        );
+    }
+    let image = fs::canonicalize(path)
+        .with_context(|| format!("unable to resolve the guest image {}", path.display()))?;
+
+    let qemu_binary = config
+        .qemu_binary
+        .as_deref()
+        .unwrap_or_else(|| qemu_executable());
+    if !installed(qemu_binary)? {
+        anyhow::bail!("{qemu_binary} not found, please install before continuing");
+    }
+
+    let tempdir = tempfile::tempdir().context("unable to create tempdir")?;
+    let working_image = tempdir.path().join("redoxer.img");
+
+    // A copy, not the image itself: the files below are written into it, and
+    // the environment is shared by every command a build runs. `--sparse=always`
+    // keeps a mostly empty image the size of its contents.
+    Command::new("cp")
+        .arg("--sparse=always")
+        .arg(&image)
+        .arg(&working_image)
+        .status()
+        .and_then(status_error)
+        .context("copying the guest image failed")?;
+
+    let mut files = redoxerd_config_files(
+        &config.arguments,
+        config.folders.get("root").map(String::as_str),
+    )?;
+    files.extend(folder_files(config)?);
+    if !files.is_empty() {
+        crate::redoxfs::write_files(&working_image, &files)
+            .context("unable to write into the guest image")?;
+    }
+
+    let code = run_qemu(config, qemu_binary, &working_image, false, false)?;
+
+    tempdir.close()?;
+    Ok(code)
+}
+
+/// Why `--artifact` cannot work in image mode.
+///
+/// An artifact is copied out of the guest through a mount of its file system.
+/// Image mode has no mount — it writes into the copy with the RedoxFS writer
+/// and boots the copy — so the files could not be delivered. Saying so while
+/// the arguments are parsed, and again before anything is booted, is the
+/// difference between a run that fails immediately and one that spends minutes
+/// booting, runs the command and then throws its output away.
+const ARTIFACT_REFUSAL: &str = "--artifact cannot read files out of a --image guest: redoxer \
+     writes into an image but does not mount it, so use REDOXER_USE_FUSE with an install \
+     configuration";
+
+/// Refuses `--artifact` in image mode, before anything is booted.
+///
+/// # Errors
+/// Returns [`ARTIFACT_REFUSAL`] when `--artifact` was given with `--image`.
+fn artifact_refusal(config: &RedoxerExecConfig) -> anyhow::Result<()> {
+    if config.artifacts.is_empty() || config.image.is_none() {
+        return Ok(());
+    }
+    bail!(ARTIFACT_REFUSAL)
+}
+
+/// The files that put a `--folder` source into the guest image.
+///
+/// Each folder is read from the host and written under its destination, so the
+/// image needs no mount and no `rsync`. Only regular files and directories are
+/// copied: a build passes source trees, and following a symlink out of one
+/// would write host files into the image at a path the build did not name.
+///
+/// The destination is resolved from its own path, not from the image: the file
+/// system inside the disk has `/` as its root, and that is what
+/// [`guest_path`] builds. Resolving against the image file as if it were a
+/// root directory, which is what the mounting path does for its staging tree,
+/// fails for every destination because a disk image is not a directory.
+///
+/// # Errors
+/// Returns an error when a source directory cannot be walked, or a destination
+/// is not an absolute path inside the guest image.
+fn folder_files(config: &RedoxerExecConfig) -> anyhow::Result<Vec<GuestEntry>> {
+    let mut files = Vec::new();
+    for (sysroot, folder) in config.folders.iter() {
+        let destination = guest_path(sysroot)
+            .with_context(|| format!("the destination of {folder} is not inside the image"))?;
+        copy_into(folder.as_ref(), destination, &mut files, 0)?;
+    }
+    Ok(files)
+}
+
+/// The guest-absolute path a `--folder` destination names.
+///
+/// `sysroot` is a key of [`RedoxerExecConfig::folders`], which holds the
+/// destination already relative to the guest's root: `--folder src:/opt/x`
+/// parses to `opt/x`, and a bare `--folder src` to `root`.
+///
+/// `/` here is the root of the file system inside the image, so the destination
+/// is validated on its own: a `..` component would put the copy outside the
+/// guest image, and no host directory is involved, so no host path can be
+/// escaped either.
+///
+/// # Errors
+/// Returns an error when the path contains `..` or a platform prefix, or names
+/// the image root rather than a folder in it.
+fn guest_path(sysroot: &str) -> anyhow::Result<PathBuf> {
+    let relative = redox_installer::image_relative_path(Path::new(sysroot))?;
+    if relative.as_os_str().is_empty() {
+        bail!("{sysroot:?} names the image root, not a folder in it");
+    }
+    Ok(Path::new("/").join(relative))
+}
+
+/// Reads the tree at `source` into `target` in the guest.
+///
+/// `depth` bounds the walk so a symlink loop cannot spin here; the guest
+/// directories a build copies are shallow.
+///
+/// # Errors
+/// Returns an error when a directory cannot be read or a file cannot be read.
+fn copy_into(
+    source: &Path,
+    target: PathBuf,
+    files: &mut Vec<GuestEntry>,
+    depth: usize,
+) -> anyhow::Result<()> {
+    const MAX_DEPTH: usize = 64;
+    if depth > MAX_DEPTH {
+        anyhow::bail!(
+            "{} is nested deeper than {MAX_DEPTH} directories",
+            source.display()
+        );
+    }
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("unable to read {}", source.display()))?;
+    if metadata.is_dir() {
+        for entry in
+            fs::read_dir(source).with_context(|| format!("unable to list {}", source.display()))?
+        {
+            let entry = entry?;
+            copy_into(
+                &entry.path(),
+                target.join(entry.file_name()),
+                files,
+                depth + 1,
+            )?;
+        }
+    } else if metadata.is_file() {
+        let data =
+            fs::read(source).with_context(|| format!("unable to read {}", source.display()))?;
+        // Keep the source's mode so an executable stays executable in the guest.
+        let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) as u16 & 0o777;
+        // Empty files stay files: the kind is explicit, so an empty
+        // `--folder` source is not mistaken for a directory request.
+        files.push(GuestEntry::file(target, data, mode));
+    }
+    Ok(())
+}
+
 fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
+    if config.image.is_some() {
+        return inner_image(config);
+    }
+
     let qemu_binary = config
         .qemu_binary
         .as_deref()
@@ -384,8 +1184,6 @@ fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
         );
         process::exit(1);
     }
-    let kvm = config.kvm;
-
     let fuse = config.fuse;
 
     if fuse {
@@ -424,6 +1222,9 @@ fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
 
     let code = {
         if fuse {
+            // The stored base is qcow2, which only QEMU reads. Everything that
+            // mounts or rewrites the disk here works on raw bytes, so unpack it
+            // into the copy the run will use.
             Command::new("cp")
                 .arg(&base_file)
                 .arg(&redoxer_bin)
@@ -431,18 +1232,28 @@ fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
                 .and_then(status_error)
                 .context("copy base to redoxer bin failed")?;
 
-            expand_disk(&redoxer_bin, qemu_disk_size())?;
+            // Only the FUSE install path stores its base as qcow2; the archive
+            // path writes a whole-disk image, so this is compiled out with it.
+            #[cfg(feature = "fuse")]
+            {
+                let raw = redoxer_bin.with_extension("raw");
+                crate::redoxfs::to_raw(&redoxer_bin, &raw)
+                    .context("unable to unpack the base image")?;
+                fs::rename(&raw, &redoxer_bin).context("unable to use the unpacked base image")?;
+            }
+
+            // The base image is the disk. Expanding it here would write a
+            // filesystem header sized from the whole file, but the firmware
+            // exposes only the RedoxFS partition, which is smaller by the GPT
+            // and EFI partition ahead of it: the bootloader then reads past the
+            // partition and setup fails with "invalid parameter". The shrunk
+            // base already has room for the files a run adds.
         }
 
         fs::create_dir_all(&dest_dir).context("unable to create redoxer dir")?;
 
         {
-            let redoxfs_opt = if fuse {
-                Some(RedoxFs::new(&redoxer_bin, &dest_dir).context("unable to init redoxfs")?)
-            } else {
-                extract_tar(&base_file, &dest_dir)?;
-                None
-            };
+            let redoxfs_opt = install_into_disk(fuse, &redoxer_bin, &dest_dir, &base_file)?;
 
             write_redoxerd_config(
                 &dest_dir,
@@ -467,9 +1278,12 @@ fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
                     .context("rsync failed")?;
             }
 
+            #[cfg(feature = "fuse")]
             if let Some(mut redoxfs) = redoxfs_opt {
                 redoxfs.unmount().context("unable to unmount")?;
             }
+            #[cfg(not(feature = "fuse"))]
+            let _ = redoxfs_opt;
         }
 
         if !fuse {
@@ -482,75 +1296,11 @@ fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
             )?;
         }
 
-        let redoxer_log = tempdir.path().join("redoxer.log");
-        let mut command = Command::new(qemu_binary);
-
-        let chardev = format!("file,id=log,path={}", redoxer_log.display());
-        let drive = format!(
-            "file={},format=raw,if={}",
-            redoxer_bin.display(),
-            qemu_disk_device()
-        );
-        let mut default_args = qemu_default_args();
-        default_args.extend(vec!["-chardev", &chardev, "-drive", &drive]);
-        if kvm {
-            default_args.push("-accel");
-            default_args.push("kvm");
-        }
-        if !gui {
-            default_args.push("-nographic");
-            default_args.push("-vga");
-            default_args.push("none");
-        }
-
-        apply_qemu_args(
-            &mut command,
-            default_args,
-            config.qemu_args.as_ref().map(|s| s.split(" ").collect()),
-        );
-
-        if config.output.as_ref().is_some_and(|s| s == "-") {
-            command.stdout(Stdio::null());
-            command.stderr(Stdio::null());
-        }
-
-        if qemu_verbose {
-            eprintln!("{command:?}");
-        }
-        let status = command.status().context("unable to get redoxer status")?;
-
-        eprintln!();
-
-        let code = match status.code() {
-            Some(51) => {
-                eprintln!("## redoxer (success) ##");
-                0
-            }
-            Some(53) => {
-                eprintln!("## redoxer (failure) ##");
-                1
-            }
-            _ => {
-                eprintln!("## redoxer (failure, qemu exit status {status}) ##");
-                2
-            }
-        };
-
-        match config.output.as_deref() {
-            Some("-") => print!("{}", fs::read_to_string(&redoxer_log)?),
-            Some(output) => fs::copy(&redoxer_log, output).map(|_| {})?,
-            None => {}
-        }
-
-        code
+        run_qemu(config, qemu_binary, &redoxer_bin, gui, qemu_verbose)?
     };
 
     if code == 0 && !config.artifacts.is_empty() {
-        let redoxfs_opt = if fuse {
-            Some(RedoxFs::new(&redoxer_bin, &dest_dir).context("unable to init redoxfs")?)
-        } else {
-            unimplemented!()
-        };
+        let redoxfs_opt = install_into_disk(fuse, &redoxer_bin, &dest_dir, &base_file)?;
 
         for (sysroot, folder) in config.artifacts.iter() {
             eprintln!("redoxer: copying '/{sysroot}' to '{folder}'");
@@ -571,9 +1321,12 @@ fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
                 .context("rsync failed")?;
         }
 
+        #[cfg(feature = "fuse")]
         if let Some(mut redoxfs) = redoxfs_opt {
             redoxfs.unmount().context("unable to unmount")?;
         }
+        #[cfg(not(feature = "fuse"))]
+        let _ = redoxfs_opt;
     }
 
     tempdir.close()?;
@@ -611,6 +1364,11 @@ pub struct RedoxerExecConfig {
     pub config_name: String,
     pub config_toml: String,
     pub install_config: Option<PathBuf>,
+    /// A whole-disk image to boot as it is, instead of installing one from
+    /// `install_config`. A build that prepared an environment (the guest build
+    /// tools) boots that one: the tools are in it, and installing from a base
+    /// configuration would produce an image without them.
+    pub image: Option<PathBuf>,
     // Folders to copy (host -> qemu)
     pub folders: HashMap<String, String>,
     // Folders to extract (qemu -> host)
@@ -683,6 +1441,15 @@ impl RedoxerExecConfig {
                     config.config_toml = GUI_TOML.into();
                     config.install_config = None;
                 }
+                ("--image", true) => match args.next() {
+                    Some(image) => {
+                        if config.install_config.is_some() {
+                            bail!("--image and --install-config cannot be combined");
+                        }
+                        config.image = Some(PathBuf::from(image));
+                    }
+                    None => bail!("--image requires a path to a guest image"),
+                },
                 ("-i" | "--install-config", true) => match args.next() {
                     Some(file) => {
                         let path = Path::new(&file);
@@ -697,8 +1464,9 @@ impl RedoxerExecConfig {
                         config.config_toml = fs::read_to_string(path)
                             .context("unable to read --install-config file")?;
                         config.install_config = Some(fs::canonicalize(path)?);
+                        config.image = None;
                     }
-                    None => bail!("--output requires a path to a directory"),
+                    None => bail!("--install-config requires a path to a file"),
                 },
                 ("-h" | "--help", true) => bail!(""),
                 ("-o" | "--output", true) => match args.next() {
@@ -736,6 +1504,10 @@ impl RedoxerExecConfig {
             )?
         }
 
+        // A mount is what copies an artifact out, and only an install
+        // configuration has one. Image mode says so itself, before the FUSE
+        // check, because turning FUSE on would not make its artifacts work.
+        artifact_refusal(&config)?;
         if !config.artifacts.is_empty() && !config.fuse {
             bail!("--artifact requires REDOXER_USE_FUSE=true");
         }
@@ -756,7 +1528,10 @@ impl RedoxerExecConfig {
             args.push(format!("{host_dir}:/{sysroot}"));
         }
 
-        if let Some(path) = &self.install_config {
+        if let Some(path) = &self.image {
+            args.push("--image".to_string());
+            args.push(path.to_string_lossy().into_owned());
+        } else if let Some(path) = &self.install_config {
             args.push("--install-config".to_string());
             args.push(path.to_string_lossy().into_owned());
         } else if self.config_name == "gui" {
@@ -807,6 +1582,509 @@ pub fn main(args: &[String]) {
 mod tests {
     use super::*;
 
+    /// `--image` boots an installed image, so it cannot be combined with the
+    /// install configuration `--install-config` provides instead.
+    #[test]
+    fn image_mode_takes_a_path_and_rules_out_an_install_config() {
+        let config =
+            RedoxerExecConfig::new(["--image".into(), "guest.img".into()].into_iter()).unwrap();
+        assert_eq!(config.image, Some(PathBuf::from("guest.img")));
+
+        // A later --install-config replaces the mode rather than mixing them.
+        // A configuration file also names the configuration, and `base`/`gui`
+        // are the built-in ones, so this one is its own.
+        let temporary = tempfile::tempdir().unwrap();
+        let install_config = temporary.path().join("custom.toml");
+        std::fs::write(&install_config, "[general]\nfilesystem_size = 512\n").unwrap();
+        let config = RedoxerExecConfig::new(
+            [
+                "--image".into(),
+                "guest.img".into(),
+                "--install-config".into(),
+                install_config.to_string_lossy().into_owned(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(config.image, None);
+        assert!(config.install_config.is_some());
+
+        // The other order is refused, because the image would silently win.
+        let error = RedoxerExecConfig::new(
+            [
+                "--install-config".into(),
+                install_config.to_string_lossy().into_owned(),
+                "--image".into(),
+                "guest.img".into(),
+            ]
+            .into_iter(),
+        )
+        .err()
+        .expect("--image and --install-config cannot be combined");
+        assert!(
+            error.to_string().contains("cannot be combined"),
+            "unexpected error: {error}"
+        );
+
+        let error = RedoxerExecConfig::new(["--image".into()].into_iter())
+            .err()
+            .expect("--image needs a value");
+        assert!(error.to_string().contains("--image requires a path"));
+    }
+
+    /// `redoxer cargo` re-executes `redoxer exec` with the arguments it was
+    /// given, so the image has to survive that round trip.
+    #[test]
+    fn image_mode_survives_a_round_trip_through_to_args() {
+        let config = RedoxerExecConfig::new(
+            [
+                "--image".into(),
+                "guest.img".into(),
+                "--".into(),
+                "mdbook".into(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let args = config.to_args();
+        assert!(args.contains(&"--image".to_string()), "{args:?}");
+        let rebuilt = RedoxerExecConfig::new(args.into_iter()).unwrap();
+        assert_eq!(rebuilt.image, Some(PathBuf::from("guest.img")));
+        assert_eq!(rebuilt.arguments, ["mdbook"]);
+    }
+
+    /// `--artifact` copies files out of the guest, which needs the mount that
+    /// image mode does not use. The refusal names image mode rather than
+    /// pointing at `REDOXER_USE_FUSE`, which would not help: it happens while
+    /// the arguments are parsed, so a run that could not deliver its files
+    /// fails before QEMU starts rather than after the command has run.
+    #[test]
+    fn image_mode_refuses_artifacts_before_booting() {
+        let error = RedoxerExecConfig::new(
+            [
+                "--image".into(),
+                "guest.img".into(),
+                "--artifact".into(),
+                "out:/usr/share/out".into(),
+                "--".into(),
+                "tool".into(),
+            ]
+            .into_iter(),
+        )
+        .err()
+        .expect("image mode refuses --artifact");
+        assert!(
+            error.to_string().contains("--artifact cannot read"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("--image"),
+            "the message names the mode: {error}"
+        );
+
+        // The same artifact with an install configuration is what the mount is
+        // for, so the refusal is about the mode and not about `--artifact`.
+        // Building the config by hand keeps the answer independent of whether
+        // this host happens to have FUSE: the FUSE check is a separate rule.
+        let install_config = RedoxerExecConfig {
+            artifacts: HashMap::from([("usr/share/out".to_string(), "out".to_string())]),
+            fuse: true,
+            ..Default::default()
+        };
+        assert!(
+            artifact_refusal(&install_config).is_ok(),
+            "an install configuration may copy artifacts out"
+        );
+
+        // `inner_image` asks again before booting, so a config built by hand —
+        // as `redoxer cargo` rebuilds one — cannot reach QEMU either.
+        let image_mode = RedoxerExecConfig {
+            image: Some(PathBuf::from("guest.img")),
+            ..install_config
+        };
+        let error = artifact_refusal(&image_mode).expect_err("image mode refuses --artifact");
+        assert!(
+            error.to_string().contains("--artifact cannot read"),
+            "{error}"
+        );
+    }
+
+    /// Image mode does not mount the image, so `REDOXER_USE_FUSE` changes
+    /// nothing about it. The flag is read in `RedoxerExecConfig::new` for the
+    /// install path; this checks that the value a config carries does not
+    /// reach any decision image mode makes. Mounting would also be wrong:
+    /// every invocation gets its own copy, and a mount exposes one image to
+    /// every reader at once.
+    #[test]
+    fn image_mode_ignores_the_fuse_setting() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("src");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("tool"), "binary").unwrap();
+
+        for fuse in [true, false] {
+            let config = RedoxerExecConfig {
+                image: Some(PathBuf::from("guest.img")),
+                fuse,
+                folders: HashMap::from([("root".to_string(), source.display().to_string())]),
+                arguments: vec!["tool".to_string()],
+                ..Default::default()
+            };
+            // The files the run installs are the same either way, and none of
+            // them is a staging tree a mount would be needed to fill.
+            let files = folder_files(&config).unwrap();
+            assert_eq!(files.len(), 1, "fuse={fuse}: {files:?}");
+            assert!(
+                artifact_refusal(&config).is_ok(),
+                "fuse={fuse} does not make an artifact readable"
+            );
+        }
+    }
+
+    /// A missing firmware is a setup problem the user can fix, so it is an
+    /// error naming what to install rather than a panic. The lookup runs
+    /// against a path that cannot exist, so the test does not depend on which
+    /// firmware this host happens to have.
+    #[test]
+    fn a_missing_firmware_names_the_packages_to_install() {
+        for arch in [
+            "x86_64-unknown-redox",
+            "aarch64-unknown-redox",
+            "riscv64gc-unknown-redox",
+        ] {
+            let error = uefi_firmware_among(arch, &[("/nonexistent/firmware.fd", "value")])
+                .expect_err("a firmware that does not exist is an error");
+            let message = error.to_string();
+            assert!(message.contains(arch), "{message}");
+            assert!(
+                message.contains("/nonexistent/firmware.fd"),
+                "the message lists where it looked: {message}"
+            );
+            // The caller's wrapper is what tells the user what to install.
+            let (_, candidates, packages) = FIRMWARE_SEARCHES
+                .iter()
+                .find(|(name, _, _)| *name == arch)
+                .unwrap();
+            assert!(!candidates.is_empty(), "{arch}");
+            assert!(!packages.is_empty(), "{arch} names where to get it");
+        }
+        // An architecture with no entry at all is rejected, not guessed.
+        assert!(uefi_firmware("mips-unknown-redox").is_err());
+    }
+
+    /// The search table is the only record of where firmware lives, so every
+    /// architecture `machine_args` handles must have an entry.
+    #[test]
+    fn every_uefi_architecture_has_a_firmware_search() {
+        for arch in [
+            "x86_64-unknown-redox",
+            "aarch64-unknown-redox",
+            "riscv64gc-unknown-redox",
+        ] {
+            assert!(
+                FIRMWARE_SEARCHES.iter().any(|(name, _, _)| *name == arch),
+                "{arch} needs a firmware search"
+            );
+        }
+        // i586/i686 are BIOS only: they must not claim UEFI firmware.
+        for arch in ["i586-unknown-redox", "i686-unknown-redox"] {
+            assert!(
+                !FIRMWARE_SEARCHES.iter().any(|(name, _, _)| *name == arch),
+                "{arch} boots through BIOS"
+            );
+        }
+    }
+
+    /// One rule decides BIOS versus UEFI. An x86_64 package that ships both
+    /// images must boot the BIOS one when the checkout kept the BIOS
+    /// bootloader, which is how an upstream-style build always booted: taking
+    /// the first image that exists would demand OVMF from a guest that never
+    /// needed it.
+    #[test]
+    fn a_dual_bootloader_package_boots_the_way_the_checkout_can() {
+        let temporary = tempfile::tempdir().unwrap();
+        let package = temporary.path().join("package");
+        fs::create_dir_all(package.join("usr/lib/boot")).unwrap();
+
+        // Only the UEFI image: Ferric Oxide's package, which boots UEFI.
+        fs::write(package.join(INSTALLED_UEFI_IMAGE), "efi").unwrap();
+        let (image, firmware) = installed_bootloader(temporary.path(), &package).unwrap();
+        assert_eq!(firmware, Firmware::Uefi);
+        assert_eq!(image, package.join(INSTALLED_UEFI_IMAGE));
+
+        // Both images: the rule, not the file order, decides. `target()` is the
+        // build's target, so the expected answer comes from the same rule.
+        fs::write(package.join(INSTALLED_BIOS_IMAGE), "bios").unwrap();
+        let (image, firmware) = installed_bootloader(temporary.path(), &package).unwrap();
+        assert_eq!(
+            firmware,
+            firmware_for(target(), bootloader_bios_available()),
+            "a package with both images follows the checkout"
+        );
+        assert_eq!(
+            image,
+            package.join(match firmware {
+                Firmware::Uefi => INSTALLED_UEFI_IMAGE,
+                Firmware::Bios => INSTALLED_BIOS_IMAGE,
+            }),
+            "the extracted image is the one the firmware decision names"
+        );
+        assert_eq!(
+            firmware == Firmware::Uefi,
+            qemu_use_uefi(),
+            "the QEMU firmware and the extracted image are the same decision"
+        );
+
+        // Only the BIOS image left: a target whose rule says UEFI cannot boot
+        // it at all, because there is no UEFI image to extract. The rule is
+        // asked rather than `bootloader_bios_available` alone, so what this
+        // checkout happens to have is not assumed.
+        fs::remove_file(package.join(INSTALLED_UEFI_IMAGE)).unwrap();
+        match firmware_for(target(), bootloader_bios_available()) {
+            Firmware::Bios => assert_eq!(
+                installed_bootloader(temporary.path(), &package).unwrap().1,
+                Firmware::Bios
+            ),
+            Firmware::Uefi => {
+                let error = installed_bootloader(temporary.path(), &package)
+                    .expect_err("a UEFI target needs a UEFI image");
+                assert!(error.to_string().contains("no UEFI boot image"), "{error}");
+            }
+        }
+
+        // Neither image: an error naming the checkout, never a guess.
+        fs::remove_file(package.join(INSTALLED_BIOS_IMAGE)).unwrap();
+        let error = installed_bootloader(temporary.path(), &package)
+            .expect_err("a package with no boot image is an error");
+        assert!(
+            error
+                .to_string()
+                .contains(&temporary.path().display().to_string()),
+            "{error}"
+        );
+    }
+
+    /// The rule itself: x86_64 follows the checkout's BIOS bootloader, the
+    /// other architectures do not, and the two x86 BIOS targets always are.
+    #[test]
+    fn only_x86_64_lets_the_checkout_choose_the_firmware() {
+        assert_eq!(firmware_for("x86_64-unknown-redox", false), Firmware::Uefi);
+        assert_eq!(firmware_for("x86_64-unknown-redox", true), Firmware::Bios);
+        for arch in ["aarch64-unknown-redox", "riscv64gc-unknown-redox"] {
+            assert_eq!(firmware_for(arch, false), Firmware::Uefi, "{arch}");
+            assert_eq!(
+                firmware_for(arch, true),
+                Firmware::Uefi,
+                "{arch} has no BIOS boot path to keep"
+            );
+        }
+        for arch in ["i586-unknown-redox", "i686-unknown-redox"] {
+            assert_eq!(firmware_for(arch, true), Firmware::Bios, "{arch}");
+        }
+    }
+
+    /// Which image the bootloader package offers decides, so the BIOS bootloader
+    /// is looked for where the package puts it rather than at a borrowed name.
+    #[test]
+    fn the_bios_bootloader_is_found_in_a_stage_tree() {
+        let temporary = tempfile::tempdir().unwrap();
+        assert!(bios_bootloader(temporary.path()).is_none());
+
+        let staged = temporary.path().join(BIOS_BOOTLOADER);
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&staged, "bios").unwrap();
+        assert_eq!(bios_bootloader(temporary.path()), Some(staged));
+    }
+
+    /// A staged tree that holds a BIOS loader can boot BIOS, even when it also
+    /// holds a UEFI one.
+    ///
+    /// A plain `repo cook` does not set FERRIC_UEFI_ONLY, so its bootloader
+    /// stage often has both images. Treating that as "no BIOS" forced UEFI and
+    /// demanded OVMF from a host whose loader it could already boot.
+    #[test]
+    fn a_stage_with_both_images_still_offers_bios() {
+        let temporary = tempfile::tempdir().unwrap();
+        let stage = temporary.path();
+
+        // Neither image: no BIOS to offer.
+        assert!(bios_bootloader(stage).is_none());
+
+        // Both: the BIOS loader is there, so BIOS is available.
+        for image in [BIOS_BOOTLOADER, "usr/lib/boot/bootloader-live.efi"] {
+            let path = stage.join(image);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "image").unwrap();
+        }
+        assert_eq!(
+            bios_bootloader(stage),
+            Some(stage.join(BIOS_BOOTLOADER)),
+            "a dual-image stage keeps its BIOS loader"
+        );
+
+        // This is what `bootloader_bios_available` reduces to, so the rule sees
+        // BIOS as available here and no longer insists on UEFI.
+        assert_eq!(
+            firmware_for(target(), bios_bootloader(stage).is_some()),
+            if target().starts_with("x86_64") {
+                Firmware::Bios
+            } else {
+                firmware_for(target(), true)
+            },
+            "an x86_64 checkout with a BIOS loader boots BIOS"
+        );
+    }
+
+    /// A cache hit must reach the firmware decision of the run that filled the
+    /// cache, whatever the architecture would guess on its own.
+    #[test]
+    fn a_cached_bootloader_restores_the_firmware_it_was_extracted_for() {
+        let stamp = "cookbook /checkout\nbootloader.pkgar 123 456\n";
+        for firmware in [Firmware::Uefi, Firmware::Bios] {
+            for arch in [
+                "x86_64-unknown-redox",
+                "i586-unknown-redox",
+                "aarch64-unknown-redox",
+            ] {
+                assert_eq!(
+                    recorded_firmware(stamp, Some(&firmware.to_string()), arch),
+                    firmware,
+                    "{arch} restores the recorded {firmware}"
+                );
+            }
+        }
+    }
+
+    /// The record lives beside the stamp, not in it: `clear_stale` compares the
+    /// stamp byte for byte, so a firmware line inside it would make every run
+    /// treat its own cache as stale and rebuild the bootloader forever.
+    #[test]
+    fn recording_the_firmware_does_not_invalidate_the_stamp() {
+        let temporary = tempfile::tempdir().unwrap();
+        let stamp_file = temporary.path().join("bootloader.stamp");
+        let firmware = temporary.path().join("bootloader.firmware");
+        let stamp = cookbook_stamp(&temporary.path().join("cookbook"), |_| true);
+
+        // No cookbook repository: the stamp is unknown, which is what a rebuild
+        // looks like, so only the file contents are under test here.
+        let stamp = match stamp {
+            Ok(stamp) => stamp,
+            Err(_) => "cookbook /checkout\nbootloader.pkgar 123 456\n".to_string(),
+        };
+        fs::write(&stamp_file, &stamp).unwrap();
+        fs::write(&firmware, Firmware::Bios.to_string()).unwrap();
+        assert_eq!(fs::read_to_string(&firmware).unwrap(), "BIOS");
+        assert_eq!(
+            fs::read_to_string(&stamp_file).unwrap(),
+            stamp,
+            "the stamp is written unchanged"
+        );
+    }
+
+    /// A stamp from before the firmware was recorded has only the package list,
+    /// and that alone must still give the same answer as a fresh decision.
+    #[test]
+    fn an_old_stamp_still_decides_the_firmware() {
+        let old = "cookbook /checkout\nbootloader.pkgar 123 456\n";
+        // Ferric Oxide's single package implies no BIOS bootloader beside it.
+        assert_eq!(
+            recorded_firmware(old, None, "x86_64-unknown-redox"),
+            firmware_for("x86_64-unknown-redox", false)
+        );
+        // A package that ships a BIOS variant is the upstream arrangement: it
+        // boots BIOS exactly when the checkout also kept the BIOS bootloader,
+        // which `bootloader_bios_available` answers, not this test.
+        let upstream = "cookbook /checkout\nbootloader.bios.pkgar 1 2\nbootloader.pkgar 3 4\n";
+        assert_eq!(
+            recorded_firmware(upstream, None, "x86_64-unknown-redox"),
+            firmware_for("x86_64-unknown-redox", bootloader_bios_available()),
+            "a BIOS package follows the checkout like a fresh decision would"
+        );
+        // Without a BIOS variant in the package there is nothing to boot BIOS with.
+        assert_eq!(
+            recorded_firmware(old, None, "x86_64-unknown-redox"),
+            Firmware::Uefi,
+            "a package with no BIOS variant is Ferric Oxide's UEFI-only image"
+        );
+        assert_eq!(
+            recorded_firmware(old, None, "aarch64-unknown-redox"),
+            Firmware::Uefi
+        );
+        // An empty or unreadable stamp is not a reason to panic.
+        assert_eq!(
+            recorded_firmware("", None, "x86_64-unknown-redox"),
+            firmware_for("x86_64-unknown-redox", false)
+        );
+        assert_eq!(
+            recorded_firmware(
+                "firmware whatever\n",
+                Some("firmware whatever"),
+                "x86_64-unknown-redox"
+            ),
+            firmware_for("x86_64-unknown-redox", false)
+        );
+    }
+
+    /// Every guest gets the memory the bootloader needs to load its disk. The
+    /// argument is architecture-independent, so it is asserted where it is
+    /// built rather than through the firmware-dependent `qemu_default_args`.
+    #[test]
+    fn a_guest_is_given_the_memory_the_bootloader_needs() {
+        let args = common_qemu_args();
+        let memory = args
+            .iter()
+            .position(|argument| argument == "-m")
+            .unwrap_or_else(|| panic!("the default arguments name -m: {args:?}"));
+        assert_eq!(
+            args.get(memory + 1).map(String::as_str),
+            Some(GUEST_MEMORY_MIB.to_string().as_str()),
+            "the guest memory is GUEST_MEMORY_MIB: {args:?}"
+        );
+        assert_eq!(
+            GUEST_MEMORY_MIB, 8192,
+            "the guest loads a DISK_SIZE_LIVE disk into memory, so it needs \
+             twice that to hold the disk and run the kernel beside it"
+        );
+    }
+
+    /// `REDOXER_QEMU_ARGS` overrides a default flag by naming it, so passing
+    /// `-m` is how a machine with less RAM lowers the guest's. The merge would
+    /// silently keep both values if it did not drop the default one, so this
+    /// asserts the documented override actually takes effect.
+    #[test]
+    fn a_user_qemu_argument_replaces_the_default_one() {
+        let default = common_qemu_args();
+        let default: Vec<&str> = default.iter().map(String::as_str).collect();
+        let mut command = Command::new("true");
+        apply_qemu_args(
+            &mut command,
+            default,
+            Some(vec!["-m", "2048", "-nographic"]),
+        );
+        let merged: Vec<&str> = command
+            .get_args()
+            .map(|argument| argument.to_str().unwrap())
+            .collect();
+        let memories: Vec<&str> = merged
+            .iter()
+            .enumerate()
+            .filter(|(index, argument)| {
+                **argument == "-m" || merged.get(index.wrapping_sub(1)) == Some(&"-m")
+            })
+            .map(|(_, argument)| *argument)
+            .collect();
+        assert_eq!(
+            memories,
+            ["-m", "2048"],
+            "the user's -m replaces the default: {merged:?}"
+        );
+        assert!(merged.contains(&"-nographic"), "{merged:?}");
+        assert!(
+            !merged.contains(&GUEST_MEMORY_MIB.to_string().as_str()),
+            "the default memory is gone: {merged:?}"
+        );
+    }
+
     #[test]
     fn folder_destinations_reject_traversal() {
         for path in ["src:/../../outside", "src:/etc/../outside"] {
@@ -816,6 +2094,119 @@ mod tests {
             RedoxerExecConfig::new(["--folder".into(), "src:/etc/./data".into()].into_iter())
                 .unwrap();
         assert_eq!(config.folders.get("etc/data"), Some(&"src".to_string()));
+    }
+
+    /// A `--folder` copy in image mode writes under the guest's own root. The
+    /// destinations used to be resolved against the image *file* as if it were
+    /// a directory, which fails for every folder because a disk image is not
+    /// one, so every `--folder` in image mode failed before QEMU started.
+    #[test]
+    fn image_mode_folders_land_at_their_guest_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("src");
+        fs::create_dir_all(source.join("sub")).unwrap();
+        fs::write(source.join("build.sh"), "true\n").unwrap();
+        fs::write(source.join("sub/data.txt"), "data\n").unwrap();
+        // The mode has to be set rather than inherited: `fs::write` creates
+        // through the process umask (0002 on some hosts), and this test checks
+        // that the copy keeps the source's mode, whatever that happens to be.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(source.join("build.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            source.join("sub/data.txt"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        // The image is not created: resolving a destination must not depend on
+        // the file existing, and in particular must not require a directory.
+        let image = temporary.path().join("guest.img");
+        let config = RedoxerExecConfig::new(
+            [
+                "--image".into(),
+                image.to_string_lossy().into_owned(),
+                "--folder".into(),
+                format!("{}:/opt/project", source.display()),
+                "--".into(),
+                "make".into(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        let files = folder_files(&config).unwrap();
+        let by_path: HashMap<&Path, (&[u8], u16)> = files
+            .iter()
+            .map(|entry| (entry.path.as_path(), (entry.data.as_slice(), entry.mode)))
+            .collect();
+        assert_eq!(
+            by_path.get(Path::new("/opt/project/build.sh")),
+            Some(&(&b"true\n"[..], 0o755)),
+            "a file keeps its place and its mode: {files:?}"
+        );
+        assert_eq!(
+            by_path.get(Path::new("/opt/project/sub/data.txt")),
+            Some(&(&b"data\n"[..], 0o644)),
+            "nested files are copied too: {files:?}"
+        );
+        assert_eq!(by_path.len(), 2, "{files:?}");
+    }
+
+    /// The default `--folder` destination is `/root`, because the writer
+    /// rewrites arguments inside it to `/root`; image mode must use the same
+    /// place or a recipe's script would name a path that was never written.
+    #[test]
+    fn image_mode_folders_default_to_the_root_folder() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("src");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("tool"), "binary").unwrap();
+
+        let config = RedoxerExecConfig::new(
+            [
+                "--image".into(),
+                "guest.img".into(),
+                "--folder".into(),
+                source.to_string_lossy().into_owned(),
+                "--".into(),
+                "tool".into(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        let files = folder_files(&config).unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|entry| entry.path == Path::new("/root/tool") && entry.data == b"binary"),
+            "{files:?}"
+        );
+    }
+
+    /// A destination is part of the image's own path space, so it is accepted
+    /// or refused on its own terms: absolute, and never above the image root.
+    #[test]
+    fn image_mode_folder_destinations_stay_inside_the_guest_root() {
+        // The keys are guest-relative, which is what `--folder src:/etc/data`
+        // and a bare `--folder src` parse to.
+        assert_eq!(guest_path("etc/data").unwrap(), PathBuf::from("/etc/data"));
+        assert_eq!(guest_path("root").unwrap(), PathBuf::from("/root"));
+        assert_eq!(
+            guest_path("etc/./data").unwrap(),
+            PathBuf::from("/etc/data")
+        );
+        // A leading `/` is the guest's root either way.
+        assert_eq!(guest_path("/etc/data").unwrap(), PathBuf::from("/etc/data"));
+        for escaping in ["etc/../data", "/../../outside"] {
+            assert!(
+                guest_path(escaping).is_err(),
+                "{escaping:?} leaves the image"
+            );
+        }
+        // The image's root is not a folder the copy can be placed on.
+        assert!(guest_path("").is_err());
+        assert!(guest_path("/").is_err());
     }
 
     #[test]

@@ -26,6 +26,12 @@ then
     COOKBOOK_CONFIGURE_FLAGS+=(--with-shared)
 fi
 cookbook_configure
+
+# coreutils ships clear and reset, Redox's own implementations, and the two
+# must not both be installed: they would overwrite each other in the image.
+# ncurses' copies are the shell-script wrappers around tput, so leaving them
+# out keeps one owner per path.
+rm -fv "${COOKBOOK_STAGE}/usr/bin/clear" "${COOKBOOK_STAGE}/usr/bin/reset"
 """
 
 [package]

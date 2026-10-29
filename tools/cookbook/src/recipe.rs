@@ -229,6 +229,50 @@ pub struct CookRecipe {
     pub pinned: bool,
 }
 
+/// How a `host:` recipe's dependency `dependency` builds, or `None` to drop it.
+///
+/// `owner` is the recipe's own name without its selector, and
+/// `tools_are_target` is [`crate::build_tools_in_guest`]: whether the recipe is
+/// itself built for the target.
+///
+/// * `host:` of itself is dropped: a tool may list itself (`python312` builds
+///   with its own interpreter), and keeping that edge makes the dependency walk
+///   descend until it hits the depth limit.
+/// * `target:` is dropped for a host tool, which cannot link a target package.
+///   For a guest-built tool the pin is dropped but the package stays: the
+///   dependency keeps following the recipe's own build, which for a guest-built
+///   tool is the target build its libraries are usable from. Dropping the
+///   package outright would lose the target libraries it needs.
+/// * a `host:` dependency of another recipe stays as written: it is a build
+///   tool, built for the target alongside this one in guest mode.
+/// * an unprefixed one is a target package, so a guest-built tool keeps it as
+///   written and a host tool's moves to the host build. Leaving it unprefixed
+///   for a host tool would have it link the target libraries (`libgmp`,
+///   `libmpfr` for a host `binutils`) that the host binary cannot use.
+fn map_tool_dependency(
+    dependency: RecipeName,
+    owner: &str,
+    tools_are_target: bool,
+) -> Option<RecipeName> {
+    if dependency.is_host() {
+        if dependency.recipe() == owner {
+            None
+        } else {
+            Some(dependency)
+        }
+    } else if dependency.is_target() {
+        if tools_are_target {
+            RecipeName::new(dependency.without_prefix()).ok()
+        } else {
+            None
+        }
+    } else if tools_are_target {
+        Some(dependency)
+    } else {
+        Some(dependency.with_host())
+    }
+}
+
 impl Recipe {
     pub fn new(file: &PathBuf) -> Result<Recipe, PackageError> {
         if !file.is_file() {
@@ -258,20 +302,9 @@ impl CookRecipe {
     pub fn new(name: RecipeName, dir: PathBuf, mut recipe: Recipe) -> Result<Self, PackageError> {
         let target = cook_package::package_target(&name);
         if name.is_host() {
-            let thisname = name.without_prefix();
-            let fn_map = |p: RecipeName| {
-                if p.is_host() {
-                    if p.recipe() == thisname {
-                        None
-                    } else {
-                        Some(p)
-                    }
-                } else if p.is_target() {
-                    None
-                } else {
-                    Some(p.with_host())
-                }
-            };
+            let tools_are_target = crate::build_tools_in_guest();
+            let fn_map =
+                |p: RecipeName| map_tool_dependency(p, name.without_prefix(), tools_are_target);
             recipe.build.dependencies = recipe
                 .build
                 .dependencies
@@ -775,6 +808,106 @@ impl VersionExtractor {
 #[cfg(test)]
 mod tests {
     use fox_core::cookbook::RecipeName;
+
+    /// `python312` lists itself as a build tool because it builds with its own
+    /// interpreter. Keeping that edge makes the dependency walk descend until
+    /// it hits the depth limit, which is what broke the tool list: it must be
+    /// dropped however the tool is built, not only for a host build.
+    #[test]
+    fn a_tool_that_lists_itself_drops_that_dependency() {
+        use crate::recipe::{BuildRecipe, Recipe};
+
+        let name = RecipeName::new("python312").unwrap().with_host();
+        let recipe = Recipe {
+            build: BuildRecipe {
+                dev_dependencies: vec![name.clone()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cooked = super::CookRecipe::new(name, std::path::PathBuf::from("."), recipe).unwrap();
+        assert!(
+            cooked.recipe.build.dev_dependencies.is_empty(),
+            "a tool's self-reference is dropped from its own dependencies"
+        );
+    }
+
+    /// A guest-built tool is a target binary, so its dependencies have to be
+    /// target packages: an unprefixed dependency stays unprefixed (that is what
+    /// makes it a target package), and a `target:` pin keeps its package and
+    /// only loses the pin, so the library it names is still linked.
+    #[test]
+    fn a_guest_built_tool_keeps_its_target_dependencies() {
+        let map = |name: &str| {
+            let dependency = RecipeName::new(name).unwrap();
+            super::map_tool_dependency(dependency, "python312", true)
+                .map(|mapped| mapped.as_str().to_string())
+        };
+
+        // Unprefixed stays unprefixed: a target package.
+        assert_eq!(map("openssl3").as_deref(), Some("openssl3"));
+        assert_eq!(
+            map("python312.setuptools").as_deref(),
+            Some("python312.setuptools")
+        );
+        // A `target:` pin drops the pin but keeps the package.
+        assert_eq!(map("target:zlib").as_deref(), Some("zlib"));
+        assert_eq!(map("target:zlib.dev").as_deref(), Some("zlib.dev"));
+        // The tool's own `host:` reference is dropped.
+        assert_eq!(map("host:python312"), None);
+        assert_eq!(map("host:python312.dev"), None);
+        // A `host:` tool of another recipe is kept and built with this one.
+        assert_eq!(
+            map("host:python3-setuptools").as_deref(),
+            Some("host:python3-setuptools")
+        );
+    }
+
+    /// A host tool compiles and links on the host, so a `target:` dependency is
+    /// dropped. Turning it into an unprefixed one would make the walk pick up a
+    /// Redox-built package for a host build that cannot use it, which would
+    /// change the dependency graph of every host-mode build.
+    #[test]
+    fn a_host_built_tool_drops_target_dependencies() {
+        let map = |name: &str| {
+            let dependency = RecipeName::new(name).unwrap();
+            super::map_tool_dependency(dependency, "python312", false)
+                .map(|mapped| mapped.as_str().to_string())
+        };
+
+        assert_eq!(map("target:zlib"), None);
+        assert_eq!(map("target:zlib.dev"), None);
+        // An unprefixed dependency moves to the host build. Leaving it a target
+        // package is what let a host tool link the target libraries: `libgmp`
+        // and `libmpfr` are what a host `binutils-gdb` declares.
+        assert_eq!(map("openssl3").as_deref(), Some("host:openssl3"));
+        assert_eq!(map("libgmp").as_deref(), Some("host:libgmp"));
+        assert_eq!(map("libmpfr").as_deref(), Some("host:libmpfr"));
+        assert_eq!(map("host:python312"), None);
+        assert_eq!(
+            map("host:python3-setuptools").as_deref(),
+            Some("host:python3-setuptools")
+        );
+    }
+
+    /// A recipe that builds with another tool names it `host:`, and that edge
+    /// is kept as written in either mode: it is a build tool, built for the
+    /// target alongside this recipe in guest mode, and `cook::cook_build`
+    /// installs it where the guest shims find it.
+    #[test]
+    fn a_tools_host_tool_stays_a_build_tool() {
+        for tools_are_target in [false, true] {
+            let tool = super::map_tool_dependency(
+                RecipeName::new("host:gperf").unwrap(),
+                "fontconfig",
+                tools_are_target,
+            );
+            assert_eq!(
+                tool.map(|name| name.as_str().to_string()).as_deref(),
+                Some("host:gperf")
+            );
+        }
+    }
 
     #[test]
     fn git_cargo_recipe() {

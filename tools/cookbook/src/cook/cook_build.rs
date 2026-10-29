@@ -175,6 +175,58 @@ fn auto_deps_from_static_package_deps(
     Ok(pkgs.into_iter().collect())
 }
 
+/// Which dependency set a recipe's sysroot is built from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SysrootDeps {
+    /// The host tool packages, for a `host:` recipe built for the host.
+    Host,
+    /// The target packages, for a target recipe and for a `host:` recipe built
+    /// for the target.
+    Target,
+}
+
+/// The dependency sets a recipe builds against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DependencySets {
+    sysroot: SysrootDeps,
+    /// Whether the host tool packages are also installed as a toolchain the
+    /// build scripts run tools from.
+    toolchain: bool,
+}
+
+/// Chooses the dependency sets for `name`, ignoring the dependency contents.
+///
+/// A recipe built for the target compiles against the target packages, laid
+/// out as its sysroot. That includes a `host:` recipe when its tools are built
+/// for the guest: it is a target binary then, so its own libraries are the
+/// target ones, and the host toolchain must stay empty so no host-built
+/// library is linked into it.
+///
+/// Otherwise a `host:` recipe is a host binary. It compiles against its host
+/// tool packages: they are host-built too, so they take the sysroot's place,
+/// and the target sysroot must stay empty so no target library is linked into
+/// it. It also installs them as a toolchain, which its scripts run tools from.
+///
+/// The packages a dependency walk found are not consulted here, so the choice
+/// is the same on a cold build and on the rebuild that clears the cached
+/// directories.
+fn dependency_sets(name: &RecipeName, tools_are_target: bool) -> DependencySets {
+    match (name.is_host(), tools_are_target) {
+        (true, true) => DependencySets {
+            sysroot: SysrootDeps::Target,
+            toolchain: false,
+        },
+        (true, false) => DependencySets {
+            sysroot: SysrootDeps::Host,
+            toolchain: true,
+        },
+        (false, _) => DependencySets {
+            sysroot: SysrootDeps::Target,
+            toolchain: true,
+        },
+    }
+}
+
 pub struct BuildResult {
     pub stage_dirs: Vec<PathBuf>,
     pub auto_deps: BTreeSet<RecipeName>,
@@ -228,6 +280,10 @@ pub fn build(
 
     let mut dep_pkgars = BTreeSet::new();
     let mut dep_host_pkgars = BTreeSet::new();
+    // With build.build_tools = "guest" a build tool is a target package, so it
+    // joins the sysroot like any other dependency instead of the host
+    // toolchain the recipe would run from the host.
+    let tools_are_target = crate::build_tools_in_guest();
     let build_deps = CookRecipe::get_build_deps_recursive(
         &[
             &recipe.build.dependencies[..],
@@ -239,6 +295,14 @@ pub fn build(
     for dependency in build_deps.iter() {
         let (_, pkgar, _) = dependency.stage_paths();
         if dependency.name.is_host() {
+            // A tool joins the toolchain, which is what a host-built recipe
+            // runs tools from and what the guest shims stand in for. Built for
+            // the target it is also a target package, so it joins the sysroot
+            // too; `dependency_sets` picks which of the two the recipe itself
+            // builds against.
+            if tools_are_target {
+                dep_pkgars.insert((dependency.name.clone(), pkgar.clone()));
+            }
             dep_host_pkgars.insert((dependency.name.clone(), pkgar));
         } else {
             dep_pkgars.insert((dependency.name.clone(), pkgar));
@@ -273,12 +337,12 @@ pub fn build(
         return build_remote(stage_dirs, stage_pkgars, recipe, target_dir, logger);
     }
 
-    let deps_sysroot = if name.is_host() {
-        &dep_host_pkgars
-    } else {
-        &dep_pkgars
+    let sets = dependency_sets(name, tools_are_target);
+    let deps_sysroot = match sets.sysroot {
+        SysrootDeps::Host => &dep_host_pkgars,
+        SysrootDeps::Target => &dep_pkgars,
     };
-    let have_toolchain = !name.is_host() && !dep_host_pkgars.is_empty();
+    let have_toolchain = sets.toolchain && !dep_host_pkgars.is_empty();
     let (sysroot_cached, toolchain_cached) = (
         build_deps_dir(logger, &sysroot_dir, deps_sysroot)?,
         if have_toolchain {
@@ -314,6 +378,10 @@ pub fn build(
             if toolchain_cached && have_toolchain {
                 fs::remove_all(&toolchain_dir)?;
                 build_deps_dir(logger, &toolchain_dir, &dep_host_pkgars)?;
+            } else if !sets.toolchain && toolchain_dir.is_dir() {
+                // No toolchain applies, so a leftover one from host tools would
+                // put host-built libraries in front of the target ones.
+                fs::remove_all(&toolchain_dir)?;
             }
         }
     } else {
@@ -470,6 +538,28 @@ pub fn build(
                 command.env("COOKBOOK_TOOLCHAIN", cookbook_toolchain);
             } else if name.is_host() {
                 command.env("COOKBOOK_TOOLCHAIN", &cookbook_sysroot);
+            }
+            // With tools built for the guest, the toolchain holds Redox
+            // binaries. Scripts reach them through the guest runner instead of
+            // running them directly, so it needs to know where it is, and the
+            // shims that stand in for the toolchain's binaries on PATH.
+            if let Some(guest_tools) = crate::guest_tools_dir() {
+                command.env("COOKBOOK_GUEST_TOOLS", &guest_tools);
+                // The shims run `repo` themselves, and the cookbook's working
+                // directory is the recipe's build dir, so it is named absolutely.
+                let repo = cookbook_root
+                    .join("target/release/repo")
+                    .canonicalize()
+                    .map_err(wrap_io_err!(
+                        "locating the repo binary for guest build tools"
+                    ))?;
+                command.env("COOKBOOK_REPO_BIN", &repo);
+                if let Some(toolchain) = &cookbook_toolchain {
+                    command.env(
+                        "COOKBOOK_GUEST_TOOLS_SHIMS",
+                        write_guest_tool_shims(&guest_tools, toolchain, &repo)?,
+                    );
+                }
             }
             if let Some(compiler) = recipe.build.compiler.as_ref() {
                 match compiler {
@@ -648,6 +738,81 @@ pub fn get_sub_target_dir(target_dir: &Path, sub_path: &str) -> PathBuf {
         target_dir = target_dir.join(cross_target)
     }
     target_dir.join(sub_path)
+}
+
+/// Writes a shim per tool in `toolchain/bin` and returns the shim directory.
+///
+/// With `build.build_tools = "guest"` those binaries are built for the target,
+/// so the host cannot run them. A shim of the same name runs the real one in the
+/// guest environment (`repo guest-run`), which keeps a recipe script that calls
+/// a tool by name working unchanged. The directory is per build and shared by
+/// the recipes cooked from it.
+///
+/// The shim runs the tool by its **name**, not by its host path. The toolchain
+/// holds the same tools the guest environment installed under the same
+/// basenames, and the guest resolves the name on its `PATH`; a host path would
+/// reach `redoxerd` as an argument it rewrites to `/root/...` (see
+/// `redoxer`'s `write_redoxerd_config`), pointing at a directory rather than a
+/// program. The guest command a shim passes is therefore the file name alone.
+///
+/// `Error` is large, like every `Result` in this module; the error paths here
+/// are startup failures, not per-file ones, so boxing buys nothing.
+#[allow(clippy::result_large_err)]
+fn write_guest_tool_shims(guest_tools: &str, toolchain: &Path, repo: &Path) -> Result<PathBuf> {
+    let bin = toolchain.join("bin");
+    let shims = toolchain.join("guest-shims");
+    if shims.is_dir() {
+        fs::remove_all(&shims)?;
+    }
+    fs::create_dir(&shims)?;
+    let entries = match std::fs::read_dir(&bin) {
+        Ok(entries) => entries,
+        // A recipe with no tools has no toolchain binaries to stand in for.
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(shims),
+        Err(source) => {
+            return Err(wrap_io_err!(bin.clone(), "reading the toolchain binaries")(
+                source,
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(wrap_io_err!(bin.clone(), "reading the toolchain binaries"))?;
+        let name = entry.file_name();
+        let shim = shims.join(&name);
+        // The guest has the tool installed under this same name on PATH, so
+        // the command is the name and never the toolchain's host path.
+        let command = name.to_str().ok_or_else(|| Error::Io {
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "a toolchain binary's name is not valid UTF-8",
+            ),
+            path: Some(entry.path()),
+            context: "naming the guest tool a shim runs",
+        })?;
+        // `repo` sits beside the cookbook_redoxer shim the recipe runs under,
+        // so the shim finds it by the same path rather than guessing one.
+        let script = format!(
+            "#!/bin/sh\n# Generated: runs the tool built for the target in the guest.\nexec \"{}\" guest-run --guest \"{}\" --silent \"${{COOKBOOK_SILENT:-0}}\" -- \"{}\" \"$@\"\n",
+            shell_quote(&repo.display().to_string()),
+            shell_quote(guest_tools),
+            shell_quote(command),
+        );
+        std::fs::write(&shim, script)
+            .map_err(wrap_io_err!(shim.clone(), "writing a guest tool shim"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).map_err(
+                wrap_io_err!(shim.clone(), "setting a guest tool shim executable"),
+            )?;
+        }
+    }
+    Ok(shims)
+}
+
+/// Quotes a path for the `sh` shim, which sees it inside double quotes.
+fn shell_quote(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn build_deps_dir(
@@ -873,7 +1038,173 @@ fn hint_incorrect_pkey(logger: &PtyOut, source_pubkey: &Path, source_pkgar: &Pat
 
 #[cfg(test)]
 mod tests {
+    use fox_core::cookbook::RecipeName;
     use std::os::unix;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Builds the name of a recipe with `prefix` as its build selector, the
+    /// way `recipes/…/recipe.toml` names one.
+    fn recipe(name: &str, prefix: &str) -> RecipeName {
+        let name = format!("{prefix}{name}");
+        RecipeName::new(name).unwrap()
+    }
+
+    /// A tool built for the guest is a target binary: it must link the target
+    /// packages (its own libraries and the target libraries it uses) and must
+    /// not be handed the host toolchain, which would put host-built libraries
+    /// in front of the target ones.
+    #[test]
+    fn a_guest_built_tool_builds_against_the_target_sysroot_only() {
+        assert_eq!(
+            super::dependency_sets(&recipe("mdbook", "host:"), true),
+            super::DependencySets {
+                sysroot: super::SysrootDeps::Target,
+                toolchain: false,
+            }
+        );
+    }
+
+    /// A tool built for the host compiles and links on the host, so its own
+    /// host packages are its sysroot; a target package must not be, or the
+    /// host compiler would link target binaries. It runs its tools from that
+    /// same toolchain.
+    #[test]
+    fn a_host_built_tool_builds_against_its_host_tools() {
+        assert_eq!(
+            super::dependency_sets(&recipe("mdbook", "host:"), false),
+            super::DependencySets {
+                sysroot: super::SysrootDeps::Host,
+                toolchain: true,
+            }
+        );
+    }
+
+    /// An ordinary recipe is a target package, so its dependencies are target
+    /// packages; the host tools in its dependency walk are the ones its build
+    /// scripts run.
+    #[test]
+    fn a_target_recipe_builds_against_the_target_sysroot_and_host_tools() {
+        assert_eq!(
+            super::dependency_sets(&recipe("ncdu", "target:"), false),
+            super::DependencySets {
+                sysroot: super::SysrootDeps::Target,
+                toolchain: true,
+            }
+        );
+        // An unprefixed name is a target package too.
+        assert_eq!(
+            super::dependency_sets(&recipe("ncdu", ""), true),
+            super::DependencySets {
+                sysroot: super::SysrootDeps::Target,
+                toolchain: true,
+            }
+        );
+    }
+
+    /// Metapackages, remote builds and a toolchain-less build all have to pick
+    /// the ordinary target sysroot: an unprefixed recipe name is a target
+    /// package, and a `host:` one only becomes a host binary when its tools
+    /// are not built for the guest. The choice reads the name and the mode,
+    /// never the packages found, so a rebuild that clears the cached
+    /// directories selects the same sets as the cold build did.
+    #[test]
+    fn the_choice_follows_the_name_prefix_and_the_mode() {
+        for tools_are_target in [false, true] {
+            let target = super::dependency_sets(&recipe("base", ""), tools_are_target);
+            assert_eq!(target.sysroot, super::SysrootDeps::Target);
+
+            let tool = super::dependency_sets(&recipe("gperf", "host:"), tools_are_target);
+            assert_eq!(tool.sysroot == super::SysrootDeps::Target, tools_are_target);
+            assert_eq!(tool.toolchain, !tools_are_target);
+        }
+    }
+
+    /// A tool built for the guest cannot run on the host, so each toolchain
+    /// binary gets a shim that dispatches it into the guest under the name the
+    /// recipe already calls.
+    #[test]
+    fn guest_tool_shims_are_written_for_every_toolchain_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("toolchain/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("mdbook"), "").unwrap();
+        std::fs::write(bin.join("gperf"), "").unwrap();
+
+        let repo = temp.path().join("target/release/repo");
+        std::fs::create_dir_all(repo.parent().unwrap()).unwrap();
+        std::fs::write(&repo, "").unwrap();
+        let shims = super::write_guest_tool_shims(
+            "/guest/guest.img",
+            &temp.path().join("toolchain"),
+            &repo,
+        )
+        .unwrap();
+
+        for tool in ["mdbook", "gperf"] {
+            let shim = shims.join(tool);
+            let script = std::fs::read_to_string(&shim).unwrap();
+            assert!(
+                script.contains("guest-run") && script.contains("/guest/guest.img"),
+                "the shim dispatches {tool} into the guest: {script}"
+            );
+            assert!(
+                script.contains(repo.to_str().unwrap()),
+                "the shim runs the repo beside this checkout: {script}"
+            );
+            // The guest has the tool on PATH under the same name, so the shim
+            // names it. A host path would be rewritten to /root/... by
+            // redoxerd and point at a directory instead of the program.
+            let guest_command = script
+                .rsplit("${COOKBOOK_SILENT:-0}\" -- \"")
+                .next()
+                .and_then(|rest| rest.split('\"').next())
+                .unwrap_or_default();
+            assert_eq!(guest_command, tool, "the shim names the tool: {script}");
+            assert!(
+                !script.contains(&bin.join(tool).display().to_string()),
+                "the shim does not pass the host toolchain path: {script}"
+            );
+            // The shim stands in for the tool on PATH, so it must be executable.
+            assert!(
+                std::fs::metadata(&shim).unwrap().permissions().mode() & 0o111 != 0,
+                "{tool}'s shim is executable"
+            );
+        }
+    }
+
+    /// The shim's guest command is the tool's file name, never a path: the
+    /// guest has the tool on its PATH, and a path would be treated as a host
+    /// file to copy rather than a program to run.
+    #[test]
+    fn guest_tool_shims_pass_a_bare_tool_name_not_a_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("toolchain/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("pkg-config"), "").unwrap();
+
+        let repo = temp.path().join("repo");
+        std::fs::write(&repo, "").unwrap();
+        let shims = super::write_guest_tool_shims(
+            "/guest/guest.img",
+            &temp.path().join("toolchain"),
+            &repo,
+        )
+        .unwrap();
+
+        let script = std::fs::read_to_string(shims.join("pkg-config")).unwrap();
+        assert!(
+            script.ends_with("-- \"pkg-config\" \"$@\"\n"),
+            "the shim ends with the bare tool name: {script}"
+        );
+        // Neither the host toolchain path nor a guest path may appear as the
+        // command: the guest resolves the bare name on its PATH.
+        for fragment in [bin.display().to_string(), "/guest/toolchain".to_string()] {
+            assert!(
+                !script.contains(&format!("-- \"{fragment}")),
+                "the shim passes no path for {fragment}: {script}"
+            );
+        }
+    }
 
     #[test]
     fn native_sysroot_checks_every_required_package_variant() {

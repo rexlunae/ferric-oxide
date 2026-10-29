@@ -17,7 +17,7 @@ use cookbook::recipe::{
 use cookbook::{Error, Result, staged_pkg};
 use fox_core::cookbook::RecipeName;
 use redox_installer::PackageConfig;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Write, stderr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,6 +29,8 @@ use termion::{color, style};
 
 mod app;
 use app::*;
+
+mod guest_run;
 
 // A repo manager, to replace repo.sh
 
@@ -117,6 +119,7 @@ enum CliCommand {
     CaptureRev,
     ChangeRule,
     ChangeRuleLocal,
+    BuildToolsList,
 }
 
 #[derive(Clone)]
@@ -131,9 +134,14 @@ impl CliCommand {
         *self == CliCommand::PushList
             || *self == CliCommand::CookList
             || *self == CliCommand::RepoList
+            || *self == CliCommand::BuildToolsList
     }
+    /// Commands that print a dependency tree. `build-tools-list` is
+    /// informational but prints one tool per line, so it is not a tree.
     pub fn is_tree(&self) -> bool {
-        self.is_informational()
+        *self == CliCommand::PushList
+            || *self == CliCommand::CookList
+            || *self == CliCommand::RepoList
     }
     pub fn is_change_rule(&self) -> bool {
         *self == CliCommand::ChangeRuleLocal
@@ -186,6 +194,7 @@ impl FromStr for CliCommand {
             "capture-rev" => Ok(CliCommand::CaptureRev),
             "change-rule" => Ok(CliCommand::ChangeRule),
             "change-rule-local" => Ok(CliCommand::ChangeRuleLocal),
+            "build-tools-list" => Ok(CliCommand::BuildToolsList),
             _ => bail_options_err!("Unknown command {:?}", s),
         }
     }
@@ -206,6 +215,7 @@ impl ToString for CliCommand {
             CliCommand::CaptureRev => "capture-rev".to_string(),
             CliCommand::ChangeRule => "change-rule".to_string(),
             CliCommand::ChangeRuleLocal => "change-rule-local".to_string(),
+            CliCommand::BuildToolsList => "build-tools-list".to_string(),
         }
     }
 }
@@ -249,11 +259,20 @@ fn main() {
     };
 }
 
+// `Error` is large throughout this binary; these are top-level failures, not
+// per-file ones, so boxing the error would only hide it.
+#[allow(clippy::result_large_err)]
 fn main_inner() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
 
     if args.is_empty() || args.contains(&"--help".to_string()) || args.contains(&"-h".to_string()) {
         bail_options_err!("");
+    }
+
+    // guest-run names no recipe: it runs one command in the guest build
+    // environment, so it is handled before the recipe arguments are read.
+    if guest_run::GuestRun::matches(&args) {
+        return guest_run::GuestRun::parse(args.into_iter().skip(1))?.run();
     }
 
     let (config, command, recipes) = parse_args(args)?;
@@ -294,6 +313,9 @@ fn main_inner() -> Result<()> {
     }
     if command.is_tree() {
         return handle_tree(&recipes, command.to_tree(), &config);
+    }
+    if command == CliCommand::BuildToolsList {
+        return handle_build_tools_list(&recipes);
     }
     if command.is_change_rule() {
         return handle_change_rule(&recipes, &config, &command);
@@ -1099,6 +1121,35 @@ fn handle_push(recipes: &Vec<CookRecipe>, config: &CliConfig) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// Prints the build tools the selected recipes need, one recipe name per line.
+///
+/// A recipe's `build.dev-dependencies` are the tools it runs while it builds.
+/// `make` collects this list to install the guest build environment for
+/// `build.build_tools = "guest"`, so it names the tools themselves rather than
+/// their whole dependency graph: a tool's own dependencies are installed with
+/// it when the environment is built.
+///
+/// Only tools that are recipes are listed: a `host:` name can also be a program
+/// the host provides, and nothing can be built for the guest from that.
+fn handle_build_tools_list(recipes: &[CookRecipe]) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for recipe in recipes {
+        for tool in &recipe.recipe.build.dev_dependencies {
+            let name = tool.without_prefix();
+            if name.is_empty() || seen.contains(name) {
+                continue;
+            }
+            if staged_pkg::find(name).is_none() {
+                eprintln!("build-tools: no recipe for {name}; it stays a host tool");
+                continue;
+            }
+            seen.insert(name.to_owned());
+            println!("{name}");
+        }
+    }
     Ok(())
 }
 

@@ -379,9 +379,16 @@ impl Store {
     /// entry, checked as [`Store::verify`] checks it.
     fn changed_file(&self, head: &VerifiedHead) -> Result<Option<SkipReason>, StoreError> {
         for entry in head.entries() {
-            if let Some(problem) =
-                self.check_file(entry.path, entry.kind, entry.mode, entry.blake3)?
-            {
+            let file = FileRecord {
+                path: entry.path.to_owned(),
+                kind: entry.kind,
+                mode: entry.mode,
+                // The stored size of a compressed entry is not the installed
+                // one, and the checks below do not use it.
+                size: 0,
+                blake3: entry.blake3,
+            };
+            if let Some(problem) = self.check_file(&file)? {
                 return Ok(Some(SkipReason::Changed {
                     path: entry.path.to_owned(),
                     problem,

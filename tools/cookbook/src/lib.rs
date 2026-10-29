@@ -17,6 +17,48 @@ pub fn cross_target() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Whether a recipe's build tools (`build.dev-dependencies`, the `host:`
+/// recipes) are built for the target and run in a guest instead of being
+/// compiled for, and run on, the host.
+///
+/// The build sets `FERRIC_BUILD_TOOLS=guest` from `features.toml`
+/// `build.build_tools`. Only a native build can do this: a tool built for a
+/// foreign architecture cannot run in a guest on this host, so the build
+/// resolves the option to `host` there and this stays off.
+///
+/// It changes three things together, because they have to agree: the tool
+/// builds for the target rather than the host ([`cook::package`]), a `host:`
+/// recipe's dependencies are mapped for a target build — unprefixed ones stay
+/// target packages and a `target:` pin keeps its package without the pin
+/// ([`recipe::CookRecipe::new`]) — and the recipe builds against the target
+/// sysroot with no host toolchain ([`cook::cook_build`]).
+pub fn build_tools_in_guest() -> bool {
+    build_tools_in_guest_for(std::env::var("FERRIC_BUILD_TOOLS").ok().as_deref())
+}
+
+/// The decision in [`build_tools_in_guest`], on the value itself, so it can be
+/// tested without the process environment.
+///
+/// The dependency mapping in [`recipe`] takes the result as a parameter for the
+/// same reason: it has to reach both modes in a test.
+fn build_tools_in_guest_for(value: Option<&str>) -> bool {
+    value == Some("guest")
+}
+
+/// Where the guest build environment's image is, when tools run in the guest.
+///
+/// `mk/fstools.mk` builds it once per configuration and passes its path as
+/// `FERRIC_GUEST_TOOLS_DIR`; recipe scripts dispatch tool commands into it
+/// instead of running the Redox binaries directly.
+pub fn guest_tools_dir() -> Option<String> {
+    if !build_tools_in_guest() {
+        return None;
+    }
+    std::env::var("FERRIC_GUEST_TOOLS_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 // Errors
 
 use std::fmt::Display;
@@ -312,3 +354,19 @@ pub(crate) use wrap_other_err;
 pub(crate) use bail_other_err;
 
 pub(crate) use cook::pty::log_to_pty;
+
+#[cfg(test)]
+mod tests {
+    use super::build_tools_in_guest_for;
+
+    /// Only the `guest` value moves a recipe's build tools to the target.
+    /// An unset or empty setting keeps the inherited host behaviour, which is
+    /// what a build without `features.toml` must do.
+    #[test]
+    fn only_the_guest_value_builds_tools_for_the_target() {
+        assert!(build_tools_in_guest_for(Some("guest")));
+        assert!(!build_tools_in_guest_for(Some("host")));
+        assert!(!build_tools_in_guest_for(Some("")));
+        assert!(!build_tools_in_guest_for(None));
+    }
+}

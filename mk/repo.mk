@@ -1,6 +1,17 @@
 # Configuration file for recipe commands
 
-$(REPO_TAG): prefix $(FILESYSTEM_CONFIG) | $(FSTOOLS) $(FSTOOLS_TAG) $(CONTAINER_TAG)
+# Recipe build scripts run the build tools' shims, so the guest build
+# environment (mk/fstools.mk) has to be installed before the image's packages
+# are cooked; otherwise the shims fail their "environment is missing" check
+# whenever make reaches the cook first, as it may under -j. $(GUEST_TOOLS_EDGE)
+# is that environment, or empty when the tools come from the host or the
+# configuration does not use it.
+#
+# The prerequisite has to be a separate directory, not `build_tools`: with
+# build.keep_build_tools, build_tools also depends on $(GUEST_TOOL_MANIFEST),
+# which the environment's own installation reads, so this edge would make the
+# environment's cook depend on the image's cook, which it already precedes.
+$(REPO_TAG): prefix $(FILESYSTEM_CONFIG) | $(FSTOOLS) $(FSTOOLS_TAG) $(CONTAINER_TAG) $(GUEST_TOOLS_EDGE)
 	$(MAKE) cook
 
 # Internal command for rebuild (this is PHONY; use make rebuild if possible)

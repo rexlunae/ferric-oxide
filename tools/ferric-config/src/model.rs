@@ -9,6 +9,25 @@ use toml_edit::{DocumentMut, Item, Table};
 use crate::schema::{Entry, Kind, Level, Schema};
 use crate::value::Value;
 
+/// Expression identifier for the architecture the build runs on.
+///
+/// It is not a catalog option: `features.toml` expressions may read it, and it
+/// resolves to the same names `target.arch` uses (`x86_64`, `aarch64`, ...).
+pub const HOST_ARCH: &str = "host.arch";
+
+/// The architecture the build runs on, in `target.arch` terms.
+///
+/// Only the architectures the catalog offers as targets are named, so an
+/// expression like `host.arch == target.arch` means "native build" and never
+/// accidentally matches a host Ferric cannot build for.
+pub fn host_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => other,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diag {
     pub level: Level,
@@ -254,6 +273,13 @@ impl Resolved {
 
     /// Lookup used by expressions: an inactive bool reads as false.
     pub fn lookup(&self, schema: &Schema, id: &str) -> Option<Value> {
+        // `host.arch` is the architecture the build runs on, not an option:
+        // expressions compare it with `target.arch` to tell a native build from
+        // a cross-compiled one. It has no stored value, so it is answered here
+        // rather than in the option table.
+        if id == HOST_ARCH {
+            return Some(Value::Str(host_arch().to_owned()));
+        }
         let i = schema.position(id)?;
         if !self.active[i] && schema.options[i].kind == Kind::Bool {
             return Some(Value::Bool(false));

@@ -10,25 +10,28 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 dirs = "6.0"
+fscommon = { version = "0.1.1", optional = true }
+gpt = { version = "3.0.0", optional = true }
 sha2 = "0.10"
 fuser = { version = "0.16", optional = true }
 libc = { version = "0.2", optional = true }
 proc-mounts = { version = "0.3", optional = true }
-redox_installer = { workspace = true, optional = true, features = ["installer", "fuse"] }
+redox_installer = { workspace = true, optional = true, default-features = false, features = ["installer"] }
 # Ferric Oxide: `redoxer pkg` installs a cookbook's packages with fox.
 fox-core = { path = "../../crates/fox-core", features = ["std"], optional = true }
 fox-store = { path = "../../crates/fox-store", optional = true }
 redox_syscall = { version = "0.9", optional = true }
-redoxfs = { version = "0.9", optional = true }
+redoxfs = { version = "0.9", optional = true, default-features = false, features = ["std", "log"] }
 tempfile = { workspace = true, optional = true }
 toml = { version = "0.8", optional = true }
 
 [features]
-default = ["cli-pkg", "cli-exec"]
+default = ["cli-pkg", "cli-exec", "fuse"]
 cli-pkg = ["fox-core", "fox-store"]
 cli-exec = [
+    "fscommon",
+    "gpt",
     "libc",
-    "fuser",
     "redox_installer",
     "redox_syscall",
     "redoxfs",
@@ -36,6 +39,12 @@ cli-exec = [
     "proc-mounts",
     "toml",
 ]
+# Installing images by mounting them. This needs libfuse (through fuser and
+# redoxfs's fuse support) and fusermount, so it is separate from cli-exec and
+# is off where those are unavailable, such as macOS. Without it `exec` builds
+# and drives images through the Rust RedoxFS writer and tar archives instead,
+# which needs neither FUSE nor root.
+fuse = ["fuser", "redoxfs/fuse", "redox_installer/fuse"]
 
 [dev-dependencies]
 fox-core = { path = "../../crates/fox-core", features = ["test-fixtures"] }

@@ -87,6 +87,25 @@ build passes these options from `ferric.toml`; see the package tooling
 chapter of the book (`docs/src/ferric-packaging.md`, "Target images").
 Library users set `Config::fox` to a `FoxImage`.
 
+## Installing build tools
+
+A recipe's `build.dev-dependencies` are tools it runs while it builds; the
+`host:` ones are built for the host by default, so a contributor needs them
+installed. `general.build_tools` adds them to the package set this installation
+places:
+
+```toml
+[general]
+build_tools = { keep = true, list = "build/x86_64/desktop/build-tools/manifest.txt" }
+```
+
+`list` names a file with one tool recipe per line, as `repo build-tools-list`
+writes it; `--build-tools-list <file>` sets the same path from the command line.
+`keep` marks the tools as part of the image; the make build sets it from
+`build.keep_build_tools`, and leaves it off for the scratch guest environment it
+uses while building. An installation whose configuration has no
+`general.build_tools` adds no tools.
+
 ## Embedding
 
 The installer can also be used inside of other crates, as a library:

@@ -28,6 +28,27 @@ pub struct GeneralConfig {
     /// Use AR to write files instead of FUSE-based mount
     /// Guest ownership is recorded and applied inside the image, without host chown.
     pub no_mount: Option<bool>,
+    /// Also install the image's build tools, the recipes its packages list as
+    /// `build.dev-dependencies` (a `host:` tool needs them at compile time but
+    /// the finished image does not).
+    ///
+    /// The guest build environment is made this way so the tools can run
+    /// inside it; setting `keep` also leaves them installed in the final image
+    /// as the `build-tools` meta-package (`build.keep_build_tools`).
+    pub build_tools: Option<BuildToolsConfig>,
+}
+
+/// Which build tools an image installation adds.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BuildToolsConfig {
+    /// Leave the tools installed in the finished image, rather than treating
+    /// them as a scratch build environment. They are collected in one
+    /// `build-tools` meta-package so a package list shows one entry.
+    pub keep: Option<bool>,
+    /// File listing the tool recipe names, one per line, as
+    /// `repo build-tools-list` prints them. Relative paths resolve against
+    /// the current directory, like `general.cookbook`.
+    pub list: Option<String>,
 }
 
 impl GeneralConfig {
@@ -48,5 +69,15 @@ impl GeneralConfig {
             self.write_bootloader = Some(write_bootloader);
         }
         self.no_mount = other.no_mount.or(self.no_mount);
+        if let Some(build_tools) = other.build_tools {
+            let merged = match self.build_tools.take() {
+                Some(existing) => BuildToolsConfig {
+                    keep: build_tools.keep.or(existing.keep),
+                    list: build_tools.list.or(existing.list),
+                },
+                None => build_tools,
+            };
+            self.build_tools = Some(merged);
+        }
     }
 }
