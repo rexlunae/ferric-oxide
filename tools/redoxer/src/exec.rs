@@ -904,8 +904,11 @@ fn run_qemu(
 
     let chardev = format!("file,id=log,path={}", redoxer_log.display());
     // The image is qcow2: raw would make QEMU read the header as disk content.
+    // The image QEMU boots is always raw: the stored base is qcow2, but a run
+    // unpacks its copy before mounting and rewriting it, and the install leaves
+    // raw bytes behind.
     let drive = format!(
-        "file={},format=qcow2,if={}",
+        "file={},format=raw,if={}",
         image.display(),
         qemu_disk_device()
     );
