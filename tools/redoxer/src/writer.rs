@@ -4,6 +4,8 @@ use std::{
     process,
 };
 
+use crate::redoxfs::{GuestEntry, GuestKind};
+
 static INIT_ENV: &str = include_str!("../res/run_redoxer.ion");
 static INIT_REDOXER: &str = include_str!("../res/30_redoxer");
 
@@ -32,7 +34,7 @@ static INIT_REDOXER: &str = include_str!("../res/30_redoxer");
 pub fn redoxerd_config_files(
     arguments: &[String],
     root_dir: Option<&str>,
-) -> io::Result<Vec<(PathBuf, Vec<u8>, u16)>> {
+) -> io::Result<Vec<GuestEntry>> {
     let mut redoxerd_config = String::new();
     for arg in arguments.iter() {
         // Replace absolute path to folder with /root in command name
@@ -59,28 +61,15 @@ pub fn redoxerd_config_files(
         redoxerd_config.push('\n');
     }
     Ok(vec![
-        (
-            PathBuf::from(redoxerd_config::CONFIG),
-            redoxerd_config.into_bytes(),
-            0o644,
-        ),
-        (
-            PathBuf::from(redoxerd_config::SCRIPT),
-            INIT_ENV.as_bytes().to_vec(),
-            0o755,
-        ),
-        (
-            PathBuf::from(redoxerd_config::UNIT),
+        GuestEntry::file(redoxerd_config::CONFIG, redoxerd_config.into_bytes(), 0o644),
+        GuestEntry::file(redoxerd_config::SCRIPT, INIT_ENV.as_bytes().to_vec(), 0o755),
+        GuestEntry::file(
+            redoxerd_config::UNIT,
             INIT_REDOXER.as_bytes().to_vec(),
             0o644,
         ),
-        (
-            // A directory entry: data is ignored for a node that is already a
-            // directory, and the writer creates this one with the mode below.
-            PathBuf::from(redoxerd_config::WORKING_DIR),
-            Vec::new(),
-            0o755,
-        ),
+        // The directory the command runs from, made when the image has none.
+        GuestEntry::directory(redoxerd_config::WORKING_DIR, 0o755),
     ])
 }
 
@@ -113,9 +102,11 @@ pub fn write_redoxerd_config(
     arguments: &[String],
     root_dir: Option<&str>,
 ) -> Result<(), io::Error> {
-    for (path, data, _mode) in redoxerd_config_files(arguments, root_dir)? {
+    for entry in redoxerd_config_files(arguments, root_dir)? {
         let target = dest_dir.join(
-            path.strip_prefix("/")
+            entry
+                .path
+                .strip_prefix("/")
                 .map_err(|err| io::Error::other(err.to_string()))?,
         );
         if let Some(parent) = target.parent()
@@ -128,13 +119,12 @@ pub fn write_redoxerd_config(
             // the same unit, and overwriting it would change what was signed.
             continue;
         }
-        if data.is_empty() {
-            // An empty entry is a directory to make, which the staging tree
-            // needs just as a prepared image does.
-            fs::create_dir(&target)?;
-            continue;
+        match entry.kind {
+            // The staging tree needs the working directory just as a prepared
+            // image does.
+            GuestKind::Directory => fs::create_dir_all(&target)?,
+            GuestKind::File => fs::write(&target, &entry.data)?,
         }
-        fs::write(&target, data)?;
     }
     Ok(())
 }

@@ -9,7 +9,7 @@ use std::{fs, io};
 #[cfg(feature = "fuse")]
 #[cfg(feature = "fuse")]
 use crate::redoxfs::to_qcow2;
-use crate::redoxfs::{archive_image, extract_tar};
+use crate::redoxfs::{archive_image, extract_tar, GuestEntry};
 #[cfg(feature = "fuse")]
 use crate::redoxfs::{run_install_mount, RedoxFs};
 use crate::writer::{redoxerd_config_files, write_redoxerd_config};
@@ -1084,7 +1084,7 @@ fn artifact_refusal(config: &RedoxerExecConfig) -> anyhow::Result<()> {
 /// # Errors
 /// Returns an error when a source directory cannot be walked, or a destination
 /// is not an absolute path inside the guest image.
-fn folder_files(config: &RedoxerExecConfig) -> anyhow::Result<Vec<(PathBuf, Vec<u8>, u16)>> {
+fn folder_files(config: &RedoxerExecConfig) -> anyhow::Result<Vec<GuestEntry>> {
     let mut files = Vec::new();
     for (sysroot, folder) in config.folders.iter() {
         let destination = guest_path(sysroot)
@@ -1126,7 +1126,7 @@ fn guest_path(sysroot: &str) -> anyhow::Result<PathBuf> {
 fn copy_into(
     source: &Path,
     target: PathBuf,
-    files: &mut Vec<(PathBuf, Vec<u8>, u16)>,
+    files: &mut Vec<GuestEntry>,
     depth: usize,
 ) -> anyhow::Result<()> {
     const MAX_DEPTH: usize = 64;
@@ -1155,7 +1155,9 @@ fn copy_into(
             fs::read(source).with_context(|| format!("unable to read {}", source.display()))?;
         // Keep the source's mode so an executable stays executable in the guest.
         let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) as u16 & 0o777;
-        files.push((target, data, mode));
+        // Empty files stay files: the kind is explicit, so an empty
+        // `--folder` source is not mistaken for a directory request.
+        files.push(GuestEntry::file(target, data, mode));
     }
     Ok(())
 }
@@ -2132,7 +2134,7 @@ mod tests {
         let files = folder_files(&config).unwrap();
         let by_path: HashMap<&Path, (&[u8], u16)> = files
             .iter()
-            .map(|(path, data, mode)| (path.as_path(), (data.as_slice(), *mode)))
+            .map(|entry| (entry.path.as_path(), (entry.data.as_slice(), entry.mode)))
             .collect();
         assert_eq!(
             by_path.get(Path::new("/opt/project/build.sh")),
@@ -2174,7 +2176,7 @@ mod tests {
         assert!(
             files
                 .iter()
-                .any(|(path, data, _)| path == Path::new("/root/tool") && data == b"binary"),
+                .any(|entry| entry.path == Path::new("/root/tool") && entry.data == b"binary"),
             "{files:?}"
         );
     }

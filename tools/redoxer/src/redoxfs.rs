@@ -282,10 +282,59 @@ pub(crate) fn open_partition(
 /// signed records — stays exactly as it is, which is the whole point of running
 /// in a prepared environment. Reading the image out and archiving a staging
 /// copy back would rewrite all of it, and the RedoxFS writer cannot read an
+/// One thing `write_files` puts into a guest image.
+///
+/// The kind is explicit rather than inferred from the contents: a `--folder`
+/// source may contain an empty file, and "empty" cannot also mean "make a
+/// directory" without turning that file into one.
+#[derive(Debug)]
+pub(crate) struct GuestEntry {
+    /// Absolute path inside the guest.
+    pub(crate) path: PathBuf,
+    /// Contents for a file; ignored for a directory.
+    pub(crate) data: Vec<u8>,
+    /// Permission bits.
+    pub(crate) mode: u16,
+    /// Whether this path is a file or a directory.
+    pub(crate) kind: GuestKind,
+}
+
+impl GuestEntry {
+    /// A regular file with `data` and `mode`.
+    pub(crate) fn file(path: impl Into<PathBuf>, data: Vec<u8>, mode: u16) -> Self {
+        Self {
+            path: path.into(),
+            data,
+            mode,
+            kind: GuestKind::File,
+        }
+    }
+
+    /// A directory. Its contents are ignored, so an empty file is never taken
+    /// for one.
+    pub(crate) fn directory(path: impl Into<PathBuf>, mode: u16) -> Self {
+        Self {
+            path: path.into(),
+            data: Vec::new(),
+            mode,
+            kind: GuestKind::Directory,
+        }
+    }
+}
+
+/// Whether a [`GuestEntry`] is a file or a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuestKind {
+    /// A regular file; `data` is written to it.
+    File,
+    /// A directory; `data` must be empty.
+    Directory,
+}
+
 /// image out in the first place (that is what the FUSE mount is for).
 ///
-/// Missing directories on the way to a file are created, and a file that
-/// already exists keeps its node and gets the new contents. A node is truncated
+/// Missing directories on the way to a [`GuestEntry`] are created, and a file
+/// that already exists keeps its node and gets the new contents. A node is truncated
 /// to the new length first: writing over a longer file would leave its tail in
 /// place, and a command file `redoxerd` reads line by line would then run the
 /// arguments of the previous run.
@@ -294,14 +343,20 @@ pub(crate) fn open_partition(
 /// Returns an error when the partition or its file system cannot be opened, a
 /// path is not inside the image or is not valid UTF-8, or a node cannot be
 /// created, truncated or written.
-pub(crate) fn write_files(image: &Path, files: &[(PathBuf, Vec<u8>, u16)]) -> anyhow::Result<()> {
+pub(crate) fn write_files(image: &Path, files: &[GuestEntry]) -> anyhow::Result<()> {
     let mut fs = open_partition(image)?;
     // The transaction closure can only report a `syscall::Error`, which carries
     // an errno and no message, so the path that was refused is kept here and
     // turned into the returned error below.
     let mut invalid_path: Option<String> = None;
     fs.tx(|tx| {
-        for (path, data, mode) in files {
+        for GuestEntry {
+            path,
+            data,
+            mode,
+            kind,
+        } in files
+        {
             // A path that leaves the image is a mistake in the caller, not an
             // I/O condition: remember it so the error below says so.
             let relative = redox_installer::image_relative_path(path).map_err(|err| {
@@ -330,26 +385,33 @@ pub(crate) fn write_files(image: &Path, files: &[(PathBuf, Vec<u8>, u16)]) -> an
                         .map(|node| node.ptr())?,
                 };
             }
+            let wanted = match kind {
+                GuestKind::File => Node::MODE_FILE,
+                GuestKind::Directory => Node::MODE_DIR,
+            };
             let node = match tx.find_node(parent, name) {
                 Ok(node) => node.ptr(),
-                // Only a per-run directory arrives empty; every per-run file has
-                // contents, so an empty entry with no node behind it asks for
-                // the directory to be made.
-                Err(_) if data.is_empty() => tx
-                    .create_node(parent, name, Node::MODE_DIR | (mode & 0o777), 0, 0)
-                    .map(|node| node.ptr())?,
                 Err(_) => tx
-                    .create_node(parent, name, Node::MODE_FILE | (mode & 0o777), 0, 0)
+                    .create_node(parent, name, wanted | (mode & 0o777), 0, 0)
                     .map(|node| node.ptr())?,
             };
-            if tx.read_tree(node)?.data().mode() & Node::MODE_DIR != 0 {
-                if data.is_empty() {
-                    // A directory is already in place; writing into it as if it
-                    // were a file would replace it.
+            let is_dir = tx.read_tree(node)?.data().mode() & Node::MODE_DIR != 0;
+            match kind {
+                GuestKind::Directory => {
+                    if !is_dir {
+                        invalid_path = Some(format!("{}: is a file in the image", path.display()));
+                        return Err(syscall::Error::new(syscall::ENOTDIR));
+                    }
+                    // Already in place: a directory needs no contents written.
                     continue;
                 }
-                invalid_path = Some(format!("{}: is a directory in the image", path.display()));
-                return Err(syscall::Error::new(syscall::EISDIR));
+                GuestKind::File => {
+                    if is_dir {
+                        invalid_path =
+                            Some(format!("{}: is a directory in the image", path.display()));
+                        return Err(syscall::Error::new(syscall::EISDIR));
+                    }
+                }
             }
             // Shrinking first is what removes a previous, longer file's tail.
             tx.truncate_node(node, data.len() as u64, 0, 0)?;
@@ -651,7 +713,7 @@ mod tests {
 
         write_files(
             &image,
-            &[(PathBuf::from("/etc/redoxerd"), b"tool\n".to_vec(), 0o644)],
+            &[GuestEntry::file("/etc/redoxerd", b"tool\n".to_vec(), 0o644)],
         )
         .unwrap();
 
@@ -679,8 +741,8 @@ mod tests {
         let (_temp, image) = whole_disk_with(&[("etc/os-release", b"Ferric Oxide")]);
         write_files(
             &image,
-            &[(
-                PathBuf::from("/root/project/build.sh"),
+            &[GuestEntry::file(
+                "/root/project/build.sh",
                 b"true\n".to_vec(),
                 0o755,
             )],
@@ -699,7 +761,7 @@ mod tests {
         let (_temp, image) = whole_disk_with(&[("etc/os-release", b"Ferric Oxide")]);
         let error = write_files(
             &image,
-            &[(PathBuf::from("/../outside"), b"data".to_vec(), 0o644)],
+            &[GuestEntry::file("/../outside", b"data".to_vec(), 0o644)],
         )
         .unwrap_err();
         assert!(
@@ -734,7 +796,7 @@ mod tests {
         let long = b"/root/build-please\n--with-a-much-longer-argument\n".to_vec();
         write_files(
             &image,
-            &[(PathBuf::from("/etc/redoxerd"), long.clone(), 0o644)],
+            &[GuestEntry::file("/etc/redoxerd", long.clone(), 0o644)],
         )
         .unwrap();
         assert_eq!(
@@ -746,7 +808,7 @@ mod tests {
         let short = b"tool\n".to_vec();
         write_files(
             &image,
-            &[(PathBuf::from("/etc/redoxerd"), short.clone(), 0o644)],
+            &[GuestEntry::file("/etc/redoxerd", short.clone(), 0o644)],
         )
         .unwrap();
         assert_eq!(
@@ -760,7 +822,7 @@ mod tests {
         let longer = b"a\nb\nc\nd\ne\n".to_vec();
         write_files(
             &image,
-            &[(PathBuf::from("/etc/redoxerd"), longer.clone(), 0o644)],
+            &[GuestEntry::file("/etc/redoxerd", longer.clone(), 0o644)],
         )
         .unwrap();
         assert_eq!(
@@ -790,29 +852,31 @@ mod tests {
             .to_vec();
         let mut files = crate::writer::redoxerd_config_files(&arguments, None).unwrap();
         files.extend([
-            (
-                PathBuf::from("/opt/project/scripts/build.sh"),
+            GuestEntry::file(
+                "/opt/project/scripts/build.sh",
                 b"#!/bin/sh\nmake\n".to_vec(),
                 0o755,
             ),
-            (
-                PathBuf::from("/opt/project/data/input.txt"),
-                b"input\n".to_vec(),
-                0o644,
-            ),
+            GuestEntry::file("/opt/project/data/input.txt", b"input\n".to_vec(), 0o644),
+            // A `--folder` source may legitimately be empty; it stays a file.
+            GuestEntry::file("/opt/project/data/empty.txt", Vec::new(), 0o644),
         ]);
         write_files(&image, &files).unwrap();
 
-        for (path, data, mode) in &files {
+        for entry in &files {
+            let path = &entry.path;
+            if entry.kind == GuestKind::Directory {
+                continue;
+            }
             assert_eq!(
                 read_guest_file(&image, &path.to_string_lossy()).as_deref(),
-                Some(data.as_slice()),
+                Some(entry.data.as_slice()),
                 "{} has its own contents",
                 path.display()
             );
             assert_eq!(
                 guest_mode(&image, &path.to_string_lossy()).map(|found| found & 0o777),
-                Some(*mode & 0o777),
+                Some(entry.mode & 0o777),
                 "{} has its own mode",
                 path.display()
             );
@@ -839,9 +903,9 @@ mod tests {
         let files = crate::writer::redoxerd_config_files(&["tool".to_string()], None).unwrap();
         let root = files
             .iter()
-            .find(|(path, _, _)| path == Path::new(crate::writer::redoxerd_config::WORKING_DIR))
+            .find(|entry| entry.path == Path::new(crate::writer::redoxerd_config::WORKING_DIR))
             .expect("the per-run files provide the working directory");
-        assert!(root.1.is_empty());
+        assert_eq!(root.kind, GuestKind::Directory, "it is a directory entry");
         write_files(&image, &files).unwrap();
 
         let mode = guest_mode(&image, "/root").expect("/root exists");
