@@ -415,6 +415,19 @@ cooked, because their build scripts are what run the shims.
 are thrown away with it. It implies `build.build_tools = "guest"`, and setting
 it together with `host` is a configuration error.
 
+Every guest `redoxer exec` boots, the build-tools environment included, is given
+4 GiB of RAM. The bootloader reads the whole disk image into RAM before the
+kernel starts, so a working image needs room for the disk, the kernel and the
+firmware at once; the previous 2 GiB was not enough, and a guest booted with too
+little memory fails instead of starting. A host with less than about 4 GiB free,
+plus QEMU's own overhead, cannot run a guest build: build with
+`build.build_tools = "host"` there. `REDOXER_QEMU_ARGS` overrides the argument,
+because a `-m` in it replaces the default `-m` that redoxer generates
+(`REDOXER_QEMU_ARGS="-m 2048"`); that only works for an image small enough to
+load in the smaller memory. See the
+[Redoxer README](https://github.com/rexlunae/ferric-oxide/tree/main/tools/redoxer#readme)
+for the `exec` options.
+
 Cross-compiling is the exception. A tool built for a foreign architecture cannot
 run inside a guest on this host, so a build whose `host.arch` differs from
 `target.arch` uses the host tools whatever `build.build_tools` says, and

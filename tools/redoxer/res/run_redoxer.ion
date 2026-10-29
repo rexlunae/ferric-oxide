@@ -7,7 +7,14 @@ export HOST=redox
 export SHELL=/bin/sh
 export UID=0
 export USER=root
+# A prepared image need not have a home directory: redoxer writes the files a
+# run needs and nothing else. `cd` starts at /, because init runs units there,
+# so failing to enter /root only happens when the directory is absent.
 cd /root
+if test $? -ne 0
+    echo "redoxer: no /root in this image, running from /"
+    cd /
+end
 env
 echo
 echo "## running redoxer ##"

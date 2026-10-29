@@ -245,8 +245,10 @@ pub struct CookRecipe {
 ///   package outright would lose the target libraries it needs.
 /// * a `host:` dependency of another recipe stays as written: it is a build
 ///   tool, built for the target alongside this one in guest mode.
-/// * an unprefixed one stays as written, so it is a target package for a
-///   guest-built tool and a host package for a host tool.
+/// * an unprefixed one is a target package, so a guest-built tool keeps it as
+///   written and a host tool's moves to the host build. Leaving it unprefixed
+///   for a host tool would have it link the target libraries (`libgmp`,
+///   `libmpfr` for a host `binutils`) that the host binary cannot use.
 fn map_tool_dependency(
     dependency: RecipeName,
     owner: &str,
@@ -264,8 +266,10 @@ fn map_tool_dependency(
         } else {
             None
         }
-    } else {
+    } else if tools_are_target {
         Some(dependency)
+    } else {
+        Some(dependency.with_host())
     }
 }
 
@@ -873,8 +877,12 @@ mod tests {
 
         assert_eq!(map("target:zlib"), None);
         assert_eq!(map("target:zlib.dev"), None);
-        // The other arms are the same in either mode.
-        assert_eq!(map("openssl3").as_deref(), Some("openssl3"));
+        // An unprefixed dependency moves to the host build. Leaving it a target
+        // package is what let a host tool link the target libraries: `libgmp`
+        // and `libmpfr` are what a host `binutils-gdb` declares.
+        assert_eq!(map("openssl3").as_deref(), Some("host:openssl3"));
+        assert_eq!(map("libgmp").as_deref(), Some("host:libgmp"));
+        assert_eq!(map("libmpfr").as_deref(), Some("host:libmpfr"));
         assert_eq!(map("host:python312"), None);
         assert_eq!(
             map("host:python3-setuptools").as_deref(),

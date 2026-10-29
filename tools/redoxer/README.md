@@ -42,15 +42,27 @@ redoxer exec [-f|--folder folder] [-f|--folder folder:/path/in/redox] [-g|--gui]
     Notes:
     - Setting REDOXER_QEMU_BINARY will print qemu commands to terminal
     - Setting "-o -" will hide qemu serial output, only printing stdout/stderr from the command
+    - Every guest gets 4 GiB of RAM (`-m 4096`). The bootloader reads the whole
+      disk image into RAM before the kernel runs, so a working image no longer
+      fits in 2048 MiB; a host that cannot give QEMU that much plus its own
+      overhead fails the boot instead of starting a guest that cannot load its
+      disk. `REDOXER_QEMU_ARGS` overrides it, because a `-m` there replaces the
+      default `-m`: `REDOXER_QEMU_ARGS="-m 2048"`. Lowering it only works for an
+      image small enough to load in that memory.
     - x86_64 boots through UEFI when the cookbook's bootloader recipe produced no
       BIOS bootloader, which is what a Ferric Oxide build does (it is UEFI-only);
-      a checkout that still builds `bootloader.bios` boots through BIOS as before
+      a checkout that still builds `bootloader.bios` boots through BIOS as before,
+      even when its bootloader package also carries a UEFI image
     - A UEFI guest needs its firmware installed on the host. When none of the
       usual OVMF/AAVMF/EDK2 paths exists, `exec` fails with an error that names
       the packages to install (for x86_64: `ovmf` on Debian/Ubuntu,
       `edk2-ovmf` on Fedora, `edk2-ovmf` on Arch).
     - `--image` and `--install-config` cannot be combined: one boots an image
       that exists, the other builds one. A missing `--image` file is an error.
+    - `--image` ignores `REDOXER_USE_FUSE`: it writes the per-run files straight
+      into a private copy of the disk with the built-in RedoxFS writer and never
+      mounts anything, so no FUSE setup is needed. `--artifact` is refused
+      there, because reading files back out of a guest is what needs the mount.
 
 redoxer pkg [install|remove|update] pkg-1 pkg-2 ...
     Install additional native packages for Cargo
@@ -84,14 +96,28 @@ In this mode redoxer:
   one shared environment, and the next run still finds the environment it was
   given. The copy uses `cp --sparse=always`, so a largely empty 4 GiB image
   costs the space it occupies;
-- writes only the files a run needs into the copy: `/etc/redoxerd` and the
-  `30_redoxer` init unit, plus each `--folder` at its destination. Everything
-  the environment installed — kernel, boot configuration, packages and their
-  signed records — is left byte-for-byte as it was, so the guest's
-  `fox verify --installed` keeps passing;
-- does not support `--artifact`: reading files back out of a guest needs the
-  FUSE mount, which this mode does not use; it fails and says so rather than
-  returning an empty directory;
+- writes only the files a run needs into the copy: `/etc/redoxerd`, the
+  `30_redoxer` init unit, `/usr/lib/run_redoxer.ion`, an empty `/root` when the
+  image has none, plus each `--folder` at its destination. A rewritten file is
+  truncated to its new length, so a shorter command does not keep the tail of
+  the previous one. Everything the environment installed — kernel, boot
+  configuration, packages and their signed records — is left byte-for-byte as
+  it was, so the guest's `fox verify --installed` keeps passing;
+- never mounts the image, so `REDOXER_USE_FUSE` has no effect here and FUSE
+  (or `fusermount`) is not needed on the host. The per-run files go into the
+  copy through the RedoxFS writer, which is why this mode works on a host
+  without FUSE. It is also why the files are the only thing written: the
+  writer can create and overwrite a known path, but it cannot list what an
+  image contains;
+- does not support `--artifact`: reading files back out of a guest is the one
+  thing that needs the FUSE mount, and this mode deliberately has no mount. It
+  fails and says so rather than returning an empty directory. Use
+  `REDOXER_USE_FUSE` with an install configuration to copy files out;
+- gives the command the same working directory an installed image does:
+  `/root`, which is created in the copy when the prepared image has none
+  (redoxer also creates it for an installed image), and does `cd /root` with a
+  fallback to `/` if it still cannot be entered. A prepared image holds the
+  build tools and need not have a home directory;
 - validates the path first: a missing image is reported as an error naming
   `make build_tools`, never silently replaced by a freshly built image.
 

@@ -19,6 +19,13 @@ static INIT_REDOXER: &str = include_str!("../res/30_redoxer");
 /// needs to name a host path; when `root_dir` is given, any argument that names
 /// a path inside it is rewritten to the `/root` the folder is copied to.
 ///
+/// The guest runs the command from `/root`, so an image that does not have it
+/// gets an empty `/root` from here: a prepared image holds the build tools and
+/// not necessarily a home directory, and a command that cannot start in the
+/// directory it was given would resolve its relative paths somewhere else.
+/// Creating it is what keeps the working directory identical to the one an
+/// image that does have `/root` already uses.
+///
 /// # Errors
 /// Returns an I/O error when `root_dir` cannot be canonicalised or is not valid
 /// UTF-8.
@@ -53,21 +60,41 @@ pub fn redoxerd_config_files(
     }
     Ok(vec![
         (
-            PathBuf::from("/etc/redoxerd"),
+            PathBuf::from(redoxerd_config::CONFIG),
             redoxerd_config.into_bytes(),
             0o644,
         ),
         (
-            PathBuf::from("/usr/lib/run_redoxer.ion"),
+            PathBuf::from(redoxerd_config::SCRIPT),
             INIT_ENV.as_bytes().to_vec(),
             0o755,
         ),
         (
-            PathBuf::from("/usr/lib/init.d/30_redoxer"),
+            PathBuf::from(redoxerd_config::UNIT),
             INIT_REDOXER.as_bytes().to_vec(),
             0o644,
         ),
+        (
+            // A directory entry: data is ignored for a node that is already a
+            // directory, and the writer creates this one with the mode below.
+            PathBuf::from(redoxerd_config::WORKING_DIR),
+            Vec::new(),
+            0o755,
+        ),
     ])
+}
+
+/// Where the guest keeps the files a redoxer run installs, and the directory
+/// the command runs from.
+pub(crate) mod redoxerd_config {
+    /// The command `redoxerd` reads and runs, one line per argument.
+    pub(crate) const CONFIG: &str = "/etc/redoxerd";
+    /// The init unit that starts `/usr/lib/run_redoxer.ion`.
+    pub(crate) const UNIT: &str = "/usr/lib/init.d/30_redoxer";
+    /// The script that sets the guest environment and starts `redoxerd`.
+    pub(crate) const SCRIPT: &str = "/usr/lib/run_redoxer.ion";
+    /// The directory a command starts in, which `SCRIPT` enters with `cd`.
+    pub(crate) const WORKING_DIR: &str = "/root";
 }
 
 /// Writes the guest's `/etc/redoxerd` command description and the init units
@@ -75,11 +102,12 @@ pub fn redoxerd_config_files(
 ///
 /// See [`redoxerd_config_files`] for what the files contain. A file the guest
 /// image already provides — the init unit, which an install configuration may
-/// also declare — is left alone.
+/// also declare — is left alone, and so is a directory, which is what the entry
+/// for the working directory becomes here.
 ///
 /// # Errors
 /// Returns an I/O error when `root_dir` cannot be canonicalised, is not valid
-/// UTF-8, or when a file cannot be written.
+/// UTF-8, or when a file or directory cannot be written.
 pub fn write_redoxerd_config(
     dest_dir: &Path,
     arguments: &[String],
@@ -95,17 +123,18 @@ pub fn write_redoxerd_config(
         {
             fs::create_dir_all(parent)?;
         }
-        if target.is_file() {
+        if target.is_file() || target.is_dir() {
             // The image's own copy wins: an install configuration may declare
             // the same unit, and overwriting it would change what was signed.
             continue;
         }
+        if data.is_empty() {
+            // An empty entry is a directory to make, which the staging tree
+            // needs just as a prepared image does.
+            fs::create_dir(&target)?;
+            continue;
+        }
         fs::write(&target, data)?;
-    }
-    let root_dir = dest_dir.join("root");
-    if !root_dir.is_dir() {
-        // needed for cwd
-        fs::create_dir(&root_dir)?;
     }
     Ok(())
 }
