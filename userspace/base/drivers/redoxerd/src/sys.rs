@@ -15,11 +15,19 @@ mod imp {
     use syscall::{Io, Pio};
 
     pub fn exit(success: bool) {
+        // `isa-debug-exit` on 0x501 is what reports the status to the caller:
+        // QEMU exits with `code << 1 | 1`, so 51 means success. Write it first.
+        //
+        // 0x604 is ACPI's sleep-and-shutdown port. Writing it makes the machine
+        // power off, and if it lands before the debug-exit write QEMU halts
+        // with status 0, which redoxer cannot tell from a crash — the same
+        // command then succeeded or failed depending on the race. It is only a
+        // fallback for a QEMU whose debug-exit device is absent, so write the
+        // status first and let the shutdown follow.
+        let status = if success { 51 } else { 53 };
+        Pio::<u8>::new(0x501).write(status / 2);
         if success {
             Pio::<u16>::new(0x604).write(0x2000);
-            Pio::<u8>::new(0x501).write(51 / 2);
-        } else {
-            Pio::<u8>::new(0x501).write(53 / 2);
         }
     }
 
