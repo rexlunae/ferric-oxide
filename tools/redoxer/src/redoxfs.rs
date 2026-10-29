@@ -1,8 +1,15 @@
-use anyhow::{anyhow, bail, Context};
-use redoxfs::{BlockAddr, BlockMeta, DiskFile, FileSystem, Node, TreePtr};
+#[cfg(feature = "fuse")]
+use anyhow::bail;
+use anyhow::{anyhow, Context};
+#[cfg(feature = "fuse")]
+use redoxfs::DiskFile;
+#[cfg(any(feature = "fuse", test))]
+use redoxfs::{BlockAddr, BlockMeta};
+use redoxfs::{FileSystem, Node, TreePtr};
 use std::fs;
 use std::fs::File;
 use std::io;
+#[cfg(feature = "fuse")]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -425,31 +432,7 @@ pub(crate) fn shrink_disk(disk_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn expand_disk(disk_path: &Path, desired_size: u64) -> anyhow::Result<()> {
-    {
-        let disk = open_disk(disk_path)?;
-        let size = disk
-            .file
-            .metadata()
-            .context("Unable to get disk file metadata")?
-            .size();
-        if size < desired_size {
-            disk.file
-                .set_len(desired_size)
-                .context("Unable to expand disk file metadata")?;
-        } else {
-            return Ok(());
-        }
-    }
-
-    {
-        let mut fs = open_fs(disk_path)?;
-        resize(&mut fs, false).map_err(|e| anyhow!(e))?;
-    }
-
-    Ok(())
-}
-
+#[cfg(feature = "fuse")]
 fn open_fs(disk_path: &Path) -> anyhow::Result<FileSystem<DiskFile>> {
     let disk = open_disk(disk_path)?;
     let fs = match FileSystem::open(disk, None, None, true) {
@@ -465,6 +448,7 @@ fn open_fs(disk_path: &Path) -> anyhow::Result<FileSystem<DiskFile>> {
     Ok(fs)
 }
 
+#[cfg(feature = "fuse")]
 fn open_disk(disk_path: &Path) -> anyhow::Result<DiskFile> {
     let disk = match DiskFile::open(disk_path) {
         Ok(disk) => disk,
@@ -480,6 +464,7 @@ fn open_disk(disk_path: &Path) -> anyhow::Result<DiskFile> {
 }
 
 // copied from redoxfs-resize
+#[cfg(any(feature = "fuse", test))]
 fn resize<D: redoxfs::Disk>(fs: &mut FileSystem<D>, shrink: bool) -> Result<(u64, u64), String> {
     let disk_size = fs
         .disk

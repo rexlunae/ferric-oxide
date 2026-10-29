@@ -8,7 +8,7 @@ use std::{fs, io};
 
 #[cfg(feature = "fuse")]
 use crate::redoxfs::shrink_disk;
-use crate::redoxfs::{archive_image, expand_disk, extract_tar};
+use crate::redoxfs::{archive_image, extract_tar};
 #[cfg(feature = "fuse")]
 use crate::redoxfs::{run_install_mount, RedoxFs};
 use crate::writer::{redoxerd_config_files, write_redoxerd_config};
@@ -202,13 +202,17 @@ fn bootloader_bios_available() -> bool {
     let Ok(cookbook) = crate::cookbook_dir() else {
         return false;
     };
-    bios_bootloader(
-        &cookbook
-            .join("recipes/core/bootloader/target")
-            .join(target())
-            .join("stage"),
-    )
-    .is_some()
+    let stage = cookbook
+        .join("recipes/core/bootloader/target")
+        .join(target())
+        .join("stage");
+    // Only a tree with no UEFI image at all is BIOS-only. A plain `repo cook`
+    // does not set FERRIC_UEFI_ONLY, so its stage can hold both images; the
+    // firmware is then decided by the one that is installed, not by what the
+    // recipe happened to leave behind.
+    let has_uefi = stage.join("usr/lib/boot/bootloader-live.efi").is_file()
+        || stage.join("usr/lib/boot/bootloader.efi").is_file();
+    bios_bootloader(&stage).is_some() && !has_uefi
 }
 
 /// The BIOS bootloader in `root`, if the tree has one.
@@ -235,18 +239,11 @@ pub fn qemu_disk_device() -> &'static str {
 }
 /// The size the base image is built at.
 ///
-/// The bootloader reads the whole image into memory before the kernel runs, so
-/// it has to fit beside the kernel in the guest's RAM. `qemu_disk_size` is what
-/// a run expands its private copy to once the base is loaded.
+/// The base is the disk a run boots: the bootloader reads the whole image into
+/// memory before the kernel runs, so it has to fit beside the kernel in the
+/// guest's RAM.
+#[cfg(feature = "fuse")]
 pub fn qemu_base_disk_size() -> u64 {
-    DISK_SIZE_LIVE
-}
-
-/// The largest disk a guest can boot, given the memory it is given.
-///
-/// The bootloader reads the image into RAM, so the disk has to leave room for
-/// the kernel, the firmware and the machine's own overhead.
-pub fn qemu_working_disk_size() -> u64 {
     DISK_SIZE_LIVE
 }
 
@@ -766,7 +763,7 @@ fn base(
                 &base_dir,
                 bootloader_bin,
                 qemu_use_uefi(),
-                qemu_base_disk_size(),
+                DISK_SIZE_LIVE,
             )?;
         }
 
@@ -1221,10 +1218,12 @@ fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
                 .and_then(status_error)
                 .context("copy base to redoxer bin failed")?;
 
-            // The bootloader loads the whole image into RAM before the kernel
-            // runs, so the working copy cannot grow past what fits beside it:
-            // a larger disk would be one the guest cannot boot.
-            expand_disk(&redoxer_bin, qemu_working_disk_size())?;
+            // The base image is the disk. Expanding it here would write a
+            // filesystem header sized from the whole file, but the firmware
+            // exposes only the RedoxFS partition, which is smaller by the GPT
+            // and EFI partition ahead of it: the bootloader then reads past the
+            // partition and setup fails with "invalid parameter". The shrunk
+            // base already has room for the files a run adds.
         }
 
         fs::create_dir_all(&dest_dir).context("unable to create redoxer dir")?;
