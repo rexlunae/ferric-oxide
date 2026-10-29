@@ -2044,6 +2044,16 @@ mod tests {
         fs::create_dir_all(source.join("sub")).unwrap();
         fs::write(source.join("build.sh"), "true\n").unwrap();
         fs::write(source.join("sub/data.txt"), "data\n").unwrap();
+        // The mode has to be set rather than inherited: `fs::write` creates
+        // through the process umask (0002 on some hosts), and this test checks
+        // that the copy keeps the source's mode, whatever that happens to be.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(source.join("build.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            source.join("sub/data.txt"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
 
         // The image is not created: resolving a destination must not depend on
         // the file existing, and in particular must not require a directory.
@@ -2068,7 +2078,7 @@ mod tests {
             .collect();
         assert_eq!(
             by_path.get(Path::new("/opt/project/build.sh")),
-            Some(&(&b"true\n"[..], 0o644)),
+            Some(&(&b"true\n"[..], 0o755)),
             "a file keeps its place and its mode: {files:?}"
         );
         assert_eq!(

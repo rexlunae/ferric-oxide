@@ -206,6 +206,13 @@ else
 	# The tools are the cookbook's own packages, so they are cooked before the
 	# environment installs them; the environment is a client of the repository,
 	# not a second way to build them.
+	# The same environment the image's cook has, because these recipes run the
+	# same scripts: `libgcc` copies `${COOKBOOK_HOST_SYSROOT}/${GNU_TARGET}/lib`,
+	# so an unset variable there names `/x86_64-unknown-redox` and the cook
+	# fails. mk/repo.mk exports this for the image's cook; without it here the
+	# guest environment could not be built at all.
+	export PATH="$(PREFIX_PATH):$$PATH" && \
+	export COOKBOOK_HOST_SYSROOT="$(ROOT)/$(PREFIX_INSTALL)" && \
 	$(REPO_BIN) cook $$(cat $(GUEST_TOOL_MANIFEST)) $(COOKBOOK_OPTS)
 	$(HOST_CARGO) run --quiet --locked -p ferric-build -- sparse-file \
 		$(GUEST_TOOL_IMAGE_PARTIAL) --mib $(GUEST_TOOL_SIZE_MIB)
