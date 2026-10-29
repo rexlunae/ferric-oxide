@@ -42,6 +42,18 @@ const MIBI: usize = KIBI * KIBI;
 /// firmware, the kernel and the tables built while loading.
 pub(crate) const MAX_PHYSICAL_ADDRESS: u64 = 0x4_0000_0000;
 
+/// The same bound, but never above what this architecture identity-maps.
+///
+/// The page tables are built before the kernel runs and only cover
+/// [`MAX_PHYSICAL_ADDRESS`] on x86_64. aarch64 and the RISC-V maps still cover
+/// 8 GiB, so a buffer allocated above that would be unmapped when the kernel
+/// takes over and entry would fault. Ask for the smaller of the two instead of
+/// growing three page-table builders that only a real boot can check.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub(crate) const ALLOCATION_LIMIT: u64 = 0x2_0000_0000;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+pub(crate) const ALLOCATION_LIMIT: u64 = MAX_PHYSICAL_ADDRESS;
+
 //TODO: allocate this in a more reasonable manner
 static mut AREAS: [OsMemoryEntry; 1024] = [OsMemoryEntry {
     base: 0,

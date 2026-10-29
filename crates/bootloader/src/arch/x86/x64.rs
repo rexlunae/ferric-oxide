@@ -132,8 +132,21 @@ pub unsafe fn paging_framebuffer(
         // Map framebuffer_size at framebuffer offset
         let mut framebuffer_mapped = 0;
         while framebuffer_mapped < framebuffer_size && pdp_i < pdp.len() {
+            // A framebuffer between 8 and 16 GiB lands on a PDP entry the
+            // identity map already filled up to `MAX_PHYSICAL_ADDRESS`. That
+            // mapping already covers the window with writable 2 MiB pages, so
+            // reuse it rather than replacing it: the old `assert_eq!(pdp[pdp_i],
+            // 0)` panicked on exactly this layout and the machine never booted.
+            if pdp[pdp_i] != 0 {
+                // Advance over the part of this 1 GiB window the framebuffer
+                // covers, starting from where its offset left off.
+                let covered = 0x4000_0000 - pd_i as u64 * 0x20_0000;
+                framebuffer_mapped += covered;
+                pd_i = 0;
+                pdp_i += 1;
+                continue;
+            }
             let pd = paging_allocate(os)?;
-            assert_eq!(pdp[pdp_i], 0);
             pdp[pdp_i] = pd.as_ptr() as u64 | 1 << 1 | 1;
 
             while framebuffer_mapped < framebuffer_size && pd_i < pd.len() {
