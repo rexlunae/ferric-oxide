@@ -7,7 +7,7 @@ use std::process::{self, Command, Stdio};
 use std::{fs, io};
 
 #[cfg(feature = "fuse")]
-use crate::redoxfs::shrink_disk;
+use crate::redoxfs::to_qcow2;
 use crate::redoxfs::{archive_image, extract_tar};
 #[cfg(feature = "fuse")]
 use crate::redoxfs::{run_install_mount, RedoxFs};
@@ -17,7 +17,7 @@ use crate::{host_target, parse_bool_env, redoxer_dir, status_error, target};
 // extra disk space to fit large projects
 const DISK_SIZE: u64 = 3 * 1024 * 1024 * 1024;
 // need to fit under the default RAM
-const DISK_SIZE_LIVE: u64 = 1024 * 1024 * 1024;
+const DISK_SIZE_LIVE: u64 = 4 * 1024 * 1024 * 1024;
 
 pub fn qemu_executable() -> &'static str {
     match target() {
@@ -512,7 +512,7 @@ fn machine_args(arch: &str) -> anyhow::Result<Vec<String>> {
 /// guest needs room for a disk-sized buffer plus the kernel, the firmware and
 /// the tables built while doing it. A working image is a gigabyte, which leaves
 /// too little at 2048.
-const GUEST_MEMORY_MIB: u32 = 4096;
+const GUEST_MEMORY_MIB: u32 = 8192;
 
 /// The arguments that do not depend on the architecture or on firmware.
 fn common_qemu_args() -> Vec<String> {
@@ -742,15 +742,14 @@ fn base(
                 &base_partial,
             )?;
 
-            // only shrink disk outside CI
-            if !base_tar.exists() {
-                eprintln!("redoxer: shrinking {name}");
-                // The bootloader reads the whole image into memory, so the
-                // image has to leave room in the guest's RAM. The EFI partition
-                // the boot image lives in sits at a fixed offset, so resizing
-                // the filesystem does not move it.
-                shrink_disk(&base_partial)?;
-            }
+            // The disk is written as raw and then stored as qcow2: only the
+            // blocks the install touched are kept, so the base stays small even
+            // though the guest sees a disk with room for a project.
+            let raw = base_partial.with_extension("raw");
+            fs::rename(&base_partial, &raw)?;
+            eprintln!("redoxer: compressing {name} to qcow2");
+            to_qcow2(&raw, &base_partial)?;
+            fs::remove_file(&raw)?;
         } else {
             #[cfg(not(feature = "fuse"))]
             require_no_fuse(fuse)?;
@@ -898,8 +897,9 @@ fn run_qemu(
     let mut command = Command::new(qemu_binary);
 
     let chardev = format!("file,id=log,path={}", redoxer_log.display());
+    // The image is qcow2: raw would make QEMU read the header as disk content.
     let drive = format!(
-        "file={},format=raw,if={}",
+        "file={},format=qcow2,if={}",
         image.display(),
         qemu_disk_device()
     );
@@ -1978,8 +1978,9 @@ mod tests {
             "the guest memory is GUEST_MEMORY_MIB: {args:?}"
         );
         assert_eq!(
-            GUEST_MEMORY_MIB, 4096,
-            "a working image needs the extra room over 2048 MiB"
+            GUEST_MEMORY_MIB, 8192,
+            "the guest loads a DISK_SIZE_LIVE disk into memory, so it needs \
+             twice that to hold the disk and run the kernel beside it"
         );
     }
 

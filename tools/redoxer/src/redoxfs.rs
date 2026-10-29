@@ -408,27 +408,27 @@ pub(crate) fn extract_tar(tar_file: &Path, dest_dir: &Path) -> anyhow::Result<()
 }
 
 #[cfg(feature = "fuse")]
-pub(crate) fn shrink_disk(disk_path: &Path) -> anyhow::Result<()> {
-    let shrink_size = {
-        let mut fs = open_fs(disk_path)?;
-        let (old_size, new_size) = resize(&mut fs, true).map_err(|e| anyhow!(e))?;
-        if old_size > new_size {
-            Some(old_size - new_size)
-        } else {
-            None
-        }
-    };
-
-    if let Some(shrink_size) = shrink_size {
-        let f = open_disk(disk_path)?.file;
-        let size = f
-            .metadata()
-            .context("Unable to get disk file metadata")?
-            .size();
-        f.set_len(size - shrink_size)
-            .context("Unable to shrink disk file metadata")?;
+/// Writes `raw` to `qcow2` as a qcow2 image of the same virtual size.
+///
+/// A raw image is as large as its disk: a guest that needs room for a project
+/// ends up with a gigabyte file, and the bootloader loads all of it into memory.
+/// qcow2 stores only the blocks that are written, so the file on disk stays
+/// small while the disk the guest sees keeps the room it needs.
+#[cfg(feature = "fuse")]
+pub(crate) fn to_qcow2(raw: &Path, qcow2: &Path) -> anyhow::Result<()> {
+    let status = Command::new("qemu-img")
+        .arg("convert")
+        .arg("-f")
+        .arg("raw")
+        .arg("-O")
+        .arg("qcow2")
+        .arg(raw)
+        .arg(qcow2)
+        .status()
+        .with_context(|| "running qemu-img convert")?;
+    if !status.success() {
+        bail!("qemu-img convert {} failed: {status}", raw.display());
     }
-
     Ok(())
 }
 
