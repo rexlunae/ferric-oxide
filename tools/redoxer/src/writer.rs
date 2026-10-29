@@ -4,7 +4,54 @@ use std::{
     process,
 };
 
-use crate::redoxfs::{GuestEntry, GuestKind};
+/// One thing a redoxer run puts into a guest: a file, or a directory to make.
+///
+/// The kind is explicit rather than inferred from the contents. A `--folder`
+/// source may contain an empty file, and "empty" must not also mean "make a
+/// directory" without turning that file into one.
+#[derive(Debug)]
+pub(crate) struct GuestEntry {
+    /// Absolute path inside the guest.
+    pub(crate) path: PathBuf,
+    /// Contents for a file; ignored for a directory.
+    pub(crate) data: Vec<u8>,
+    /// Permission bits.
+    pub(crate) mode: u16,
+    /// Whether this path is a file or a directory.
+    pub(crate) kind: GuestKind,
+}
+
+impl GuestEntry {
+    /// A regular file with `data` and `mode`.
+    pub(crate) fn file(path: impl Into<PathBuf>, data: Vec<u8>, mode: u16) -> Self {
+        Self {
+            path: path.into(),
+            data,
+            mode,
+            kind: GuestKind::File,
+        }
+    }
+
+    /// A directory. Its contents are ignored, so an empty file is never taken
+    /// for one.
+    pub(crate) fn directory(path: impl Into<PathBuf>, mode: u16) -> Self {
+        Self {
+            path: path.into(),
+            data: Vec::new(),
+            mode,
+            kind: GuestKind::Directory,
+        }
+    }
+}
+
+/// Whether a [`GuestEntry`] is a file or a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuestKind {
+    /// A regular file; `data` is written to it.
+    File,
+    /// A directory; `data` must be empty.
+    Directory,
+}
 
 static INIT_ENV: &str = include_str!("../res/run_redoxer.ion");
 static INIT_REDOXER: &str = include_str!("../res/30_redoxer");
@@ -73,6 +120,15 @@ pub fn redoxerd_config_files(
     ])
 }
 
+/// Sets `path` to `mode`, the permission bits the entry carries.
+///
+/// # Errors
+/// Returns an I/O error when the mode cannot be set.
+fn set_mode(path: &Path, mode: u16) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(u32::from(mode)))
+}
+
 /// Where the guest keeps the files a redoxer run installs, and the directory
 /// the command runs from.
 pub(crate) mod redoxerd_config {
@@ -122,8 +178,17 @@ pub fn write_redoxerd_config(
         match entry.kind {
             // The staging tree needs the working directory just as a prepared
             // image does.
-            GuestKind::Directory => fs::create_dir_all(&target)?,
-            GuestKind::File => fs::write(&target, &entry.data)?,
+            GuestKind::Directory => {
+                fs::create_dir_all(&target)?;
+                set_mode(&target, entry.mode)?;
+            }
+            GuestKind::File => {
+                fs::write(&target, &entry.data)?;
+                // The stage is the tree an install copies into the image, so a
+                // file keeps the mode a prepared image would give it. Without
+                // this `run_redoxer.ion` would not be executable in the guest.
+                set_mode(&target, entry.mode)?;
+            }
         }
     }
     Ok(())

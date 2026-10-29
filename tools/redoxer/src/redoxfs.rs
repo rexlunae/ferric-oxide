@@ -9,7 +9,9 @@ use redoxfs::{FileSystem, Node, TreePtr};
 use std::fs;
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(feature = "fuse", test))]
+use std::path::PathBuf;
 use std::process::Command;
 #[cfg(feature = "fuse")]
 use std::sync::mpsc::{channel, TryRecvError};
@@ -274,83 +276,32 @@ pub(crate) fn open_partition(
 
 /// Writes `files` into the file system of the whole-disk image at `image`.
 ///
-/// Each entry is a guest path, its contents and its permission bits. An entry
-/// with no contents whose path does not exist yet is created as a directory,
-/// which is how the per-run files provide the working directory a command
-/// starts in. Only the given paths are touched: everything the image was
-/// installed with — the kernel, the boot configuration, the packages and their
-/// signed records — stays exactly as it is, which is the whole point of running
-/// in a prepared environment. Reading the image out and archiving a staging
-/// copy back would rewrite all of it, and the RedoxFS writer cannot read an
-/// One thing `write_files` puts into a guest image.
+/// Only the given paths are touched: everything the image was installed with —
+/// the kernel, the boot configuration, the packages and their signed records —
+/// stays exactly as it is, which is the whole point of running in a prepared
+/// environment. Reading the image out and archiving a staging copy back would
+/// rewrite all of it, and the RedoxFS writer cannot read an image out in the
+/// first place (that is what the FUSE mount is for).
 ///
-/// The kind is explicit rather than inferred from the contents: a `--folder`
-/// source may contain an empty file, and "empty" cannot also mean "make a
-/// directory" without turning that file into one.
-#[derive(Debug)]
-pub(crate) struct GuestEntry {
-    /// Absolute path inside the guest.
-    pub(crate) path: PathBuf,
-    /// Contents for a file; ignored for a directory.
-    pub(crate) data: Vec<u8>,
-    /// Permission bits.
-    pub(crate) mode: u16,
-    /// Whether this path is a file or a directory.
-    pub(crate) kind: GuestKind,
-}
-
-impl GuestEntry {
-    /// A regular file with `data` and `mode`.
-    pub(crate) fn file(path: impl Into<PathBuf>, data: Vec<u8>, mode: u16) -> Self {
-        Self {
-            path: path.into(),
-            data,
-            mode,
-            kind: GuestKind::File,
-        }
-    }
-
-    /// A directory. Its contents are ignored, so an empty file is never taken
-    /// for one.
-    pub(crate) fn directory(path: impl Into<PathBuf>, mode: u16) -> Self {
-        Self {
-            path: path.into(),
-            data: Vec::new(),
-            mode,
-            kind: GuestKind::Directory,
-        }
-    }
-}
-
-/// Whether a [`GuestEntry`] is a file or a directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GuestKind {
-    /// A regular file; `data` is written to it.
-    File,
-    /// A directory; `data` must be empty.
-    Directory,
-}
-
-/// image out in the first place (that is what the FUSE mount is for).
-///
-/// Missing directories on the way to a [`GuestEntry`] are created, and a file
-/// that already exists keeps its node and gets the new contents. A node is truncated
-/// to the new length first: writing over a longer file would leave its tail in
-/// place, and a command file `redoxerd` reads line by line would then run the
-/// arguments of the previous run.
+/// Missing directories on the way to an entry are created. A file that already
+/// exists keeps its node and gets the new contents, truncated to the new length
+/// first: writing over a longer file would leave its tail in place, and a
+/// command file `redoxerd` reads line by line would then run the arguments of
+/// the previous run.
 ///
 /// # Errors
 /// Returns an error when the partition or its file system cannot be opened, a
-/// path is not inside the image or is not valid UTF-8, or a node cannot be
-/// created, truncated or written.
-pub(crate) fn write_files(image: &Path, files: &[GuestEntry]) -> anyhow::Result<()> {
+/// path is not inside the image or is not valid UTF-8, an entry's kind
+/// disagrees with what is already at that path, or a node cannot be created,
+/// truncated or written.
+pub(crate) fn write_files(image: &Path, files: &[crate::writer::GuestEntry]) -> anyhow::Result<()> {
     let mut fs = open_partition(image)?;
     // The transaction closure can only report a `syscall::Error`, which carries
     // an errno and no message, so the path that was refused is kept here and
     // turned into the returned error below.
     let mut invalid_path: Option<String> = None;
     fs.tx(|tx| {
-        for GuestEntry {
+        for crate::writer::GuestEntry {
             path,
             data,
             mode,
@@ -386,8 +337,8 @@ pub(crate) fn write_files(image: &Path, files: &[GuestEntry]) -> anyhow::Result<
                 };
             }
             let wanted = match kind {
-                GuestKind::File => Node::MODE_FILE,
-                GuestKind::Directory => Node::MODE_DIR,
+                crate::writer::GuestKind::File => Node::MODE_FILE,
+                crate::writer::GuestKind::Directory => Node::MODE_DIR,
             };
             let node = match tx.find_node(parent, name) {
                 Ok(node) => node.ptr(),
@@ -397,7 +348,7 @@ pub(crate) fn write_files(image: &Path, files: &[GuestEntry]) -> anyhow::Result<
             };
             let is_dir = tx.read_tree(node)?.data().mode() & Node::MODE_DIR != 0;
             match kind {
-                GuestKind::Directory => {
+                crate::writer::GuestKind::Directory => {
                     if !is_dir {
                         invalid_path = Some(format!("{}: is a file in the image", path.display()));
                         return Err(syscall::Error::new(syscall::ENOTDIR));
@@ -405,7 +356,7 @@ pub(crate) fn write_files(image: &Path, files: &[GuestEntry]) -> anyhow::Result<
                     // Already in place: a directory needs no contents written.
                     continue;
                 }
-                GuestKind::File => {
+                crate::writer::GuestKind::File => {
                     if is_dir {
                         invalid_path =
                             Some(format!("{}: is a directory in the image", path.display()));
@@ -643,6 +594,7 @@ impl fuser::Filesystem for DummyFS {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::writer::{GuestEntry, GuestKind};
 
     /// Builds a whole-disk image with one RedoxFS partition holding `files`,
     /// laid out the way `redox_installer::with_whole_disk` lays one out.

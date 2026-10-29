@@ -9,10 +9,10 @@ use std::{fs, io};
 #[cfg(feature = "fuse")]
 #[cfg(feature = "fuse")]
 use crate::redoxfs::to_qcow2;
-use crate::redoxfs::{archive_image, extract_tar, GuestEntry};
+use crate::redoxfs::{archive_image, extract_tar};
 #[cfg(feature = "fuse")]
 use crate::redoxfs::{run_install_mount, RedoxFs};
-use crate::writer::{redoxerd_config_files, write_redoxerd_config};
+use crate::writer::{redoxerd_config_files, write_redoxerd_config, GuestEntry};
 use crate::{host_target, parse_bool_env, redoxer_dir, status_error, target};
 
 // extra disk space to fit large projects
