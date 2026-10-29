@@ -410,6 +410,19 @@ three newer than their own prerequisites and a second `make` reuses them instead
 of reinstalling. The environment is installed before the image's packages are
 cooked, because their build scripts are what run the shims.
 
+The environment is a machine in its own right, not only a box for the tools, so
+it installs the packages a guest needs to run *anything*:
+`base`, `bootloader`, `kernel` and `redoxfs` to boot, then `relibc` (the dynamic
+loader every binary asks for as `/usr/lib/ld64.so.1`), `libgcc` and `libstdcxx`
+(the C and C++ shared runtime), and `ion`, `userutils`, `uutils` and
+`extrautils` for a shell, `sudo`, `rm` and the other core commands. Those come
+from `GUEST_TOOL_PACKAGES` in `mk/fstools.mk`, one list that both the installer
+configuration and the cook that builds their archives read, so a lean image
+configuration that never cooks `extrautils` still gets it into the environment.
+
+It also carries `/etc/net/ip`, `ip_router` and `ip_subnet`, because `netstack`
+panics on a missing router address before `redoxerd` starts.
+
 `build.keep_build_tools` leaves the tools in the finished image as the
 `build-tools` meta-package; without it they stay in the scratch environment and
 are thrown away with it. It implies `build.build_tools = "guest"`, and setting
