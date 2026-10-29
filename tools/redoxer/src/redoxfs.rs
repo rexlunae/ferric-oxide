@@ -3,16 +3,13 @@ use anyhow::bail;
 use anyhow::{anyhow, Context};
 #[cfg(feature = "fuse")]
 use redoxfs::DiskFile;
-#[cfg(any(feature = "fuse", test))]
+#[cfg(test)]
 use redoxfs::{BlockAddr, BlockMeta};
 use redoxfs::{FileSystem, Node, TreePtr};
 use std::fs;
 use std::fs::File;
 use std::io;
-#[cfg(feature = "fuse")]
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(feature = "fuse")]
 use std::sync::mpsc::{channel, TryRecvError};
@@ -407,13 +404,42 @@ pub(crate) fn extract_tar(tar_file: &Path, dest_dir: &Path) -> anyhow::Result<()
     Ok(())
 }
 
-#[cfg(feature = "fuse")]
-/// Writes `raw` to `qcow2` as a qcow2 image of the same virtual size.
+/// Converts a qcow2 image back to a raw disk.
 ///
-/// A raw image is as large as its disk: a guest that needs room for a project
-/// ends up with a gigabyte file, and the bootloader loads all of it into memory.
-/// qcow2 stores only the blocks that are written, so the file on disk stays
-/// small while the disk the guest sees keeps the room it needs.
+/// The base image is stored as qcow2, which only QEMU reads; anything that opens
+/// the disk itself, such as the FUSE mount or the RedoxFS writer, needs the raw
+/// bytes.
+///
+/// # Errors
+/// Returns an error when `qemu-img` cannot be run or the conversion fails.
+#[cfg(feature = "fuse")]
+pub(crate) fn to_raw(qcow2: &Path, raw: &Path) -> anyhow::Result<()> {
+    let status = Command::new("qemu-img")
+        .arg("convert")
+        .arg("-f")
+        .arg("qcow2")
+        .arg("-O")
+        .arg("raw")
+        .arg(qcow2)
+        .arg(raw)
+        .status()
+        .with_context(|| "running qemu-img convert")?;
+    if !status.success() {
+        bail!(
+            "qemu-img convert {} to raw failed: {status}",
+            qcow2.display()
+        );
+    }
+    Ok(())
+}
+
+/// Converts a raw disk to qcow2, keeping only the blocks in use.
+///
+/// Only the FUSE install path stores its base this way; the archive path writes
+/// a whole-disk image directly.
+///
+/// # Errors
+/// Returns an error when `qemu-img` cannot be run or the conversion fails.
 #[cfg(feature = "fuse")]
 pub(crate) fn to_qcow2(raw: &Path, qcow2: &Path) -> anyhow::Result<()> {
     let status = Command::new("qemu-img")
@@ -432,39 +458,10 @@ pub(crate) fn to_qcow2(raw: &Path, qcow2: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "fuse")]
-fn open_fs(disk_path: &Path) -> anyhow::Result<FileSystem<DiskFile>> {
-    let disk = open_disk(disk_path)?;
-    let fs = match FileSystem::open(disk, None, None, true) {
-        Ok(fs) => fs,
-        Err(err) => {
-            bail!(
-                "redoxfs-resize: failed to open filesystem on {}: {}",
-                disk_path.display(),
-                err
-            );
-        }
-    };
-    Ok(fs)
-}
-
-#[cfg(feature = "fuse")]
-fn open_disk(disk_path: &Path) -> anyhow::Result<DiskFile> {
-    let disk = match DiskFile::open(disk_path) {
-        Ok(disk) => disk,
-        Err(err) => {
-            bail!(
-                "redoxfs-resize: failed to open disk image {}: {}",
-                disk_path.display(),
-                err
-            );
-        }
-    };
-    Ok(disk)
-}
-
-// copied from redoxfs-resize
-#[cfg(any(feature = "fuse", test))]
+// copied from redoxfs-resize; the image resizing that used it went away when
+// the base image became qcow2, so what remains is the size arithmetic its
+// regression test checks.
+#[cfg(test)]
 fn resize<D: redoxfs::Disk>(fs: &mut FileSystem<D>, shrink: bool) -> Result<(u64, u64), String> {
     let disk_size = fs
         .disk

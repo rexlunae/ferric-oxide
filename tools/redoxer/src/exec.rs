@@ -7,6 +7,7 @@ use std::process::{self, Command, Stdio};
 use std::{fs, io};
 
 #[cfg(feature = "fuse")]
+#[cfg(feature = "fuse")]
 use crate::redoxfs::to_qcow2;
 use crate::redoxfs::{archive_image, extract_tar};
 #[cfg(feature = "fuse")]
@@ -206,13 +207,11 @@ fn bootloader_bios_available() -> bool {
         .join("recipes/core/bootloader/target")
         .join(target())
         .join("stage");
-    // Only a tree with no UEFI image at all is BIOS-only. A plain `repo cook`
-    // does not set FERRIC_UEFI_ONLY, so its stage can hold both images; the
-    // firmware is then decided by the one that is installed, not by what the
-    // recipe happened to leave behind.
-    let has_uefi = stage.join("usr/lib/boot/bootloader-live.efi").is_file()
-        || stage.join("usr/lib/boot/bootloader.efi").is_file();
-    bios_bootloader(&stage).is_some() && !has_uefi
+    // A stage with a BIOS image can boot BIOS, whatever else it also holds:
+    // that is what the checkout built, and preferring UEFI there would demand
+    // OVMF from a host that has a loader it could already use. `firmware_for`
+    // makes the decision; this only answers "is BIOS available here".
+    bios_bootloader(&stage).is_some()
 }
 
 /// The BIOS bootloader in `root`, if the tree has one.
@@ -748,8 +747,15 @@ fn base(
             let raw = base_partial.with_extension("raw");
             fs::rename(&base_partial, &raw)?;
             eprintln!("redoxer: compressing {name} to qcow2");
-            to_qcow2(&raw, &base_partial)?;
-            fs::remove_file(&raw)?;
+            // A failed conversion must not leave the raw disk behind: it is
+            // hundreds of megabytes, it is not what `base_file` means, and the
+            // next run only clears the `.partial` output, so it would sit there
+            // for good. The conversion writes its own partial output, so
+            // removing ours on the way out leaves the cache as it was.
+            let converted = to_qcow2(&raw, &base_partial);
+            let unpacked = fs::remove_file(&raw);
+            converted?;
+            unpacked?;
         } else {
             #[cfg(not(feature = "fuse"))]
             require_no_fuse(fuse)?;
@@ -1211,12 +1217,25 @@ fn inner(config: &RedoxerExecConfig) -> anyhow::Result<i32> {
 
     let code = {
         if fuse {
+            // The stored base is qcow2, which only QEMU reads. Everything that
+            // mounts or rewrites the disk here works on raw bytes, so unpack it
+            // into the copy the run will use.
             Command::new("cp")
                 .arg(&base_file)
                 .arg(&redoxer_bin)
                 .status()
                 .and_then(status_error)
                 .context("copy base to redoxer bin failed")?;
+
+            // Only the FUSE install path stores its base as qcow2; the archive
+            // path writes a whole-disk image, so this is compiled out with it.
+            #[cfg(feature = "fuse")]
+            {
+                let raw = redoxer_bin.with_extension("raw");
+                crate::redoxfs::to_raw(&redoxer_bin, &raw)
+                    .context("unable to unpack the base image")?;
+                fs::rename(&raw, &redoxer_bin).context("unable to use the unpacked base image")?;
+            }
 
             // The base image is the disk. Expanding it here would write a
             // filesystem header sized from the whole file, but the firmware
@@ -1870,6 +1889,45 @@ mod tests {
         fs::create_dir_all(staged.parent().unwrap()).unwrap();
         fs::write(&staged, "bios").unwrap();
         assert_eq!(bios_bootloader(temporary.path()), Some(staged));
+    }
+
+    /// A staged tree that holds a BIOS loader can boot BIOS, even when it also
+    /// holds a UEFI one.
+    ///
+    /// A plain `repo cook` does not set FERRIC_UEFI_ONLY, so its bootloader
+    /// stage often has both images. Treating that as "no BIOS" forced UEFI and
+    /// demanded OVMF from a host whose loader it could already boot.
+    #[test]
+    fn a_stage_with_both_images_still_offers_bios() {
+        let temporary = tempfile::tempdir().unwrap();
+        let stage = temporary.path();
+
+        // Neither image: no BIOS to offer.
+        assert!(bios_bootloader(stage).is_none());
+
+        // Both: the BIOS loader is there, so BIOS is available.
+        for image in [BIOS_BOOTLOADER, "usr/lib/boot/bootloader-live.efi"] {
+            let path = stage.join(image);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "image").unwrap();
+        }
+        assert_eq!(
+            bios_bootloader(stage),
+            Some(stage.join(BIOS_BOOTLOADER)),
+            "a dual-image stage keeps its BIOS loader"
+        );
+
+        // This is what `bootloader_bios_available` reduces to, so the rule sees
+        // BIOS as available here and no longer insists on UEFI.
+        assert_eq!(
+            firmware_for(target(), bios_bootloader(stage).is_some()),
+            if target().starts_with("x86_64") {
+                Firmware::Bios
+            } else {
+                firmware_for(target(), true)
+            },
+            "an x86_64 checkout with a BIOS loader boots BIOS"
+        );
     }
 
     /// A cache hit must reach the firmware decision of the run that filled the

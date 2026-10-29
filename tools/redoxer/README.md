@@ -42,12 +42,12 @@ redoxer exec [-f|--folder folder] [-f|--folder folder:/path/in/redox] [-g|--gui]
     Notes:
     - Setting REDOXER_QEMU_BINARY will print qemu commands to terminal
     - Setting "-o -" will hide qemu serial output, only printing stdout/stderr from the command
-    - Every guest gets 4 GiB of RAM (`-m 4096`). The bootloader reads the whole
+    - Every guest gets 8 GiB of RAM (`-m 8192`). The bootloader reads the whole
       disk image into RAM before the kernel runs, so a working image no longer
       fits in 2048 MiB; a host that cannot give QEMU that much plus its own
       overhead fails the boot instead of starting a guest that cannot load its
       disk. `REDOXER_QEMU_ARGS` overrides it, because a `-m` there replaces the
-      default `-m`: `REDOXER_QEMU_ARGS="-m 2048"`. Lowering it only works for an
+      default `-m`: `REDOXER_QEMU_ARGS="-m 4096"`. Lowering it only works for an
       image small enough to load in that memory.
     - x86_64 boots through UEFI when the cookbook's bootloader recipe produced no
       BIOS bootloader, which is what a Ferric Oxide build does (it is UEFI-only);
