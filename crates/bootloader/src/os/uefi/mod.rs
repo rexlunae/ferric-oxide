@@ -49,7 +49,13 @@ pub(crate) fn alloc_zeroed_page_aligned(size: usize) -> *mut u8 {
     let ptr = {
         // The same bound the paging code maps, so what this returns is always
         // addressable. A live disk larger than it cannot be loaded.
-        let mut ptr = crate::MAX_PHYSICAL_ADDRESS;
+        //
+        // `AllocatePages` takes the address through `&mut usize`, while the
+        // bound is a `u64` because it is shared with the 64-bit paging code.
+        // The conversion is explicit for that reason: left to inference the
+        // literal stays a `u64` and the firmware call does not type-check.
+        let mut ptr = usize::try_from(crate::MAX_PHYSICAL_ADDRESS)
+            .expect("MAX_PHYSICAL_ADDRESS fits this target's usize");
         status_to_result((std::system_table().BootServices.AllocatePages)(
             1,                                  // AllocateMaxAddress
             MemoryType::EfiRuntimeServicesData, // Keeps this memory out of free space list
