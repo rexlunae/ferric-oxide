@@ -230,16 +230,18 @@ The goal is for Ferric Oxide to share disks with Linux and run on servers that w
 ## Phase 6: Graphics and desktop
 
 **Direction adopted 26 October 2026:** use Wayland, Smithay, Mesa and Xwayland.
-Graphics implementation is deferred until the current PR backlog has been
-merged; the prerequisites in Phases 2 and 5 still apply. Existing experimental
-recipes are groundwork, not evidence of a working accelerated desktop.
+Graphics build bring-up is in progress; the prerequisites in Phases 2 and 5
+still apply to the accelerated stack. Existing experimental recipes are
+groundwork, not evidence of a working accelerated desktop.
 
 - **Display and compositor:** use [Wayland](https://wayland.freedesktop.org/)
   and standard desktop protocols, with [Smithay](https://github.com/Smithay/smithay)
   as the Rust compositor foundation. Keep Ferric-specific integration in the
   platform backend and window-management policy. Smithay is a library, so a
-  complete desktop shell remains future work; COSMIC is no longer the selected
-  desktop.
+  complete desktop shell remains future work. Keep COSMIC supported as an
+  optional desktop choice; supporting it does not select it as the default.
+  The current `wayland` image configuration builds COSMIC components and a
+  nested session; see [its build instructions and limits](./graphics-windowing.md#cosmic-build-configuration).
 - **Rendering:** use [Mesa](https://docs.mesa3d.org/) for EGL, OpenGL/OpenGL ES
   and Vulkan. Software rendering remains useful for bring-up and diagnostics,
   but does not satisfy the hardware-acceleration milestones.

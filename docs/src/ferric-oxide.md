@@ -12,6 +12,7 @@ descriptions may differ from this checkout.
 | --- | --- |
 | Understand the components, workspaces and boot sequence | [Architecture](ferric-architecture.md) |
 | Build an image, choose features or change a recipe | [Build and configuration](ferric-build.md) |
+| Build the experimental COSMIC image or check graphics limitations | [Windowing and graphics](graphics-windowing.md#cosmic-build-configuration) |
 | Change CPU state, address spaces or kernel hardening | [Memory and CPU protection](ferric-memory.md) |
 | Work on drivers, DMA, shared buffers or rings | [Registered buffers, IOMMUs and rings](ferric-io.md) |
 | Trace system calls and scheduling, or add a tracepoint | [Kernel tracing](ferric-tracing.md) |
@@ -35,6 +36,7 @@ passed, or that a feature is enabled in every image.
 | Area | Implemented behavior | Boundary or remaining work |
 | --- | --- | --- |
 | Monorepo | Local kernel, bootloader, relibc, base services, RedoxFS, installer and Redoxer sources; shared host workspace | Other applications still come from recipes; target builds remain separate |
+| Graphics build bring-up | The `wayland` image configuration builds COSMIC components, GTK and software Mesa with the native toolchain ([graphics chapter](graphics-windowing.md#cosmic-build-configuration)); an x86_64 image built and booted headless to login | Graphical session and ARM64 image unvalidated; nested Orbital backend, no complete COSMIC shell or accelerated GPU stack; Phase 6 remains in progress |
 | Native build | `cargo xtask` setup, image build and QEMU; rustup, host Clang/LLD and rootless image writing; ARM64 UEFI firmware clock handoff ([build guide](ferric-build.md)) | Host architecture by default with explicit x86-64/ARM64 UEFI cross-builds; ARM64 uses a RAM-backed live image/software emulation, with persistent storage, HVF and some applications still incomplete; target GCC ABI runtime data remains; some application recipes need additional tools |
 | Feature configuration | TOML catalog, interactive editor, CLI, validation and generation of Make, image and kernel settings; per-architecture minimum CPU baselines and independent variant checkboxes | Target overrides resolve before validation; variant builds produce separate images, with combined-architecture images still future work; no `ferric.toml` preserves the upstream-style build path |
 | Device trees | Shared allocation-free adapter around the crates.io `fdt` parser; host-tested console, phandle and MMIO handling ([architecture](ferric-architecture.md)) | ARM64/RISC-V firmware inputs; device bindings and reserved-memory policy remain in the kernel; parser updates need target boot validation |

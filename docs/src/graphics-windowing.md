@@ -3,9 +3,40 @@
 Orbital remains the inherited default desktop, but is deprecated for new
 Ferric Oxide graphics development. The replacement direction is Wayland with
 Smithay, Mesa and Xwayland, as described in [Phase 6 of the roadmap](./ferric-roadmap.md#phase-6-graphics-and-desktop).
-Implementation is deferred until the current PR backlog is merged. Orbital is
-not planned to be brought up to a working or supported state; existing recipes
-and image defaults remain only as legacy artifacts and may not work.
+COSMIC remains an optional desktop choice to support. Its experimental image
+configuration currently uses Orbital to host a nested compositor; this is a
+build bring-up path, and the accelerated display stack remains future work.
+Orbital is not planned to be brought up to a working or supported state as a
+standalone desktop; its inherited recipes and defaults may not work.
+
+## COSMIC build configuration
+
+After the [native build setup](./ferric-build.md), select the existing image
+configuration and build it:
+
+```sh
+cargo run -p ferric-config -- set image.config wayland
+cargo xtask build
+cargo xtask run --no-build
+```
+
+The `image.config` option in `features.toml` selects `config/wayland.toml`.
+That configuration includes `cosmic-comp`, `cosmic-app-library`, the
+`libcosmic-wayland` example, GTK and Mesa, together with the inherited desktop
+packages. It does not install the complete COSMIC shell, panel and applet set.
+`build.build_tools = "guest"` runs eligible build tools such as `gperf` in
+the guest; tools that must run on the host include Python and LLVM. The build
+needs a working host C++ standard library and enough disk space for both LLVM
+builds described below.
+
+An x86_64 build of this configuration completed on 30 October 2026 and its
+image reached `redox login:` in a headless QEMU boot. The graphical COSMIC
+session was not validated. The installed `orbital-wayland` script selects
+`COSMIC_BACKEND=winit`, starts `cosmic-comp` nested inside Orbital and then
+runs the libcosmic example. Mesa uses software rendering; the compositor
+recipe still records performance and keyboard-input limitations. This build
+result does not establish a usable graphical session, hardware acceleration
+or the Phase 6 exit criteria. ARM64 COSMIC image validation remains pending.
 
 ## Drivers
 
