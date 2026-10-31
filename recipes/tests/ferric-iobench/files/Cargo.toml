@@ -13,7 +13,7 @@ name = "ferric-iobench"
 path = "src/main.rs"
 
 [dependencies]
-ferric-blkqueue = { path = "../../../../crates/blkqueue" }
+ferric-blkqueue = { path = "../../../../crates/blkqueue", features = ["std"] }
 ferric-iobench = { path = "../../../../crates/iobench" }
 ferric-trace = { path = "../../../../crates/trace" }
 

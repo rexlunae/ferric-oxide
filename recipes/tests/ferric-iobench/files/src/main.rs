@@ -67,8 +67,6 @@ mod engine;
 mod file;
 #[cfg(target_os = "redox")]
 mod redox;
-#[cfg_attr(not(target_os = "redox"), allow(dead_code))]
-mod round;
 
 /// The jobs a run without arguments runs, in fio's option syntax.
 #[cfg_attr(not(target_os = "redox"), allow(dead_code))]

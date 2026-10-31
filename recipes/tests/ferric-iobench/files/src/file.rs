@@ -27,7 +27,7 @@ use syscall::flag::O_FSYNC;
 
 use crate::engine::HeapBuffer;
 use crate::redox::{Failure, io, nanos, run_rounds};
-use crate::round::run_together;
+use ferric_blkqueue::round::run_together;
 
 /// How a round opens the file.
 #[derive(Clone, Copy, PartialEq, Eq)]
