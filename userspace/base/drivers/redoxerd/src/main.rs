@@ -4,7 +4,9 @@ use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
 use std::process::{Child, Command, ExitStatus, Stdio};
 
 use anyhow::Context;
+use ferric_abi::redoxerd::COMMAND;
 
+mod capture;
 mod sys;
 
 const DEFAULT_COLS: u16 = 80;
@@ -116,9 +118,23 @@ pub fn getpty(columns: u16, lines: u16) -> anyhow::Result<(RawFd, String)> {
 fn inner() -> anyhow::Result<()> {
     common::acquire_port_io_rights()?;
 
-    let config = fs::read_to_string("/etc/redoxerd").context("Failed to read /etc/redoxerd")?;
+    let config =
+        fs::read_to_string(COMMAND).with_context(|| format!("Failed to read {COMMAND}"))?;
     let mut config_lines = config.lines();
+    let Some(name) = config_lines.next() else {
+        anyhow::bail!("{COMMAND} does not specify command");
+    };
+    let mut command = Command::new(name);
+    command.args(config_lines);
 
+    match capture::request()? {
+        Some(request) => capture::run(&request, command),
+        None => run_on_terminal(name, command),
+    }
+}
+
+/// Runs `command` on a terminal echoed to the debug console, for a person to watch.
+fn run_on_terminal(name: &str, mut command: Command) -> anyhow::Result<()> {
     let (columns, lines) = (DEFAULT_COLS, DEFAULT_LINES);
     let (master_fd, pty) = getpty(columns, lines).context("failed to get pty")?;
 
@@ -150,13 +166,6 @@ fn inner() -> anyhow::Result<()> {
         .open(&pty)
         .context("failed to get pty stderr")?;
 
-    let Some(name) = config_lines.next() else {
-        anyhow::bail!("/etc/redoxerd does not specify command");
-    };
-    let mut command = Command::new(name);
-    for arg in config_lines {
-        command.arg(arg);
-    }
     unsafe {
         command
             .stdin(Stdio::from_raw_fd(slave_stdin.into_raw_fd()))

@@ -750,10 +750,9 @@ pub fn get_sub_target_dir(target_dir: &Path, sub_path: &str) -> PathBuf {
 ///
 /// The shim runs the tool by its **name**, not by its host path. The toolchain
 /// holds the same tools the guest environment installed under the same
-/// basenames, and the guest resolves the name on its `PATH`; a host path would
-/// reach `redoxerd` as an argument it rewrites to `/root/...` (see
-/// `redoxer`'s `write_redoxerd_config`), pointing at a directory rather than a
-/// program. The guest command a shim passes is therefore the file name alone.
+/// basenames, and the guest resolves the name on its `PATH`, whereas the
+/// toolchain path is a host directory the guest does not have. The guest
+/// command a shim passes is therefore the file name alone.
 ///
 /// `Error` is large, like every `Result` in this module; the error paths here
 /// are startup failures, not per-file ones, so boxing buys nothing.
@@ -792,7 +791,7 @@ fn write_guest_tool_shims(guest_tools: &str, toolchain: &Path, repo: &Path) -> R
         // `repo` sits beside the cookbook_redoxer shim the recipe runs under,
         // so the shim finds it by the same path rather than guessing one.
         let script = format!(
-            "#!/bin/sh\n# Generated: runs the tool built for the target in the guest.\nexec \"{}\" guest-run --guest \"{}\" --silent \"${{COOKBOOK_SILENT:-0}}\" -- \"{}\" \"$@\"\n",
+            "#!/bin/sh\n# Generated: runs the tool built for the target in the guest.\nexec \"{}\" guest-run --guest \"{}\" -- \"{}\" \"$@\"\n",
             shell_quote(&repo.display().to_string()),
             shell_quote(guest_tools),
             shell_quote(command),
@@ -1152,10 +1151,9 @@ mod tests {
                 "the shim runs the repo beside this checkout: {script}"
             );
             // The guest has the tool on PATH under the same name, so the shim
-            // names it. A host path would be rewritten to /root/... by
-            // redoxerd and point at a directory instead of the program.
+            // names it. The host toolchain path does not exist in the guest.
             let guest_command = script
-                .rsplit("${COOKBOOK_SILENT:-0}\" -- \"")
+                .rsplit("\" -- \"")
                 .next()
                 .and_then(|rest| rest.split('\"').next())
                 .unwrap_or_default();

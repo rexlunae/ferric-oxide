@@ -2198,6 +2198,7 @@ dependencies = [
  "anyhow",
  "common",
  "fdt 0.1.5",
+ "ferric-abi",
  "libc",
  "libredox",
  "qemu-exit",

@@ -47,7 +47,8 @@ pkgar = { git = "https://github.com/rexlunae/pkgar.git" } # Ferric mirror of red
 pkgar-core = { git = "https://github.com/rexlunae/pkgar.git" }
 pkgar-keys = { git = "https://github.com/rexlunae/pkgar.git" }
 redox_installer.workspace = true
-redoxer = { workspace = true, default-features = false }
+# `cli-exec` runs build tools in the guest (`repo guest-run`).
+redoxer = { workspace = true, default-features = false, features = ["cli-exec"] }
 regex = "1.11"
 serde.workspace = true
 termion = "4"

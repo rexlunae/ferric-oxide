@@ -420,24 +420,24 @@ from `GUEST_TOOL_PACKAGES` in `mk/fstools.mk`, one list that both the installer
 configuration and the cook that builds their archives read, so a lean image
 configuration that never cooks `extrautils` still gets it into the environment.
 
-It also carries `/etc/net/ip`, `ip_router` and `ip_subnet`, because `netstack`
-panics on a missing router address before `redoxerd` starts.
+It also carries `/etc/net/ip`, `ip_router` and `ip_subnet`, so the guest's
+network comes up with QEMU's user-mode addresses. (`netstack` starts without a
+default route when `ip_router` is missing; it used to panic there.)
 
 `build.keep_build_tools` leaves the tools in the finished image as the
 `build-tools` meta-package; without it they stay in the scratch environment and
 are thrown away with it. It implies `build.build_tools = "guest"`, and setting
 it together with `host` is a configuration error.
 
-Every guest `redoxer exec` boots, the build-tools environment included, is given
-8 GiB of RAM. The bootloader reads the whole disk image into RAM before the
-kernel starts, so a working image needs room for the disk, the kernel and the
-firmware at once; the previous 2 GiB was not enough, and a guest booted with too
-little memory fails instead of starting. A host with less than about 8 GiB free,
-plus QEMU's own overhead, cannot run a guest build: build with
-`build.build_tools = "host"` there. `REDOXER_QEMU_ARGS` overrides the argument,
-because a `-m` in it replaces the default `-m` that redoxer generates
-(`REDOXER_QEMU_ARGS="-m 2048"`); that only works for an image small enough to
-load in the smaller memory. See the
+The environment is installed as a disk-backed image (the installer's default
+`live_disk = false`), so a guest reads it from disk and writes back to it. Each
+build tool runs in a guest with 2 GiB of RAM, so a build that runs several tools
+at once needs 2 GiB, plus QEMU's overhead, for each. A guest that `redoxer exec`
+installs from a configuration boots a live image instead and is given 8 GiB,
+because the bootloader reads the whole disk image into RAM before the kernel
+starts. `REDOXER_QEMU_ARGS` overrides that, because a `-m` in it replaces the
+default `-m` that redoxer generates (`REDOXER_QEMU_ARGS="-m 4096"`); that only
+works for an image small enough to load in the smaller memory. See the
 [Redoxer README](https://github.com/rexlunae/ferric-oxide/tree/main/tools/redoxer#readme)
 for the `exec` options.
 
@@ -461,23 +461,49 @@ binary and the host cannot execute it. Two things keep recipe scripts unchanged:
    Redox binary. Instead the cookbook writes a shim of the same name for each
    binary in `toolchain/bin`, and puts the shim directory there first.
 2. A shim runs the tool through `repo guest-run --guest <image> -- <tool>
-   <args>`, which boots the environment installed for this build and mirrors the
-   tool's exit status. The command is the tool's name, not the path of the
-   toolchain binary: the guest resolves it on its own `PATH`, where the
-   installation put it. `repo guest-run` never rebuilds or reinstalls the
-   environment — it only boots it — so repeated calls in one build reuse it.
-   It passes the image to `redoxer exec --image`, which boots a private copy per
-   invocation, so recipe builds running in parallel never write to the shared
-   environment.
+   <args>`. The command is the tool's name, not the path of the toolchain
+   binary: the guest resolves it on its own `PATH`, where the installation put
+   it. `repo guest-run` never rebuilds or reinstalls the environment. It boots
+   a private copy of it per call ([redoxer's guest runner](https://github.com/rexlunae/ferric-oxide/tree/main/tools/redoxer#running-a-build-tool)),
+   so recipe builds running in parallel never write to the shared environment.
+
+The tool has to behave as the host tool it replaces would. A guest shares no
+file system with the host, so `repo guest-run` moves the files the tool works on.
+They keep their host paths in the guest, so relative and absolute arguments mean
+the same thing there. Only paths inside the cookbook checkout move, because
+those are the build's own files; any other path an argument names refers to the
+guest's own file. Within the checkout:
+
+- The working directory, which must be inside the checkout, is created in the
+  guest. Every file the tool creates or changes under it is copied back.
+- An argument naming an existing file or directory, alone or as
+  `--option=path`, is copied in, and changes to it, including a change of mode
+  only, are copied back. Directories arrive as directories, empty ones too.
+- An argument naming a path that does not exist yet, outside the working
+  directory, is copied back if the tool creates it, along with any parent
+  directories it creates.
+
+A path is shared as the argument spells it, so one that goes through a symlink
+arrives at the place the tool looks in the guest, holding what the symlink
+points to; the guest has no symlinks. Its target must be inside the checkout as
+well.
+
+The tool runs without a terminal. Its standard output and standard error are
+replayed byte for byte, so a build that captures generated code from standard
+output (as meson does for `gperf`) gets exactly what the tool printed.
+`repo guest-run` exits with the tool's status. Files the tool deletes are not
+deleted on the host. If the guest kernel panics, or the guest runs longer than
+`COOKBOOK_GUEST_TIMEOUT` seconds (30 minutes by default, counted from QEMU's
+start), `repo guest-run` stops the guest, fails, and prints the end of its
+console.
 
 A recipe therefore keeps writing `gperf`, `mdbook build` and so on. The
 `FERRIC_GUEST_TOOLS_DIR` variable names the environment image; it is empty when
 the tools come from the host, which is what leaves a host build's `PATH` and
 execution unchanged.
 
-A `host:` name with no recipe (for example `gperf`, which is also a host system
-package) has nothing to build for either target. Those entries are host-provided
-binaries and guest mode neither builds nor runs them.
+A `host:` name with no recipe has nothing to build for either target. Those
+entries are host-provided binaries and guest mode neither builds nor runs them.
 
 ## Debug info and unoptimized builds
 

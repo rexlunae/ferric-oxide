@@ -42,13 +42,14 @@ redoxer exec [-f|--folder folder] [-f|--folder folder:/path/in/redox] [-g|--gui]
     Notes:
     - Setting REDOXER_QEMU_BINARY will print qemu commands to terminal
     - Setting "-o -" will hide qemu serial output, only printing stdout/stderr from the command
-    - Every guest gets 8 GiB of RAM (`-m 8192`). The bootloader reads the whole
+    - Every `exec` guest gets 8 GiB of RAM (`-m 8192`). The bootloader reads the whole
       disk image into RAM before the kernel runs, so a working image no longer
       fits in 2048 MiB; a host that cannot give QEMU that much plus its own
       overhead fails the boot instead of starting a guest that cannot load its
       disk. `REDOXER_QEMU_ARGS` overrides it, because a `-m` there replaces the
       default `-m`: `REDOXER_QEMU_ARGS="-m 4096"`. Lowering it only works for an
-      image small enough to load in that memory.
+      image small enough to load in that memory. A build tool run through the
+      library boots from disk instead and gets 2 GiB (see "Running a build tool")
     - x86_64 boots through UEFI when the cookbook's bootloader recipe produced no
       BIOS bootloader, which is what a Ferric Oxide build does (it is UEFI-only);
       a checkout that still builds `bootloader.bios` boots through BIOS as before,
@@ -106,13 +107,12 @@ In this mode redoxer:
 - never mounts the image, so `REDOXER_USE_FUSE` has no effect here and FUSE
   (or `fusermount`) is not needed on the host. The per-run files go into the
   copy through the RedoxFS writer, which is why this mode works on a host
-  without FUSE. It is also why the files are the only thing written: the
-  writer can create and overwrite a known path, but it cannot list what an
-  image contains;
-- does not support `--artifact`: reading files back out of a guest is the one
-  thing that needs the FUSE mount, and this mode deliberately has no mount. It
-  fails and says so rather than returning an empty directory. Use
-  `REDOXER_USE_FUSE` with an install configuration to copy files out;
+  without FUSE;
+- does not support `--artifact`, and fails and says so rather than returning an
+  empty directory. A command whose files must come back is run through the
+  library instead (see [Running a build tool](#running-a-build-tool)); use
+  `REDOXER_USE_FUSE` with an install configuration to copy files out from the
+  command line;
 - gives the command the same working directory an installed image does:
   `/root`, which is created in the copy when the prepared image has none
   (redoxer also creates it for an installed image), and does `cd /root` with a
@@ -123,6 +123,40 @@ In this mode redoxer:
 
 There is no execution cache: the image is the input, and a rebuilt environment
 is picked up because nothing about a previous run is remembered.
+
+## Running a build tool
+
+`redoxer::guest::run` (with the `cli-exec` feature) runs one command in an
+existing image so that it behaves like a host program. `repo guest-run` is built
+on it. A Redox guest has no file system shared with the host, so everything
+travels through a private copy of the disk:
+
+1. The caller names the inputs, the outputs and the working directory with a
+   `GuestCommand`. Inputs are written into the copy at the same absolute paths
+   they have on the host, so arguments mean the same thing in the guest.
+   Symlinks are followed, so an input reached through one arrives at the path
+   given, holding what it points to; directories arrive as directories, empty
+   ones too.
+2. The command goes to `redoxerd` with a capture request (the protocol is in
+   `ferric_abi::redoxerd`). `redoxerd` then runs it without a terminal, in the
+   requested directory, with standard output and standard error in separate
+   files and its exit status recorded. Before stopping the guest it flushes
+   those files, and every file under the outputs, to the disk.
+3. After QEMU exits, the host reads the streams, the status and the outputs
+   back out of the copy with the RedoxFS reader. It writes each output file
+   that is new or changed (in contents or mode) to the host and returns a `GuestOutput` holding the
+   exact bytes of both streams and the command's status. Files the command
+   deletes are not deleted on the host.
+
+The image must boot from disk, as an installer image does by default
+(`live_disk = false`); a live image keeps the guest's writes in memory. Because
+the image is not loaded into RAM, the guest gets 2 GiB rather than 8 GiB.
+
+A guest kernel panic halts the guest without stopping QEMU. The console is
+watched, so a panic ends the run with `GuestError::Panicked` and the end of the
+console instead of hanging the build. A guest that never reaches the command
+is stopped by the run's timeout (`GuestCommand::timeout`, counted from QEMU's
+start) with `GuestError::TimedOut`.
 
 ## Commands
 

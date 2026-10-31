@@ -9,9 +9,7 @@ use redoxfs::{FileSystem, Node, TreePtr};
 use std::fs;
 use std::fs::File;
 use std::io;
-use std::path::Path;
-#[cfg(any(feature = "fuse", test))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(feature = "fuse")]
 use std::sync::mpsc::{channel, TryRecvError};
@@ -378,6 +376,111 @@ pub(crate) fn write_files(image: &Path, files: &[crate::writer::GuestEntry]) -> 
     Ok(())
 }
 
+/// A regular file read out of a guest image.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ImageFile {
+    /// Absolute path inside the guest.
+    pub(crate) path: PathBuf,
+    /// The file's contents.
+    pub(crate) data: Vec<u8>,
+    /// Permission bits.
+    pub(crate) mode: u16,
+}
+
+/// Reads every regular file at or under each of `roots` out of the file system of the
+/// whole-disk image at `image`.
+///
+/// A root the image does not have is skipped, so a caller can name outputs a command may
+/// not have produced. Symbolic links and other special nodes are skipped as well: what
+/// comes back is file contents.
+///
+/// # Errors
+/// Returns an error when the partition or its file system cannot be opened, a root is not
+/// an absolute UTF-8 path, the tree is nested more than 64 directories deep below a root,
+/// or a node cannot be read.
+pub(crate) fn read_files(image: &Path, roots: &[&Path]) -> anyhow::Result<Vec<ImageFile>> {
+    let mut fs = open_partition(image)?;
+    let mut files = Vec::new();
+    fs.tx(|tx| {
+        for root in roots {
+            if let Some(node) = find_path(tx, root)? {
+                read_tree_into(tx, node, root.to_path_buf(), &mut files, 0)?;
+            }
+        }
+        Ok(())
+    })
+    .map_err(|err| {
+        anyhow!(
+            "unable to read {roots:?} out of the guest image: {}",
+            syscall_error(err)
+        )
+    })?;
+    Ok(files)
+}
+
+/// The node at the absolute `path`, or `None` when the image has nothing there.
+fn find_path<D: redoxfs::Disk>(
+    tx: &mut redoxfs::Transaction<D>,
+    path: &Path,
+) -> syscall::Result<Option<TreePtr<Node>>> {
+    let relative = path
+        .strip_prefix("/")
+        .map_err(|_| syscall::Error::new(syscall::EINVAL))?;
+    let mut node = TreePtr::root();
+    for component in relative.iter() {
+        let name = component
+            .to_str()
+            .ok_or_else(|| syscall::Error::new(syscall::EINVAL))?;
+        node = match tx.find_node(node, name) {
+            Ok(child) => child.ptr(),
+            Err(err) if err.errno == syscall::ENOENT => return Ok(None),
+            Err(err) => return Err(err),
+        };
+    }
+    Ok(Some(node))
+}
+
+/// Appends the regular files at or under `node`, whose guest path is `path`, to `files`.
+fn read_tree_into<D: redoxfs::Disk>(
+    tx: &mut redoxfs::Transaction<D>,
+    node: TreePtr<Node>,
+    path: PathBuf,
+    files: &mut Vec<ImageFile>,
+    depth: usize,
+) -> syscall::Result<()> {
+    const MAX_DEPTH: usize = 64;
+    if depth > MAX_DEPTH {
+        return Err(syscall::Error::new(syscall::ELOOP));
+    }
+    let tree = tx.read_tree(node)?;
+    let info = tree.data();
+    if info.is_dir() {
+        let mut children = Vec::new();
+        tx.child_nodes(node, &mut children)?;
+        for child in children {
+            let name = child
+                .name()
+                .ok_or_else(|| syscall::Error::new(syscall::EINVAL))?;
+            read_tree_into(tx, child.node_ptr(), path.join(name), files, depth + 1)?;
+        }
+    } else if info.is_file() {
+        let mode = info.mode() & Node::MODE_PERM;
+        let size = usize::try_from(info.size()).map_err(|_| syscall::Error::new(syscall::EFBIG))?;
+        let mut data = vec![0; size];
+        let mut read = 0;
+        while read < size {
+            // A zero access time never updates the node's, so reading leaves the image as it was.
+            match tx.read_node(node, read as u64, &mut data[read..], 0, 0)? {
+                0 => break,
+                count => read += count,
+            }
+        }
+        data.truncate(read);
+        files.push(ImageFile { path, data, mode });
+    }
+    Ok(())
+}
+
 fn read_bootloader(
     disk_path: &Path,
     bootloader_bin: &Path,
@@ -634,23 +737,71 @@ mod tests {
 
     /// Reads a guest path out of the image, the way a booted guest would.
     fn read_guest_file(image: &Path, path: &str) -> Option<Vec<u8>> {
-        let mut fs = open_partition(image).ok()?;
-        let relative = redox_installer::image_relative_path(Path::new(path)).ok()?;
-        let mut parent = TreePtr::root();
-        let names: Vec<&str> = relative.iter().filter_map(|c| c.to_str()).collect();
-        let (name, dirs) = names.split_last()?;
-        for dir in dirs {
-            parent = fs
-                .tx(|tx| tx.find_node(parent, dir).map(|n| n.ptr()))
-                .ok()?;
-        }
-        fs.tx(|tx| {
-            let node = tx.find_node(parent, name)?;
-            let mut buf = vec![0u8; node.data().size() as usize];
-            tx.read_node(node.ptr(), 0, &mut buf, 0, 0)?;
-            Ok(buf)
-        })
-        .ok()
+        let path = Path::new(path);
+        read_files(image, &[path])
+            .ok()?
+            .into_iter()
+            .find(|file| file.path == path)
+            .map(|file| file.data)
+    }
+
+    /// What a guest command produced comes back whole: every file under a directory root,
+    /// with its contents and mode, while a root the image lacks is not an error.
+    #[test]
+    fn reading_files_returns_each_file_under_its_roots() {
+        let (_temp, image) = whole_disk_with(&[
+            ("work/out.h", b"generated\n"),
+            ("work/sub/empty", b""),
+            ("work/sub/data.bin", &[0, 1, 2, 255]),
+            ("etc/os-release", b"Ferric Oxide"),
+        ]);
+        write_files(
+            &image,
+            &[GuestEntry::file(
+                "/work/tool",
+                b"#!/bin/sh\n".to_vec(),
+                0o755,
+            )],
+        )
+        .unwrap();
+
+        let mut files =
+            read_files(&image, &[Path::new("/work"), Path::new("/missing/out")]).unwrap();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let summary: Vec<(&Path, &[u8])> = files
+            .iter()
+            .map(|file| (file.path.as_path(), file.data.as_slice()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (Path::new("/work/out.h"), b"generated\n".as_slice()),
+                (Path::new("/work/sub/data.bin"), [0, 1, 2, 255].as_slice()),
+                (Path::new("/work/sub/empty"), b"".as_slice()),
+                (Path::new("/work/tool"), b"#!/bin/sh\n".as_slice()),
+            ]
+        );
+        let tool = files
+            .iter()
+            .find(|f| f.path == Path::new("/work/tool"))
+            .unwrap();
+        assert_eq!(tool.mode & 0o777, 0o755);
+    }
+
+    /// A root may name one file as well as a directory.
+    #[test]
+    fn reading_files_accepts_a_file_root() {
+        let (_temp, image) = whole_disk_with(&[("etc/os-release", b"Ferric Oxide")]);
+        let files = read_files(&image, &[Path::new("/etc/os-release")]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].data, b"Ferric Oxide");
+    }
+
+    /// A relative root has no place in the image, and saying so beats reading nothing.
+    #[test]
+    fn reading_files_refuses_a_relative_root() {
+        let (_temp, image) = whole_disk_with(&[("etc/os-release", b"Ferric Oxide")]);
+        assert!(read_files(&image, &[Path::new("etc")]).is_err());
     }
 
     /// Writing the per-invocation files must leave the environment's own files

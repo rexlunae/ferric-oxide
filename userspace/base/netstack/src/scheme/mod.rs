@@ -46,7 +46,7 @@ type Interface = Rc<RefCell<SmoltcpInterface>>;
 const MAX_DURATION: Duration = Duration::from_micros(u64::MAX);
 const MIN_DURATION: Duration = Duration::from_micros(0);
 
-fn getcfg(key: &str) -> Result<String> {
+fn getcfg(key: &str) -> std::io::Result<String> {
     let mut value = String::new();
     let mut file = File::open(format!("/etc/net/{key}"))?;
     file.read_to_string(&mut value)?;
@@ -89,8 +89,18 @@ impl Smolnetd {
             IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8),
         ];
 
-        let default_gw = Ipv4Address::from_str(getcfg("ip_router").unwrap().trim())
-            .expect("Can't parse the 'ip_router' cfg.");
+        // An image without a static router (one not built from config/base.toml)
+        // starts with no default route; DHCP adds one later through netcfg.
+        let default_gw = match getcfg("ip_router") {
+            Ok(router) => {
+                Some(Ipv4Address::from_str(&router).expect("Can't parse the 'ip_router' cfg."))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                info!("no /etc/net/ip_router; starting without a default route");
+                None
+            }
+            Err(err) => panic!("Can't read the 'ip_router' cfg: {err}"),
+        };
 
         let devices = Rc::new(RefCell::new(DeviceList::default()));
         let route_table = Rc::new(RefCell::new(RouteTable::default()));
@@ -102,10 +112,12 @@ impl Smolnetd {
         let config = Config::new(HardwareAddress::Ip);
         let mut iface = SmoltcpInterface::new(config, &mut network_device, Instant::now());
         iface.update_ip_addrs(|ip_addrs| ip_addrs.extend(protocol_addrs));
-        iface
-            .routes_mut()
-            .add_default_ipv4_route(default_gw)
-            .expect("Failed to add default gateway");
+        if let Some(default_gw) = default_gw {
+            iface
+                .routes_mut()
+                .add_default_ipv4_route(default_gw)
+                .expect("Failed to add default gateway");
+        }
 
         let iface = Rc::new(RefCell::new(iface));
         let socket_set = Rc::new(RefCell::new(SocketSet::new(vec![])));
