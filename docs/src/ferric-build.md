@@ -373,6 +373,14 @@ image overrides. CI's forced test features remain separate. See
    fixes the size instead, and a fixed size that is too small stops the build
    before the image is written. See
    [Filesystem Size](./configuration-settings.md#filesystem-size).
+   Without FUSE (`FSTOOLS_NO_MOUNT=1`, which `cargo xtask build` uses), the
+   installer first unpacks the image's whole tree into a staging directory and
+   then writes it into RedoxFS, so a build briefly needs about as much free space
+   again as the image's contents. The staging directory is a new private
+   directory beside the image (`build/<arch>/<config>/.redox_installer.staging.*`),
+   because `/tmp` is often a small RAM-backed tmpfs; it is removed afterwards,
+   also when the install fails. Installing to a block device, or beside an image
+   in a directory you cannot write, stages in `TMPDIR` instead.
 
 The installer GUI recipe still fetches its own complete pinned upstream tree;
 the local host installer import does not include that GUI.
