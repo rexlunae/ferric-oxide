@@ -56,8 +56,8 @@ integration `b880ecc74737` by a native profiler-image source rebuild and full
 KVM smoke boot, including storage stress, profile collection and package
 verification. Both profile workflow postchecks passed, with 1,975 samples and
 zero unreadable stacks. The COSMIC image hash above records the earlier build;
-see [NVMe validation](./ferric-testing.md#nvme-command-identifiers) for the
-publication regression.
+see the [NVMe validation recorded with #352](https://github.com/rexlunae/ferric-oxide/blob/bacf514ca0e577c67bda9c55d5bdd02a98fa4456/docs/src/ferric-testing.md#nvme-command-identifiers)
+for the publication regression.
 
 The first-failure logs are retained for the preceding NVMe command-ID reuse
 hang, truncated pipe transfer ([#353](https://github.com/rexlunae/ferric-oxide/issues/353))
