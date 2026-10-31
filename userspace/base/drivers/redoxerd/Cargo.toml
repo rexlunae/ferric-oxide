@@ -14,6 +14,7 @@ redox_event.workspace = true
 redox_syscall.workspace = true
 redox_termios.workspace = true
 common = { path = "../common" }
+ferric-abi.workspace = true
 qemu-exit = "3.0.2"
 
 [lints]
