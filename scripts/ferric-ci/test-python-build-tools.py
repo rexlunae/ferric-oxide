@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.12
 """Import a compiled host build module through the cookbook's real Python setup.
 
-Requires a host C compiler and that Python's development headers. No network,
+Requires Python 3.12, its development headers and a host C compiler. No network,
 recipe downloads or target interpreter are used.
 """
 
@@ -15,10 +15,12 @@ import tempfile
 
 
 def main():
+    if sys.version_info[:2] != (3, 12):
+        raise RuntimeError("run this regression with python3.12 to match the build recipes")
     root = Path(__file__).resolve().parents[2]
     source = (root / "tools/cookbook/src/cook/script.rs").read_text()
     prescript = source.split('pub(crate) static BUILD_PRESCRIPT: &str = r#"', 1)[1].split('"#;', 1)[0]
-    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    version = "python3.12"
     suffix = sysconfig.get_config_var("EXT_SUFFIX")
     if not suffix:
         raise RuntimeError("host Python must support extension modules")
@@ -62,8 +64,8 @@ PyMODINIT_FUNC PyInit_build_native(void) { return PyModule_Create(&module); }
         (target_modules / "target_only.py").write_text("raise RuntimeError('target module imported')\n")
         config_name = "_sysconfigdata__redox_x86_64-redox"
         (target_stdlib / f"{config_name}.py").write_text("build_time_vars = {'FERRIC_TARGET_SENTINEL': 73}\n")
-        script = prescript + f"""
-COOKBOOK_PYTHON_V={shlex.quote(version)}
+        script = prescript + """
+test "$COOKBOOK_PYTHON_V" = python3.12
 PYTHON_INIT
 "$COOKBOOK_PYTHON" - <<'CHECK'
 import build_native

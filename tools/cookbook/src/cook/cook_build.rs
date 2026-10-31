@@ -185,22 +185,13 @@ enum SysrootDeps {
     Target,
 }
 
-/// The dependency sets a recipe builds against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DependencySets {
-    sysroot: SysrootDeps,
-    /// Whether the host tool packages are also installed as a toolchain the
-    /// build scripts run tools from.
-    toolchain: bool,
-}
-
-/// Chooses the dependency sets for `name`, ignoring the dependency contents.
+/// Chooses the link sysroot for `name`, ignoring the dependency contents.
 ///
 /// A recipe built for the target compiles against the target packages, laid
 /// out as its sysroot. That includes a `host:` recipe when its tools are built
 /// for the guest: it is a target binary then, so its own libraries are the
-/// target ones, and the host toolchain must stay empty so no host-built
-/// library is linked into it.
+/// target ones. Host-built dependencies still populate a separate toolchain
+/// for programs its build scripts run; they never enter its link sysroot.
 ///
 /// Otherwise a `host:` recipe is a host binary. It compiles against its host
 /// tool packages: they are host-built too, so they take the sysroot's place,
@@ -210,20 +201,10 @@ struct DependencySets {
 /// The packages a dependency walk found are not consulted here, so the choice
 /// is the same on a cold build and on the rebuild that clears the cached
 /// directories.
-fn dependency_sets(name: &RecipeName, tools_are_target: bool) -> DependencySets {
+fn dependency_sysroot(name: &RecipeName, tools_are_target: bool) -> SysrootDeps {
     match (name.is_host(), tools_are_target) {
-        (true, true) => DependencySets {
-            sysroot: SysrootDeps::Target,
-            toolchain: false,
-        },
-        (true, false) => DependencySets {
-            sysroot: SysrootDeps::Host,
-            toolchain: true,
-        },
-        (false, _) => DependencySets {
-            sysroot: SysrootDeps::Target,
-            toolchain: true,
-        },
+        (true, false) => SysrootDeps::Host,
+        _ => SysrootDeps::Target,
     }
 }
 
@@ -335,13 +316,12 @@ pub fn build(
         return build_remote(stage_dirs, stage_pkgars, recipe, target_dir, logger);
     }
 
-    let sets = dependency_sets(name, cook_recipe.runs_in_guest());
-    let deps_sysroot = match sets.sysroot {
+    let deps_sysroot = match dependency_sysroot(name, cook_recipe.runs_in_guest()) {
         SysrootDeps::Host => &dep_host_pkgars,
         SysrootDeps::Target => &dep_pkgars,
     };
-    let have_toolchain = sets.toolchain && !dep_host_pkgars.is_empty();
-    let have_guest_tools = sets.toolchain && !dep_guest_tool_pkgars.is_empty();
+    let have_toolchain = !dep_host_pkgars.is_empty();
+    let have_guest_tools = !dep_guest_tool_pkgars.is_empty();
     let (sysroot_cached, toolchain_cached, guest_tools_cached) = (
         build_deps_dir(logger, &sysroot_dir, deps_sysroot)?,
         if have_toolchain {
@@ -1095,17 +1075,13 @@ mod tests {
     }
 
     /// A tool built for the guest is a target binary: it must link the target
-    /// packages (its own libraries and the target libraries it uses) and must
-    /// not be handed the host toolchain, which would put host-built libraries
-    /// in front of the target ones.
+    /// packages (its own libraries and the target libraries it uses), keeping
+    /// the host tools its build scripts run outside that link sysroot.
     #[test]
     fn a_guest_built_tool_builds_against_the_target_sysroot_only() {
         assert_eq!(
-            super::dependency_sets(&recipe("mdbook", "host:"), true),
-            super::DependencySets {
-                sysroot: super::SysrootDeps::Target,
-                toolchain: false,
-            }
+            super::dependency_sysroot(&recipe("mdbook", "host:"), true),
+            super::SysrootDeps::Target
         );
     }
 
@@ -1116,11 +1092,8 @@ mod tests {
     #[test]
     fn a_host_built_tool_builds_against_its_host_tools() {
         assert_eq!(
-            super::dependency_sets(&recipe("mdbook", "host:"), false),
-            super::DependencySets {
-                sysroot: super::SysrootDeps::Host,
-                toolchain: true,
-            }
+            super::dependency_sysroot(&recipe("mdbook", "host:"), false),
+            super::SysrootDeps::Host
         );
     }
 
@@ -1130,19 +1103,13 @@ mod tests {
     #[test]
     fn a_target_recipe_builds_against_the_target_sysroot_and_host_tools() {
         assert_eq!(
-            super::dependency_sets(&recipe("ncdu", "target:"), false),
-            super::DependencySets {
-                sysroot: super::SysrootDeps::Target,
-                toolchain: true,
-            }
+            super::dependency_sysroot(&recipe("ncdu", "target:"), false),
+            super::SysrootDeps::Target
         );
         // An unprefixed name is a target package too.
         assert_eq!(
-            super::dependency_sets(&recipe("ncdu", ""), true),
-            super::DependencySets {
-                sysroot: super::SysrootDeps::Target,
-                toolchain: true,
-            }
+            super::dependency_sysroot(&recipe("ncdu", ""), true),
+            super::SysrootDeps::Target
         );
     }
 
@@ -1155,12 +1122,11 @@ mod tests {
     #[test]
     fn the_choice_follows_the_name_prefix_and_the_mode() {
         for tools_are_target in [false, true] {
-            let target = super::dependency_sets(&recipe("base", ""), tools_are_target);
-            assert_eq!(target.sysroot, super::SysrootDeps::Target);
+            let target = super::dependency_sysroot(&recipe("base", ""), tools_are_target);
+            assert_eq!(target, super::SysrootDeps::Target);
 
-            let tool = super::dependency_sets(&recipe("gperf", "host:"), tools_are_target);
-            assert_eq!(tool.sysroot == super::SysrootDeps::Target, tools_are_target);
-            assert_eq!(tool.toolchain, !tools_are_target);
+            let tool = super::dependency_sysroot(&recipe("gperf", "host:"), tools_are_target);
+            assert_eq!(tool == super::SysrootDeps::Target, tools_are_target);
         }
     }
 
