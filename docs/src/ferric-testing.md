@@ -207,9 +207,10 @@ with mock UARTs and a mapper that rejects calls before memory is ready. The
 regression checks that early initialization installs only the port-I/O UARTs,
 then the LPSS probe maps and installs its MMIO UART after memory initialization.
 The all-features case includes the embedded-controller output; no real hardware
-access occurs in these host tests. A target check must build and boot with both
-`kernel.serial_debug` and `kernel.lpss_debug` enabled, retaining the first panic
-log if startup fails. This checks initialization order, not physical LPSS support.
+access occurs in these host tests. The image CI configuration enables both
+`kernel.serial_debug` and `kernel.lpss_debug`, so its boot matrix also exercises
+the real startup ordering on QEMU. Retain the first panic log if startup fails.
+This checks initialization order, not physical LPSS support.
 
 The included `context/handoff.rs` tests distinguish a timeslice owner from
 the physically running scheme handler. They cover a client becoming runnable
