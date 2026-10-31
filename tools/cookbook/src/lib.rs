@@ -102,6 +102,8 @@ pub enum Error {
     FoxStore(Box<fox_store::StoreError>),
     /// Ferric Oxide: recipes to build need programs the build machine lacks.
     MissingHostTools(cook::host_tools::MissingHostTools),
+    /// Ferric Oxide: a build tool could not be run in the guest build environment.
+    GuestRun(Box<redoxer::guest::GuestError>),
 }
 
 /// Why a recipe or one of its packages could not be found or read.
@@ -210,6 +212,15 @@ impl Display for Error {
             Error::FoxArchive(error) => write!(f, "Package archive error: {error}"),
             Error::FoxStore(error) => write!(f, "Cannot install package: {error}"),
             Error::MissingHostTools(error) => write!(f, "{error}"),
+            Error::GuestRun(error) => {
+                write!(f, "Cannot run the build tool in the guest: {error}")?;
+                let mut source = std::error::Error::source(error.as_ref());
+                while let Some(cause) = source {
+                    write!(f, ": {cause}")?;
+                    source = cause.source();
+                }
+                Ok(())
+            }
         }
     }
 }
