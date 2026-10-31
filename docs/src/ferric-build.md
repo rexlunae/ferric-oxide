@@ -208,11 +208,17 @@ The Cargo architecture selection overrides a saved `target.arch` without
 rewriting `ferric.toml`. Make resolves explicit `ARCH`, `BOARD` and `CONFIG_NAME`
 assignments before validating and generating configuration. Saved feature
 choices are resolved for that target: applicable settings remain active, while
-x86-only tracing, profiling and PTI are inactive on ARM64. A saved x86 tracing/
+x86-only tracing, profiling and KPTI are inactive on ARM64. A saved x86 tracing/
 profiling conflict therefore does not prevent an ARM64 build. Selecting x86-64
 still diagnoses that conflict. Plain Make uses the saved architecture when
 configured and the host architecture otherwise (`arm64` is normalized to
 `aarch64`).
+
+The retired `kernel.pti` boolean named a kernel Cargo feature that no longer
+exists. Remove it from older `ferric.toml` files and select `kernel.cpu.kpti`
+instead. Use `"always"` to require isolation or retain the default `"auto"`
+policy described in [KPTI and PCID](./ferric-memory.md#kpti-and-pcid). An obsolete
+entry fails configuration validation before build files are generated.
 
 Configured builds resolve these inputs on every Make invocation, including
 changes to or removal of command-line overrides without a TOML edit. This adds

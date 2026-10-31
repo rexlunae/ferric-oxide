@@ -70,6 +70,11 @@ in `tools/ferric-config/tests/profiles.rs`. They exercise the public CLI and
 generated Makefile, then load the selected filesystem configuration through the
 installer's include resolver. They check inherited source packages, the effective
 boot script, image overrides and retention of saved CPU/kernel settings.
+`tests/catalog.rs` also checks every direct or conditional kernel Cargo feature
+named by the catalog against `crates/kernel/Cargo.toml`, including options that
+are disabled by default. The Make/CLI regressions reject the retired `kernel.pti`
+setting before writing build files and keep the supported `kernel.cpu.kpti`
+policy inactive when selecting ARM64.
 
 Use `cargo clippy --all-targets -- -D warnings` and `cargo doc --no-deps`
 in changed workspaces as required by `AGENTS.md`, accounting for the documented

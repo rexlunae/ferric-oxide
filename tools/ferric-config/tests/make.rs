@@ -75,7 +75,7 @@ impl Fixture {
     }
 }
 
-const INVALID_X86: &str = "[target]\narch='x86_64'\n[image]\nconfig='native'\n[kernel]\ntrace=true\nprofiling=true\npti=true\nregbuf=true\n";
+const INVALID_X86: &str = "[target]\narch='x86_64'\n[image]\nconfig='native'\n[kernel]\ntrace=true\nprofiling=true\nregbuf=true\n[kernel.cpu]\nkpti='always'\n";
 
 #[test]
 fn architecture_override_is_resolved_before_validation_without_editing_saved_choices() {
@@ -84,9 +84,16 @@ fn architecture_override_is_resolved_before_validation_without_editing_saved_cho
     assert_eq!(&result[..3], ["aarch64", "", "native"]);
     let features: Vec<_> = result[3].split(',').collect();
     assert!(features.contains(&"regbuf"));
-    for x86 in ["trace", "profiling", "pti", "x86_kvm_pv"] {
+    for x86 in ["trace", "profiling", "x86_kvm_pv"] {
         assert!(!features.contains(&x86), "{result:?}");
     }
+    assert!(
+        !fixture
+            .0
+            .path()
+            .join("build/ferric/kernel-config.toml")
+            .exists()
+    );
     assert!(!result[4].contains("x86"));
     assert_eq!(
         std::fs::read_to_string(fixture.0.path().join("ferric.toml")).unwrap(),
@@ -99,6 +106,18 @@ fn architecture_override_is_resolved_before_validation_without_editing_saved_cho
             .status
             .success()
     );
+}
+
+#[test]
+fn retired_pti_option_is_rejected_before_generating_build_files() {
+    let fixture = Fixture::new("[kernel]\npti=true\n");
+    for command in ["check", "generate"] {
+        let output = fixture.config(&[command]);
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("unknown option kernel.pti"), "{stderr}");
+    }
+    assert!(!fixture.0.path().join("build/ferric/config.mk").exists());
 }
 
 #[test]

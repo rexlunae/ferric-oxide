@@ -249,10 +249,11 @@ and child map the same addresses to different frames, so one process then
 writes into the other's memory. TCG does not show this; Apple CPUs under HVF
 do, as a bootstrap panic right after its first fork.
 
-The old catalog option `kernel.pti` is separate from `kernel.cpu.kpti`. It
-describes an experimental inherited path and currently names a Cargo feature
-absent from the kernel manifest. Use `kernel.cpu.kpti` for the implemented
-Ferric isolation path.
+The obsolete `kernel.pti` option has been removed: it selected a Cargo feature
+absent from the kernel manifest. Configurations that still contain it fail
+validation. Remove that entry and use `kernel.cpu.kpti` for the implemented
+Ferric isolation path. To require isolation, set `kernel.cpu.kpti = "always"`;
+the default remains `"auto"`.
 
 ## CET: enforcement versus preparation
 
