@@ -1652,6 +1652,7 @@ dependencies = [
  "pcid",
  "redox_event",
  "redox_syscall 0.9.4",
+ "simple_endian",
  "smallvec 1.16.0",
 ]
 
@@ -2511,6 +2512,26 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "simple_endian"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fefb7154bf9471272770ebfc50bc8ce4c52b8394ac189288655966948ad611fa"
+dependencies = [
+ "simple_endian_derive",
+]
+
+[[package]]
+name = "simple_endian_derive"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eff6284c89365acc991ef7104aba51708740641a71296c933b7be99e17a5663"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

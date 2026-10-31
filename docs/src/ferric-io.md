@@ -392,6 +392,14 @@ including when the waiting future has been cancelled. Admin, single-queue and
 per-core I/O queues all use this rule. This is a correctness requirement, enabled
 in every NVMe build.
 
+Completion reads first observe the current slot's phase tag, then acquire device
+publication before loading its other fields. Reading the whole record first can
+sample a previous cycle's command identifier before seeing a newly published
+phase, even on x86. The controller writes the phase last, as required by NVMe
+Base Specification 2.1, sections 4.2.1 and 4.2.4. `NvmeCompWire`, generated from
+the native record with `simple_endian::Endianize`, defines the 16-byte
+little-endian DMA layout. Queue lookahead reads only the phase/status field.
+
 A hardware completion also wakes one waiting submitter even when cancellation
 has removed its completion owner. Cancellation does not return a hardware queue
 credit; completion does. This keeps a full queue from stranding its submitters

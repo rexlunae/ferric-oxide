@@ -6,6 +6,8 @@ name: profile-image
 # records a profile of a short fuzz run with `ferric-trace profile` and draws it with
 # `ferric-trace flamegraph` (docs/src/ferric-tracing.md, "Sampling profiles"). One boot; it
 # runs only when the profiler, the loader, the tools or this workflow change.
+# NVMe completion/executor changes also run it: profiling can preempt a DMA
+# record read between payload fields and its publication tag.
 
 on:
   workflow_dispatch:
@@ -23,6 +25,9 @@ on:
       - "tools/ferric-trace/**"
       - "config/ferric-smoke.toml"
       - "features.toml"
+      - "crates/blkqueue/src/command_ids.rs"
+      - "userspace/base/drivers/storage/nvmed/src/nvme/**"
+      - "userspace/base/drivers/executor/src/**"
       - "scripts/ferric-ci/boot-smoke.sh"
       - ".github/workflows/profile-image.yml"
 
