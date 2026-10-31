@@ -50,7 +50,6 @@ The editor is a tree of menus:
 │  [ ] NUMA awareness                                           │
 │  [*] Self-modifying code (CPU feature patching)               │
 │  [*] KVM paravirtual clock                                    │
-│  [ ] Page table isolation (KPTI) (EXPERIMENTAL)               │
 │  ...                                                          │
 │      CPU feature use  --->                                    │
 └───────────────────────────────────────────────────────────────┘
