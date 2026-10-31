@@ -158,6 +158,15 @@ impl UserConfig {
         ))
     }
 
+    /// Whether a leaf option is explicitly saved, including unknown or invalid
+    /// values omitted from the parsed [`Self::values`] map. Tables group
+    /// options and are not leaf options themselves.
+    pub fn contains_option(&self, id: &str) -> bool {
+        id.split('.')
+            .try_fold(self.doc.as_item(), |item, key| item.get(key))
+            .is_some_and(|item| !item.is_none() && item.as_table_like().is_none())
+    }
+
     pub fn set(&mut self, id: &str, v: Value) -> Result<(), String> {
         let parts: Vec<&str> = id.split('.').collect();
         let (leaf, parents) = parts.split_last().ok_or("empty option id")?;

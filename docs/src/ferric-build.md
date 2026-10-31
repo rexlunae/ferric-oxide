@@ -215,10 +215,13 @@ configured and the host architecture otherwise (`arm64` is normalized to
 `aarch64`).
 
 The retired `kernel.pti` boolean named a kernel Cargo feature that no longer
-exists. Remove it from older `ferric.toml` files and select `kernel.cpu.kpti`
+exists. Remove it from older `ferric.toml` files with
+`cargo run -q -p ferric-config -- unset kernel.pti`, then select `kernel.cpu.kpti`
 instead. Use `"always"` to require isolation or retain the default `"auto"`
 policy described in [KPTI and PCID](./ferric-memory.md#kpti-and-pcid). An obsolete
 entry fails configuration validation before build files are generated.
+`unset` can remove existing retired or misspelled leaf keys; absent unknown
+keys and table names remain errors. Other saved choices are preserved.
 
 Configured builds resolve these inputs on every Make invocation, including
 changes to or removal of command-line overrides without a TOML edit. This adds
