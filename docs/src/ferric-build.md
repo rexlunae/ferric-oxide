@@ -24,7 +24,13 @@ Without a package server every application recipe builds from source, so the
 build machine also needs the programs recipes run: Autoconf, Automake,
 `autopoint`, Bison, CMake, Flex, M4, `makeinfo`, Meson, Ninja, `patch`, Perl,
 `pkg-config` and Python 3 (see [Building Ferric Oxide](./building-redox.md#prerequisites)). `cargo xtask doctor`, which `setup` runs first, fails
-listing every missing one. `repo cook` also checks the Meson, CMake and Ninja
+listing every missing one. It also compiles a small program that uses the C++
+standard library with the host's `clang++`, because `host:` recipes build C++
+with it. Clang takes its C++ headers from the newest GCC installation it finds
+(`clang++ -v` names it), so a machine with a newer GCC runtime than its
+libstdc++ development package fails there: install the matching package (for
+example `libstdc++-16-dev` for GCC 16). With `--podman` the check is skipped,
+because recipes then use the container's compiler. `repo cook` also checks the Meson, CMake and Ninja
 use of each recipe it is about to build from source before building any of
 them, and again before each rebuild, naming each missing program with the
 recipes that need it.

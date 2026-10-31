@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -299,41 +299,47 @@ fn doctor(arch: Architecture, podman: bool) -> Result<()> {
     }
     // Host recipes compile C++ with the host's clang++; recipes in Podman use
     // the container's compiler instead.
-    if !podman {
-        check_host_cxx()?;
+    if checks_host_cxx(podman) {
+        check_cxx_compiler(OsStr::new("clang++"))?;
         eprintln!("clang++: builds C++ standard library programs");
     }
     Ok(())
 }
 
-/// Checks that the host's `clang++` finds the C++ standard library headers.
+/// Whether `doctor` checks the host's C++ compiler. Host recipes compile C++
+/// with it; recipes in Podman use the container's compiler instead.
+fn checks_host_cxx(podman: bool) -> bool {
+    !podman
+}
+
+/// Checks that the C++ compiler `compiler` finds the C++ standard library headers.
 ///
 /// # Errors
 /// [`BuildError::HostCxx`] with the compiler's diagnostic when it cannot, and
 /// [`BuildError::Start`] when it cannot be started.
-fn check_host_cxx() -> Result<()> {
-    let mut child = Command::new("clang++")
+fn check_cxx_compiler(compiler: &OsStr) -> Result<()> {
+    let mut child = Command::new(compiler)
         .args(["-x", "c++", "-fsyntax-only", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|source| BuildError::Start {
-            program: "clang++".into(),
+            program: compiler.into(),
             source,
         })?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(b"#include <memory>\nint main() { return *std::make_unique<int>(0); }\n")
             .map_err(|source| BuildError::Start {
-                program: "clang++".into(),
+                program: compiler.into(),
                 source,
             })?;
     }
     let output = child
         .wait_with_output()
         .map_err(|source| BuildError::Start {
-            program: "clang++".into(),
+            program: compiler.into(),
             source,
         })?;
     if output.status.success() {
@@ -575,6 +581,59 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    /// A stand-in C++ compiler that reads the program and exits with `status`,
+    /// printing `diagnostic` on failure.
+    fn fake_compiler(dir: &Path, status: i32, diagnostic: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(format!("c++-{status}"));
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{diagnostic}' >&2\nexit {status}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_compiler_that_builds_the_program_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = fake_compiler(dir.path(), 0, "");
+        assert!(check_cxx_compiler(compiler.as_os_str()).is_ok());
+    }
+
+    /// A compiler without C++ headers fails the check with its own diagnostic.
+    #[test]
+    fn a_compiler_without_cxx_headers_fails_with_its_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = fake_compiler(dir.path(), 1, "fatal error: memory: file not found");
+        match check_cxx_compiler(compiler.as_os_str()) {
+            Err(BuildError::HostCxx { diagnostic }) => {
+                assert!(
+                    diagnostic.contains("memory: file not found"),
+                    "{diagnostic}"
+                );
+            }
+            other => panic!("expected HostCxx, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_compiler_cannot_start() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            check_cxx_compiler(dir.path().join("absent").as_os_str()),
+            Err(BuildError::Start { .. })
+        ));
+    }
+
+    /// Recipes in Podman use the container's compiler, so the host's is not checked.
+    #[test]
+    fn podman_builds_skip_the_host_cxx_check() {
+        assert!(checks_host_cxx(false));
+        assert!(!checks_host_cxx(true));
+    }
+
     use super::*;
     use std::{ffi::OsStr, fs};
 
