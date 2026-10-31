@@ -29,27 +29,33 @@ the guest; tools that must run on the host include Python and LLVM. The build
 needs a working host C++ standard library and enough disk space for both LLVM
 builds described below.
 
-On 31 October 2026, the reviewed build-fix combination
+On 31 October 2026, the build-fix combination
 ([#344](https://github.com/rexlunae/ferric-oxide/pull/344)–[#349](https://github.com/rexlunae/ferric-oxide/pull/349)),
-together with the NVMe command-identifier and cancellation-wakeup corrections in
-[#352](https://github.com/rexlunae/ferric-oxide/pull/352) and compiler-test fixture
-correction in [#354](https://github.com/rexlunae/ferric-oxide/pull/354), completed
+with the NVMe/executor correction
+[#352](https://github.com/rexlunae/ferric-oxide/pull/352), compiler-test fixture
+[#354](https://github.com/rexlunae/ferric-oxide/pull/354), `dd` pipe correction
+[#355](https://github.com/rexlunae/ferric-oxide/pull/355), obsolete kernel-option
+removal [#356](https://github.com/rexlunae/ferric-oxide/pull/356), and LPSS startup
+correction [#357](https://github.com/rexlunae/ferric-oxide/pull/357), completed
 `COOKBOOK_MAKE_JOBS=6 cargo xtask build` on x86_64. This was an incremental
-build using existing recipe outputs; the changed base drivers rebuilt. The
-tested integration combined documentation-stack snapshot
-[`b7da63fdbbbb`](https://github.com/rexlunae/ferric-oxide/commit/b7da63fdbbbb34312738480378b387319c879b53)
-(including build-tool policy `2d09db4c1927` and Mesa host LLVM `4cc7fe72e662`)
-with NVMe implementation
-[`a080d862e41e`](https://github.com/rexlunae/ferric-oxide/commit/a080d862e41e34e29f0300adf2f9c5bd7631287a).
-Its headless KVM boot reached
-`redox login:` with four vCPUs and 4 GiB RAM, and a 64 MiB filesystem write
-passed full SHA256 readback against the host-computed digest. Snapshot disk
-writes preserved the built image.
+build using existing recipe outputs; the changed kernel, base drivers and
+`uutils` were rebuilt during validation.
 
-The preceding build also completed, but its boot exposed the NVMe command-ID
-reuse hang fixed by #352; that failure is retained as evidence. A separate
-piped `dd` comparison failed and is tracked in
-[#353](https://github.com/rexlunae/ferric-oxide/issues/353).
+The final local integration `d5b2d41c4b11` included the LPSS implementation
+[`17ff802c6`](https://github.com/rexlunae/ferric-oxide/commit/17ff802c6a845c6a4f5d2f695a9cbf66852ea808), with
+`kernel.lpss_debug = true` and `kernel.cpu.kpti = "always"`. Its headless KVM
+snapshot boot, with four vCPUs and 4 GiB RAM, reported KPTI enabled and reached
+`redox login:`. A 64 MiB regular-file write and piped transfer passed byte-count,
+SHA256 and full file-comparison checks; the exact Ion `dd-pipe` smoke fragment
+also passed. Snapshot disk writes preserved the built image. Its SHA256 was
+`41110d0146ebd52bb31e2b5f57e55a4e11194b66721068585d0060a6b436c737`;
+the generated CycloneDX SBOM contained 103 components.
+
+The first-failure logs are retained for the preceding NVMe command-ID reuse
+hang, truncated pipe transfer ([#353](https://github.com/rexlunae/ferric-oxide/issues/353))
+and early LPSS MMIO panic. The successful check includes the corresponding
+corrections above. See [validation](./ferric-testing.md) for their host and guest
+regressions.
 The graphical COSMIC session was not validated. The installed
 `orbital-wayland` script selects
 `COSMIC_BACKEND=winit`, starts `cosmic-comp` nested inside Orbital and then
