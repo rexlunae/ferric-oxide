@@ -4194,6 +4194,7 @@ version = "0.2.63"
 dependencies = [
  "anyhow",
  "dirs",
+ "ferric-abi",
  "fox-core",
  "fox-store",
  "fscommon",
@@ -4208,6 +4209,7 @@ dependencies = [
  "redoxfs",
  "sha2 0.10.9",
  "tempfile",
+ "thiserror 2.0.17",
  "toml 0.8.23",
 ]
 

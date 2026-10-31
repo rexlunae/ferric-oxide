@@ -1,6 +1,6 @@
 use anyhow::{bail, Context};
 use std::collections::{HashMap, HashSet};
-#[cfg(feature = "fuse")]
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -14,6 +14,8 @@ use crate::redoxfs::{archive_image, extract_tar};
 use crate::redoxfs::{run_install_mount, RedoxFs};
 use crate::writer::{redoxerd_config_files, write_redoxerd_config, GuestEntry};
 use crate::{host_target, parse_bool_env, redoxer_dir, status_error, target};
+
+pub mod guest;
 
 // extra disk space to fit large projects
 const DISK_SIZE: u64 = 3 * 1024 * 1024 * 1024;

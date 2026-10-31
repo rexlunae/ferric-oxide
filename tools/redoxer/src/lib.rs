@@ -13,6 +13,8 @@ mod cargo;
 mod env;
 #[cfg(feature = "cli-exec")]
 mod exec;
+#[cfg(feature = "cli-exec")]
+pub use exec::guest;
 #[cfg(feature = "cli-pkg")]
 mod pkg;
 #[cfg(feature = "cli-exec")]
