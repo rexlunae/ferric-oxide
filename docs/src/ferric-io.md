@@ -380,6 +380,27 @@ steering and IOMMU destinations. The xAPIC ID register is decoded from bits
 31:24, while x2APIC retains its full ID; host tests cover nonzero IDs in both
 modes, and smoke CI also boots with x2APIC disabled.
 
+### NVMe command lifetimes
+
+Each NVMe queue pair reserves command identifiers separately from submission-ring
+positions, using the host-tested `ferric-blkqueue::command_ids::CommandIds` pool.
+The controller's reported submission head frees ring entries it has fetched;
+those commands may still be outstanding. Reusing a ring position as its command
+identifier could replace a completion waiter and hang a later filesystem write.
+The driver releases an identifier only when it consumes that command's completion,
+including when the waiting future has been cancelled. Admin, single-queue and
+per-core I/O queues all use this rule. This is a correctness requirement, enabled
+in every NVMe build.
+
+The pool uses 8 KiB per queue pair, does not allocate on submission or completion,
+and permits up to 65,535 outstanding commands independently of submission-ring
+capacity. It follows the distinction between consumed entries and completed
+commands in the [NVMe Base Specification 2.0c](https://nvmexpress.org/wp-content/uploads/NVM-Express-Base-Specification-2.0c-2022.10.04-Ratified.pdf),
+section 3.3.3.2, Figures 90–91, and the outstanding-command limit in
+[revision 2.1](https://nvmexpress.org/wp-content/uploads/NVM-Express-Base-Specification-Revision-2.1-2024.08.05-Ratified.pdf).
+The [validation guide](ferric-testing.md#nvme-command-identifiers) describes the
+host regressions; host coverage alone does not establish hardware reliability.
+
 ### NVMe interrupt masking
 
 nvmed's executor masks a queue pair's interrupt vector while it drains that

@@ -25,8 +25,8 @@ pcid = { path = "../../pcid" }
 ferric-blkgrant = { path = "../../../../../crates/blkgrant", optional = true }
 # Ferric Oxide: CPU ids, irq:cpus entries and the MSI-X spread order, for per-CPU queues.
 ferric-irq = { workspace = true, optional = true }
-# Ferric Oxide: which queue pair a request runs on (inline when idle, or on a worker).
-ferric-blkqueue = { path = "../../../../../crates/blkqueue", features = ["std"], optional = true }
+# Command identifiers, timing, and per-core request routing.
+ferric-blkqueue.workspace = true
 
 [features]
 default = []
@@ -36,10 +36,10 @@ default = []
 grant-dma = ["driver-block/grant-dma", "dep:ferric-blkgrant"]
 # Ferric Oxide: one I/O queue pair, MSI-X entry and pinned worker thread per CPU
 # (features.toml: drivers.nvme_percore).
-percore = ["dep:ferric-irq", "dep:ferric-blkqueue"]
+percore = ["dep:ferric-irq", "ferric-blkqueue/std"]
 # Ferric Oxide: per-request phase timing with the CPU cycle counter
 # (features.toml: drivers.nvmed_perf).
-perf = ["dep:ferric-blkqueue"]
+perf = []
 
 [lints]
 workspace = true

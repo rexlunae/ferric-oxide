@@ -868,6 +868,21 @@ Repeat image boots and repeated `ferric-blkgrant-test` worker-policy runs
 exercise the real parking/handoff path; retain the first failure and its logs.
 Linux KVM/Kleya confirmation remains required.
 
+### NVMe command identifiers
+
+`cargo test --locked -p ferric-blkqueue` tests the identifier pool used by every
+NVMe queue pair. The regressions retain commands while submission positions wrap,
+complete commands out of order, cross the entire 16-bit identifier range while
+one command remains outstanding, exhaust and resume the pool, reject duplicate
+completions, and keep queue pairs independent. The pool is also checked without
+`std` or `alloc`; its doctest and strict Clippy/Rustdoc checks run in host-tools CI.
+
+The driver job compiles the default NVMe driver, `perf`, and
+`perf,percore,grant-dma` configurations. The target check remains an image build
+and a boot with writes large enough to reuse submission positions, followed by
+filesystem readback. Preserve a failing boot's first serial log and NMI context
+dump rather than treating a later successful boot as proof the failure was fixed.
+
 ### NVMe phase accounting
 
 `cargo test --locked -p ferric-blkqueue --all-features` tests the actual

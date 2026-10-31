@@ -57,13 +57,17 @@ impl Hardware for NvmeHw {
         let ctxt = nvme.cur_thread_ctxt();
         let ctxt = ctxt.lock();
 
-        for (sq_cq_id, (sq, cq)) in ctxt.queues.borrow_mut().iter_mut() {
-            while let Some(cqe) = cq.complete() {
-                sq.head = cqe.sq_head;
+        for (sq_cq_id, queue) in ctxt.queues.borrow_mut().iter_mut() {
+            while let Some(cqe) = queue.completion.complete() {
+                queue.submission.head = cqe.sq_head;
+                assert!(
+                    queue.command_ids.release(cqe.cid),
+                    "nvmed: completion must identify an outstanding command"
+                );
                 handle(*sq_cq_id, cqe);
             }
 
-            cq.kick();
+            queue.completion.kick();
         }
     }
     fn sq_cq(_ctxt: &Arc<Nvme>, id: Self::CqId) -> Self::SqId {
