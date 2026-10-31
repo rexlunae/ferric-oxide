@@ -883,6 +883,17 @@ and a boot with writes large enough to reuse submission positions, followed by
 filesystem readback. Preserve a failing boot's first serial log and NMI context
 dump rather than treating a later successful boot as proof the failure was fixed.
 
+Local validation on 31 October 2026 reproduced a first-boot `fox` database write
+stall before the fix: seven disk-ring operations remained without completions
+after the NVMe hardware queues and executor completion maps had drained. With
+the identifier fix in [#352](https://github.com/rexlunae/ferric-oxide/pull/352),
+the combined x86_64 `wayland` image built and reached login under KVM (four
+vCPUs, 4 GiB, snapshot disk writes). A 64 MiB regular-file write followed by a
+complete SHA256 readback matched the host-computed digest. An additional piped
+`dd` comparison delivered only 4 MiB and failed; that separate unresolved result
+is recorded in [#353](https://github.com/rexlunae/ferric-oxide/issues/353).
+This establishes local boot and file-I/O evidence, not hardware performance.
+
 ### NVMe phase accounting
 
 `cargo test --locked -p ferric-blkqueue --all-features` tests the actual
