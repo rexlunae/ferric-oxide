@@ -1661,9 +1661,14 @@ impl ContextHandle {
                 let verb = ProcSchemeVerb::try_from_raw(verb).ok_or(Error::new(EINVAL))?;
 
                 match verb {
-                    ProcSchemeVerb::Iopl => context::current()
-                        .write(token.token())
-                        .set_userspace_io_allowed(true),
+                    ProcSchemeVerb::Iopl => {
+                        let current = context::current();
+                        let mut caller = current.write(token.token());
+                        if caller.euid != 0 {
+                            return Err(Error::new(EPERM));
+                        }
+                        caller.set_userspace_io_allowed(true);
+                    }
                     _ => return Err(Error::new(EINVAL)),
                 }
                 Ok(0)

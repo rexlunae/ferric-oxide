@@ -39,6 +39,15 @@ Unix way. Some kernel schemes still decide access with a plain "is this
 root" check: IRQs, physical memory mappings, port I/O and opening the IOMMU
 attach capability all require root today.
 
+The `kernel.proc` `Iopl` request checks the **calling thread's effective UID**
+when the request is made. Opening a thread handle as root and then dropping
+the effective UID does not authorize a later port-I/O request. This protects
+the existing all-ports grant; it does not revoke rights that were already
+enabled before dropping privileges. Per-device port ranges and delegated
+port-I/O capabilities remain Phase 4 work. The
+[`ferric-ioport-test`](./ferric-testing.md#port-io-authorization) regression
+checks these request-time rules without executing port-I/O instructions.
+
 ## Hardware mitigations
 
 | Mitigation | Status | Option |
