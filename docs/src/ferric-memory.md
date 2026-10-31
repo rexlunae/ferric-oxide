@@ -71,6 +71,16 @@ It also verifies SIMD registers and FPCR/FPSR across a handler that deliberately
 clobbers them. The trampoline preserves SIMD state privately below the public
 integer frame; the opaque ARM64 `ucontext_t` layout remains unchanged.
 
+## Port-I/O authorization
+
+Port-I/O access through `kernel.proc` is authorized at the request using the
+calling thread's effective UID: only root can enable the current all-ports
+bitmap. A thread descriptor opened before dropping privileges grants no
+exception. This does not revoke access already enabled as root; bounded,
+delegable port capabilities remain planned. See the
+[security chapter](./security.md#users-and-root) and the
+[on-target authorization test](./ferric-testing.md#port-io-authorization).
+
 ## Address randomization and guards
 
 | Option | Integration | Limits |

@@ -1,0 +1,16 @@
+[package]
+name = "ferric-ioport-test"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Port-I/O authorization regression test for Ferric Oxide"
+
+[workspace]
+
+[target.'cfg(all(target_os = "redox", target_arch = "x86_64"))'.dependencies]
+libc = "0.2"
+libredox = "0.1.25"
+redox_syscall = "0.9.4"
+
+[profile.release]
+debug = false
