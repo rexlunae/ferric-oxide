@@ -134,6 +134,9 @@ travels through a private copy of the disk:
 1. The caller names the inputs, the outputs and the working directory with a
    `GuestCommand`. Inputs are written into the copy at the same absolute paths
    they have on the host, so arguments mean the same thing in the guest.
+   Symlinks are followed, so an input reached through one arrives at the path
+   given, holding what it points to; directories arrive as directories, empty
+   ones too.
 2. The command goes to `redoxerd` with a capture request (the protocol is in
    `ferric_abi::redoxerd`). `redoxerd` then runs it without a terminal, in the
    requested directory, with standard output and standard error in separate
@@ -141,7 +144,7 @@ travels through a private copy of the disk:
    those files, and every file under the outputs, to the disk.
 3. After QEMU exits, the host reads the streams, the status and the outputs
    back out of the copy with the RedoxFS reader. It writes each output file
-   that is new or changed to the host and returns a `GuestOutput` holding the
+   that is new or changed (in contents or mode) to the host and returns a `GuestOutput` holding the
    exact bytes of both streams and the command's status. Files the command
    deletes are not deleted on the host.
 
@@ -152,8 +155,8 @@ the image is not loaded into RAM, the guest gets 2 GiB rather than 8 GiB.
 A guest kernel panic halts the guest without stopping QEMU. The console is
 watched, so a panic ends the run with `GuestError::Panicked` and the end of the
 console instead of hanging the build. A guest that never reaches the command
-is stopped by the run's timeout (`GuestCommand::timeout`) with
-`GuestError::TimedOut`.
+is stopped by the run's timeout (`GuestCommand::timeout`, counted from QEMU's
+start) with `GuestError::TimedOut`.
 
 ## Commands
 

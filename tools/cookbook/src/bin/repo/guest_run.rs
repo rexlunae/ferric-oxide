@@ -12,7 +12,9 @@
 //!
 //! The tool has to behave as a host tool would, so the files it works on travel
 //! with it. Paths keep their host names in the guest, which keeps relative and
-//! absolute arguments meaning the same thing. Only paths inside the cookbook
+//! absolute arguments meaning the same thing. A path is shared as the argument
+//! spells it, so one that goes through a symlink arrives at the place the tool
+//! looks, holding what the symlink points to. Only paths inside the cookbook
 //! checkout travel, because those are the build's own files; anything else an
 //! argument names is the guest's (copying the host's `/usr/include` over the
 //! guest's would be wrong). Within the checkout:
@@ -28,17 +30,18 @@
 //! standard output and standard error are replayed byte for byte, and this
 //! command exits with the tool's status.
 //!
-//! A run that takes longer than `COOKBOOK_GUEST_TIMEOUT` seconds (default
-//! [`DEFAULT_TIMEOUT`]) is stopped and fails with the end of the guest's console.
+//! A guest that runs longer than `COOKBOOK_GUEST_TIMEOUT` seconds (default
+//! [`DEFAULT_TIMEOUT`], counted from QEMU's start) is stopped, and the run fails
+//! with the end of the guest's console.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use cookbook::{Error, Result};
 use redoxer::guest::{self, GuestCommand};
 
-/// How long a guest run may take, boot included, when `COOKBOOK_GUEST_TIMEOUT`
+/// How long a guest may run, boot included, when `COOKBOOK_GUEST_TIMEOUT`
 /// does not say.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -160,17 +163,44 @@ fn share(arg: &str, working_dir: &Path, root: &Path) -> Option<Shared> {
     if value.is_empty() || value.starts_with('-') {
         return None;
     }
-    let path = working_dir.join(value);
-    if let Ok(existing) = path.canonicalize() {
-        return existing
-            .starts_with(root)
-            .then_some(Shared::Existing(existing));
+    // The guest has no symlinks and resolves `..` against the path as written,
+    // from the (canonical) working directory it is given, so this is the path
+    // the tool opens there. It is what is registered: a canonical target would
+    // put the file where the tool does not look when the argument goes through
+    // a symlink.
+    let guest = lexical(&working_dir.join(value));
+    if !guest.starts_with(root) {
+        return None;
     }
-    // A new file under the working directory comes back with it.
-    let parent = path.parent()?.canonicalize().ok()?;
-    let created = parent.join(path.file_name()?);
-    (created.starts_with(root) && !created.starts_with(working_dir))
-        .then_some(Shared::Created(created))
+    if guest.exists() {
+        // What is read in and written back is the symlink's target, so that
+        // must be inside the checkout too.
+        let target = guest.canonicalize().ok()?;
+        return target.starts_with(root).then_some(Shared::Existing(guest));
+    }
+    // A new file under the working directory comes back with it. Elsewhere the
+    // tool may create missing parent directories too, so the nearest one that
+    // exists decides whether the path is inside the checkout.
+    let ancestor = guest.ancestors().skip(1).find(|dir| dir.exists())?;
+    let resolved = ancestor.canonicalize().ok()?;
+    (resolved.starts_with(root) && !guest.starts_with(working_dir))
+        .then_some(Shared::Created(guest))
+}
+
+/// `path` with `.` and `..` resolved by its text, without following symlinks,
+/// as a path is resolved in a guest that has none.
+fn lexical(path: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            other => resolved.push(other),
+        }
+    }
+    resolved
 }
 
 #[allow(clippy::result_large_err)]
@@ -294,6 +324,46 @@ mod tests {
         );
         // Under the working directory it already comes back with the directory.
         assert_eq!(share("out.h", &build, &root), None);
+    }
+
+    /// An argument through a symlink is shared as spelled, since that is where
+    /// the tool looks in the guest, which has no symlinks.
+    #[test]
+    fn a_symlinked_input_keeps_the_arguments_spelling() {
+        let (_temp, _base, root, build) = checkout();
+        let source = root.join("recipes/x/source");
+        std::fs::create_dir(source.join("v2")).unwrap();
+        std::fs::write(source.join("v2/input.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(source.join("v2"), source.join("current")).unwrap();
+        assert_eq!(
+            share("../../source/current/input.txt", &build, &root),
+            Some(Shared::Existing(source.join("current/input.txt")))
+        );
+    }
+
+    /// A symlink in the checkout that points outside it is not followed out.
+    #[test]
+    fn a_symlink_out_of_the_checkout_is_not_shared() {
+        let (_temp, base, root, build) = checkout();
+        let source = root.join("recipes/x/source");
+        std::os::unix::fs::symlink(base.join("outside.txt"), source.join("escape")).unwrap();
+        assert_eq!(share("../../source/escape", &build, &root), None);
+    }
+
+    /// A new output whose parent directories do not exist yet still comes back.
+    #[test]
+    fn a_new_output_with_missing_parents_comes_back() {
+        let (_temp, _base, root, build) = checkout();
+        assert_eq!(
+            share(
+                "--output=../../source/generated/deep/header.h",
+                &build,
+                &root
+            ),
+            Some(Shared::Created(
+                root.join("recipes/x/source/generated/deep/header.h")
+            ))
+        );
     }
 
     #[test]

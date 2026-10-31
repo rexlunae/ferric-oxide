@@ -477,17 +477,25 @@ guest's own file. Within the checkout:
 - The working directory, which must be inside the checkout, is created in the
   guest. Every file the tool creates or changes under it is copied back.
 - An argument naming an existing file or directory, alone or as
-  `--option=path`, is copied in, and changes to it are copied back.
+  `--option=path`, is copied in, and changes to it, including a change of mode
+  only, are copied back. Directories arrive as directories, empty ones too.
 - An argument naming a path that does not exist yet, outside the working
-  directory, is copied back if the tool creates it.
+  directory, is copied back if the tool creates it, along with any parent
+  directories it creates.
+
+A path is shared as the argument spells it, so one that goes through a symlink
+arrives at the place the tool looks in the guest, holding what the symlink
+points to; the guest has no symlinks. Its target must be inside the checkout as
+well.
 
 The tool runs without a terminal. Its standard output and standard error are
 replayed byte for byte, so a build that captures generated code from standard
 output (as meson does for `gperf`) gets exactly what the tool printed.
 `repo guest-run` exits with the tool's status. Files the tool deletes are not
-deleted on the host. If the guest kernel panics, or the run takes longer than
-`COOKBOOK_GUEST_TIMEOUT` seconds (30 minutes by default), `repo guest-run` stops
-the guest, fails, and prints the end of its console.
+deleted on the host. If the guest kernel panics, or the guest runs longer than
+`COOKBOOK_GUEST_TIMEOUT` seconds (30 minutes by default, counted from QEMU's
+start), `repo guest-run` stops the guest, fails, and prints the end of its
+console.
 
 A recipe therefore keeps writing `gperf`, `mdbook build` and so on. The
 `FERRIC_GUEST_TOOLS_DIR` variable names the environment image; it is empty when

@@ -132,8 +132,9 @@ fn set_mode(path: &Path, mode: u16) -> io::Result<()> {
 /// Where the guest keeps the files a redoxer run installs, and the directory
 /// the command runs from.
 pub(crate) mod redoxerd_config {
-    /// The command `redoxerd` reads and runs, one line per argument.
-    pub(crate) const CONFIG: &str = "/etc/redoxerd";
+    /// The command `redoxerd` reads and runs, one line per argument. Defined
+    /// once in `ferric-abi`, which `redoxerd` reads it from.
+    pub(crate) const CONFIG: &str = ferric_abi::redoxerd::COMMAND;
     /// The init unit that starts `/usr/lib/run_redoxer.ion`.
     pub(crate) const UNIT: &str = "/usr/lib/init.d/30_redoxer";
     /// The script that sets the guest environment and starts `redoxerd`.

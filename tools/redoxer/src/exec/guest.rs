@@ -36,7 +36,7 @@ use ferric_abi::redoxerd::{
 };
 
 use super::{
-    apply_qemu_args, bios_bootloader, bootloader_firmware, copy_into, firmware_for, installed,
+    apply_qemu_args, bios_bootloader, bootloader_firmware, firmware_for, installed,
     qemu_default_args, qemu_disk_device, qemu_executable, qemu_has_kvm,
 };
 use crate::redoxfs::{read_files, write_files, ImageFile};
@@ -91,9 +91,10 @@ impl GuestCommand {
         }
     }
 
-    /// Stops the guest and fails with [`GuestError::TimedOut`] if the run, boot included,
-    /// takes longer than `timeout`. Without one, a guest that never runs the command
-    /// waits forever.
+    /// Stops the guest and fails with [`GuestError::TimedOut`] if it runs longer than
+    /// `timeout`, counted from QEMU's start, so the boot is included. Preparing the image
+    /// before and reading it after are bounded file I/O and are not counted. Without a
+    /// timeout, a guest that never runs the command waits forever.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -250,9 +251,10 @@ pub fn run(command: &GuestCommand) -> Result<GuestOutput, GuestError> {
         return Err(GuestError::MissingQemu { program: qemu });
     }
 
-    let outputs: Vec<&Path> = std::iter::once(command.working_dir.as_path())
-        .chain(command.outputs.iter().map(PathBuf::as_path))
-        .collect();
+    let outputs = distinct_roots(
+        std::iter::once(command.working_dir.as_path())
+            .chain(command.outputs.iter().map(PathBuf::as_path)),
+    );
     let entries = guest_entries(command, &outputs)?;
 
     let tempdir = tempfile::tempdir().map_err(GuestError::io("unable to create", "a tempdir"))?;
@@ -325,10 +327,59 @@ fn guest_entries(command: &GuestCommand, outputs: &[&Path]) -> Result<Vec<GuestE
     entries.push(GuestEntry::directory(&command.working_dir, 0o755));
     for input in &command.inputs {
         guest_path(input)?;
-        copy_into(input, input.clone(), &mut entries, 0)
-            .map_err(|err| GuestError::image("unable to read an input", err))?;
+        input_entries(input, &mut entries, 0)?;
     }
     Ok(entries)
+}
+
+/// How deep below an input its directories may nest, which also stops a symlink
+/// loop.
+const MAX_INPUT_DEPTH: usize = 64;
+
+/// Appends the entries that put the host's `path` into the guest at the same path.
+///
+/// Symlinks are followed: the guest receives what a link points to, at the path the
+/// tool names, because that is what the tool reads on the host. Directories become
+/// directories in the guest, empty ones included, so a tool that checks for an input
+/// directory finds it. Special files are skipped.
+fn input_entries(
+    path: &Path,
+    entries: &mut Vec<GuestEntry>,
+    depth: usize,
+) -> Result<(), GuestError> {
+    if depth > MAX_INPUT_DEPTH {
+        return Err(GuestError::Unrepresentable {
+            value: path.display().to_string(),
+            reason: "inputs cannot nest more than 64 directories deep (is there a symlink loop?)",
+        });
+    }
+    let metadata = fs::metadata(path).map_err(GuestError::io("unable to read", path))?;
+    let mode = (metadata.permissions().mode() & 0o777) as u16;
+    if metadata.is_dir() {
+        entries.push(GuestEntry::directory(path, mode));
+        let children = fs::read_dir(path).map_err(GuestError::io("unable to list", path))?;
+        for child in children {
+            let child = child.map_err(GuestError::io("unable to list", path))?;
+            input_entries(&child.path(), entries, depth + 1)?;
+        }
+    } else if metadata.is_file() {
+        let data = fs::read(path).map_err(GuestError::io("unable to read", path))?;
+        entries.push(GuestEntry::file(path, data, mode));
+    }
+    Ok(())
+}
+
+/// `paths` without any that lies inside another, so each file is read back once.
+fn distinct_roots<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Vec<&'a Path> {
+    let mut paths: Vec<&Path> = paths.into_iter().collect();
+    paths.sort_by_key(|path| path.components().count());
+    let mut roots: Vec<&Path> = Vec::new();
+    for path in paths {
+        if !roots.iter().any(|root| path.starts_with(root)) {
+            roots.push(path);
+        }
+    }
+    roots
 }
 
 /// `path` as the guest names it: absolute, valid UTF-8 and one line long.
@@ -520,18 +571,24 @@ fn console_tail(path: &Path) -> Result<String, GuestError> {
 fn write_back(files: &[ImageFile]) -> Result<Vec<PathBuf>, GuestError> {
     let mut written = Vec::new();
     for file in files {
-        if fs::read(&file.path).is_ok_and(|host| host == file.data) {
+        let mode = u32::from(file.mode & 0o777);
+        let same_mode =
+            fs::metadata(&file.path).is_ok_and(|host| host.permissions().mode() & 0o777 == mode);
+        let same_data = fs::read(&file.path).is_ok_and(|host| host == file.data);
+        if same_data && same_mode {
             continue;
         }
-        if let Some(parent) = file.path.parent() {
-            fs::create_dir_all(parent).map_err(GuestError::io("unable to create", parent))?;
+        if !same_data {
+            if let Some(parent) = file.path.parent() {
+                fs::create_dir_all(parent).map_err(GuestError::io("unable to create", parent))?;
+            }
+            fs::write(&file.path, &file.data)
+                .map_err(GuestError::io("unable to write", &file.path))?;
         }
-        fs::write(&file.path, &file.data).map_err(GuestError::io("unable to write", &file.path))?;
-        fs::set_permissions(
-            &file.path,
-            fs::Permissions::from_mode(u32::from(file.mode & 0o777)),
-        )
-        .map_err(GuestError::io("unable to set the mode of", &file.path))?;
+        // A tool may change only a file's mode (chmod +x on an input), which counts
+        // as a change too.
+        fs::set_permissions(&file.path, fs::Permissions::from_mode(mode))
+            .map_err(GuestError::io("unable to set the mode of", &file.path))?;
         written.push(file.path.clone());
     }
     Ok(written)
@@ -596,12 +653,88 @@ mod tests {
         ));
     }
 
+    /// An input reached through a symlink arrives at the path the tool names, holding
+    /// what the link points to, and an empty directory arrives as a directory.
+    #[test]
+    fn inputs_follow_symlinks_and_keep_empty_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("v2");
+        fs::create_dir_all(real.join("empty")).unwrap();
+        fs::write(real.join("input.txt"), b"data").unwrap();
+        let link = temp.path().join("current");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut entries = Vec::new();
+        input_entries(&link, &mut entries, 0).unwrap();
+        let kind = |path: PathBuf| {
+            entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .map(|entry| (entry.kind, entry.data.clone()))
+        };
+        use crate::writer::GuestKind;
+        assert_eq!(kind(link.clone()), Some((GuestKind::Directory, Vec::new())));
+        assert_eq!(
+            kind(link.join("empty")),
+            Some((GuestKind::Directory, Vec::new()))
+        );
+        assert_eq!(
+            kind(link.join("input.txt")),
+            Some((GuestKind::File, b"data".to_vec()))
+        );
+        assert!(entries.iter().all(|entry| !entry.path.starts_with(&real)));
+    }
+
+    #[test]
+    fn a_symlink_loop_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("dir");
+        fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("loop")).unwrap();
+        // The host's own symlink limit (ELOOP) or the depth bound ends it,
+        // whichever comes first; either way the run fails instead of recursing.
+        assert!(input_entries(&dir, &mut Vec::new(), 0).is_err());
+    }
+
+    /// An output inside another output root is read back once.
+    #[test]
+    fn nested_output_roots_are_read_once() {
+        let roots = distinct_roots([
+            Path::new("/c/build/out.h"),
+            Path::new("/c/build"),
+            Path::new("/c/source/gen.h"),
+        ]);
+        assert_eq!(roots, [Path::new("/c/build"), Path::new("/c/source/gen.h")]);
+    }
+
+    /// A tool that only changes a file's mode changes the host file's mode.
+    #[test]
+    fn write_back_applies_a_mode_only_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("run.sh");
+        fs::write(&script, b"echo ok\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+        let files = [ImageFile {
+            path: script.clone(),
+            data: b"echo ok\n".to_vec(),
+            mode: 0o755,
+        }];
+        assert_eq!(write_back(&files).unwrap(), vec![script.clone()]);
+        assert_eq!(
+            fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        // Run again, nothing has changed.
+        assert!(write_back(&files).unwrap().is_empty());
+    }
+
     /// Only new or changed files are written, with the guest's mode.
     #[test]
     fn write_back_skips_unchanged_files() {
         let temp = tempfile::tempdir().unwrap();
         let same = temp.path().join("same");
         fs::write(&same, b"x").unwrap();
+        fs::set_permissions(&same, fs::Permissions::from_mode(0o644)).unwrap();
         let new = temp.path().join("sub/new");
         let files = [
             ImageFile {
