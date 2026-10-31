@@ -49,6 +49,11 @@ sysroot="$prefix/sysroot"
 rm -rf "$sysroot"
 mkdir -p "$sysroot/bin" "$sysroot/lib"
 cp -R "$staging/$target" "$sysroot/$target"
+# The archive's include directory also holds the C library headers of the
+# relibc it was built with. Only its C++ headers are wanted: the C headers come
+# from the checkout's relibc, installed over this afterwards, and a header that
+# relibc no longer has would otherwise linger here (mk/prefix.mk does the same).
+find "$sysroot/$target/include" -mindepth 1 -maxdepth 1 ! -name c++ -exec rm -rf {} +
 cp -R "$staging/lib/gcc" "$sysroot/lib/gcc"
 mkdir -p "$sysroot/share"
 cp -R "$staging/share/aclocal" "$staging/share/libtool" "$sysroot/share/"

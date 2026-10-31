@@ -143,7 +143,8 @@ pub mod signal;
 pub mod spawn;
 // TODO: stdalign.h (likely C implementation)
 pub mod stdarg;
-// stdatomic.h implemented in C
+// stdatomic.h comes from the compiler: GCC and Clang each ship one built on
+// their own atomic builtins, and a copy of either here breaks the other.
 // stdbool.h implemented in C
 pub mod stddef;
 // stdint.h implemented in C
