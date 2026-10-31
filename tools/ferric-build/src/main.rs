@@ -318,28 +318,34 @@ fn checks_host_cxx(podman: bool) -> bool {
 /// [`BuildError::HostCxx`] with the compiler's diagnostic when it cannot, and
 /// [`BuildError::Start`] when it cannot be started.
 fn check_cxx_compiler(compiler: &OsStr) -> Result<()> {
-    let mut child = Command::new(compiler)
+    check_cxx_command(Command::new(compiler))
+}
+
+/// Runs the probe with an existing command, so tests can use a stable shell executable.
+fn check_cxx_command(mut command: Command) -> Result<()> {
+    let compiler = command.get_program().to_os_string();
+    let mut child = command
         .args(["-x", "c++", "-fsyntax-only", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|source| BuildError::Start {
-            program: compiler.into(),
+            program: compiler.clone(),
             source,
         })?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(b"#include <memory>\nint main() { return *std::make_unique<int>(0); }\n")
             .map_err(|source| BuildError::Start {
-                program: compiler.into(),
+                program: compiler.clone(),
                 source,
             })?;
     }
     let output = child
         .wait_with_output()
         .map_err(|source| BuildError::Start {
-            program: compiler.into(),
+            program: compiler,
             source,
         })?;
     if output.status.success() {
@@ -583,31 +589,29 @@ fn main() -> ExitCode {
 mod tests {
     /// A stand-in C++ compiler that reads the program and exits with `status`,
     /// printing `diagnostic` on failure.
-    fn fake_compiler(dir: &Path, status: i32, diagnostic: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join(format!("c++-{status}"));
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{diagnostic}' >&2\nexit {status}\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+    fn fake_compiler(status: i32, diagnostic: &str) -> Command {
+        // Parallel child creation can inherit a fixture's writable descriptor until
+        // exec, making a freshly written executable fail with ETXTBSY. Pass the
+        // fixture to an existing interpreter without creating an executable inode.
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            &format!("cat > /dev/null\nprintf '%s' '{diagnostic}' >&2\nexit {status}\n"),
+            "fixture-compiler",
+        ]);
+        command
     }
 
     #[test]
     fn a_compiler_that_builds_the_program_passes() {
-        let dir = tempfile::tempdir().unwrap();
-        let compiler = fake_compiler(dir.path(), 0, "");
-        assert!(check_cxx_compiler(compiler.as_os_str()).is_ok());
+        assert!(check_cxx_command(fake_compiler(0, "")).is_ok());
     }
 
     /// A compiler without C++ headers fails the check with its own diagnostic.
     #[test]
     fn a_compiler_without_cxx_headers_fails_with_its_diagnostic() {
-        let dir = tempfile::tempdir().unwrap();
-        let compiler = fake_compiler(dir.path(), 1, "fatal error: memory: file not found");
-        match check_cxx_compiler(compiler.as_os_str()) {
+        let compiler = fake_compiler(1, "fatal error: memory: file not found");
+        match check_cxx_command(compiler) {
             Err(BuildError::HostCxx { diagnostic }) => {
                 assert!(
                     diagnostic.contains("memory: file not found"),
