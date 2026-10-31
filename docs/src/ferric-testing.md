@@ -676,6 +676,15 @@ reporting `FERRIC_TEST_PASS dd-pipe`. A prebuilt `uutils` package does not acqui
 this recipe patch until rebuilt. The original 64 MiB transfer failure is tracked
 in [#353](https://github.com/rexlunae/ferric-oxide/issues/353).
 
+Local validation on 31 October 2026 rebuilt the combined x86_64 `wayland` image
+through `cargo xtask build` at integration `6b6fbdf88068`. It reached login under
+KVM with four vCPUs and 4 GiB of memory, using snapshot disk writes. The default
+64 MiB `dd` pipe delivered 67,108,864 bytes, matched the expected SHA256, and
+compared equal to a separately written regular file. The exact Ion smoke-test
+fragment above also passed. Before the patch, the same default pipe delivered
+only 4 MiB. This validates the local pipe correction; a graphical COSMIC session
+and hardware performance remain untested.
+
 ### Native entry point and image writer
 
 The native entry point and image writer have host tests:
@@ -923,8 +932,10 @@ the identifier fix in [#352](https://github.com/rexlunae/ferric-oxide/pull/352),
 the combined x86_64 `wayland` image built and reached login under KVM (four
 vCPUs, 4 GiB, snapshot disk writes). A 64 MiB regular-file write followed by a
 complete SHA256 readback matched the host-computed digest. An additional piped
-`dd` comparison delivered only 4 MiB and failed; that separate unresolved result
-is recorded in [#353](https://github.com/rexlunae/ferric-oxide/issues/353).
+`dd` comparison delivered only 4 MiB and failed, exposing the separate output
+short-write bug in [#353](https://github.com/rexlunae/ferric-oxide/issues/353).
+The recipe correction and successful full-transfer checks are documented under
+[Coreutils pipe transfers](#coreutils-pipe-transfers).
 This establishes local boot and file-I/O evidence, not hardware performance.
 The final combined build and boot/readback check was repeated after the
 cancellation-wakeup correction and the compiler-fixture fix in
