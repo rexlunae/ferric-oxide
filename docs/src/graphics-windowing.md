@@ -29,11 +29,26 @@ the guest; tools that must run on the host include Python and LLVM. The build
 needs a working host C++ standard library and enough disk space for both LLVM
 builds described below.
 
-An initial, uncommitted x86_64 bring-up snapshot completed on 30 October 2026
-and its image reached `redox login:` in a headless QEMU boot. That result
-predates the review fixes in the build PRs; a full rebuild of the reviewed
-combination ([#344](https://github.com/rexlunae/ferric-oxide/pull/344)–[#349](https://github.com/rexlunae/ferric-oxide/pull/349))
-is still pending. The initial boot does not validate that exact combination.
+On 31 October 2026, the reviewed build-fix combination
+([#344](https://github.com/rexlunae/ferric-oxide/pull/344)–[#349](https://github.com/rexlunae/ferric-oxide/pull/349)),
+together with the NVMe command-identifier correction in
+[#352](https://github.com/rexlunae/ferric-oxide/pull/352), completed
+`COOKBOOK_MAKE_JOBS=6 cargo xtask build` on x86_64. This was an incremental
+build using existing recipe outputs; the changed base drivers rebuilt. The
+tested integration combined documentation-stack snapshot
+[`6fbb112ecb22`](https://github.com/rexlunae/ferric-oxide/commit/6fbb112ecb22de20626f80717958b426e4f550f7)
+(including build-tool policy `fd5e2fcf3991` and Mesa host LLVM `c132cc44cf46`)
+with NVMe implementation
+[`5d4e54f32175`](https://github.com/rexlunae/ferric-oxide/commit/5d4e54f321755394651fa3d5107346e020bade96).
+Its headless KVM boot reached
+`redox login:` with four vCPUs and 4 GiB RAM, and a 64 MiB filesystem write
+passed full SHA256 readback against the host-computed digest. Snapshot disk
+writes preserved the built image.
+
+The preceding build also completed, but its boot exposed the NVMe command-ID
+reuse hang fixed by #352; that failure is retained as evidence. A separate
+piped `dd` comparison failed and is tracked in
+[#353](https://github.com/rexlunae/ferric-oxide/issues/353).
 The graphical COSMIC session was not validated. The installed
 `orbital-wayland` script selects
 `COSMIC_BACKEND=winit`, starts `cosmic-comp` nested inside Orbital and then
