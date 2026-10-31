@@ -542,14 +542,22 @@ that use it, from their `toolchain` directory on `PATH`, even with
 guest environment. The guest tools a recipe uses are in its `guest-tools`
 directory, and only those get shims.
 
+This separation also applies while building a guest tool: its target
+dependencies populate its link sysroot, while its host-only build dependencies
+populate `toolchain` for its build scripts. Nested guest-tool dependencies
+populate `guest-tools` and receive shims. Compiler and pkg-config searches
+continue to use the target sysroot.
+
 Python builds search the host toolchain's standard library and site-packages
 first, followed by the target standard-library directory for its pure Python
 `_sysconfigdata` file. Target site-packages are excluded: a host interpreter
 cannot import their compiled extensions. The offline integration check
-`python3 scripts/ferric-ci/test-python-build-tools.py` compiles and imports a
+`python3.12 scripts/ferric-ci/test-python-build-tools.py` compiles and imports a
 real host extension while an incompatible target copy is present, and checks
-that target sysconfig data remains usable. It requires the host Python's
-development headers and a C compiler; CI installs `python3-dev` for it.
+that target sysconfig data remains usable. It requires Python 3.12, matching
+development headers and a C compiler; CI installs `python3.12-dev` and invokes
+`python3.12` explicitly. The check uses the prescript's recipe version without
+overriding it and rejects other interpreter versions.
 
 The guest-tool manifest is recomputed on every build, so recipe dependency or
 placement edits take effect without rebuilding the cookbook binary. Its file

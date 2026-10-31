@@ -74,8 +74,8 @@ jobs:
       - name: Python build-tool import regression
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q python3-dev
-          python3 scripts/ferric-ci/test-python-build-tools.py
+          sudo apt-get install -y -q python3.12-dev
+          python3.12 scripts/ferric-ci/test-python-build-tools.py
       - name: Perf A/B gate regression tests
         run: bash scripts/ferric-ci/test-perf-ab.sh
       - name: Trace-overhead gate regression tests
