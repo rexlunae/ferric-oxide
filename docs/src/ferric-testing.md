@@ -212,6 +212,14 @@ access occurs in these host tests. The image CI configuration enables both
 the real startup ordering on QEMU. Retain the first panic log if startup fails.
 This checks initialization order, not physical LPSS support.
 
+Local validation on 31 October 2026 retained a panic from the early LPSS probe:
+`map_device_memory` attempted to descend through a huge-page entry before memory
+initialization. After deferring the probe, the combined x86_64 `wayland` image
+built at integration `d5b2d41c4b11`, with the same LPSS setting and
+`kernel.cpu.kpti = "always"`. Its four-vCPU, 4 GiB KVM snapshot boot reported
+KPTI enabled, reached login, and passed the 64 MiB pipe byte-count, SHA256 and
+file-comparison checks plus the exact Ion smoke fragment.
+
 The included `context/handoff.rs` tests distinguish a timeslice owner from
 the physically running scheme handler. They cover a client becoming runnable
 after the direct-switch check, retention of the running owner, selection of
