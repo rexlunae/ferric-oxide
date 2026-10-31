@@ -23,7 +23,7 @@ use syscall::error::{EIO, EOPNOTSUPP};
 use crate::DEFAULT_JOBS;
 use crate::engine::{EngineError, Reader, Readers};
 use crate::file;
-use crate::round::{SpawnError, run_together_at};
+use ferric_blkqueue::round::{SpawnError, run_together_at};
 
 /// The queue policies a round runs, with their names in the output. The first is the A/B
 /// baseline (the one-queue path) and the second the candidate (the default).
