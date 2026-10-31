@@ -1127,17 +1127,11 @@ fn handle_push(recipes: &Vec<CookRecipe>, config: &CliConfig) -> Result<()> {
     Ok(())
 }
 
-/// Prints the build tools the selected recipes need, one recipe name per line.
-///
-/// A recipe's `build.dev-dependencies` are the tools it runs while it builds.
-/// `make` collects this list to install the guest build environment for
-/// `build.build_tools = "guest"`, so it names the tools themselves rather than
-/// their whole dependency graph: a tool's own dependencies are installed with
-/// it when the environment is built.
-///
-/// Only tools that are recipes are listed: a `host:` name can also be a program
-/// the host provides, and nothing can be built for the guest from that.
 /// Prints the build tools the guest build environment must hold, one per line.
+///
+/// `make` collects this list to install the guest build environment for
+/// `build.build_tools = "guest"`. It names the tools themselves: a tool's own
+/// runtime dependencies are installed with it when the environment is built.
 ///
 /// `recipes` is the cook's own list (`build-tools-list` resolves its recipes as
 /// `cook-list` does), with every recipe's build and dev dependencies. Every
