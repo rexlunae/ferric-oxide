@@ -4,7 +4,8 @@
 git = "https://github.com/uutils/coreutils"
 rev = "0.11.0"
 patches = [
-  "redox.patch"
+  "redox.patch",
+  "dd-short-writes.patch",
 ]
 
 [build]

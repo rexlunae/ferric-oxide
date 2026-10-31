@@ -650,6 +650,43 @@ include old Redox versions and are not validation of current Ferric features.
 
 ## Native build checks
 
+### Coreutils pipe transfers
+
+The `uutils` recipe applies `dd-short-writes.patch` to retain every byte when an
+output write accepts only part of a block. `iflag=fullblock` controls input reads;
+it is not required to complete output writes. Interrupted writes resume at the
+unwritten suffix, zero-progress writes fail, and terminal errors retain the
+complete/partial record and byte counts already committed. This follows Rust's
+[`Write` contract](https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.write),
+including its permitted short writes.
+
+After the cookbook prepares the recipe source, run its unit tests and the
+existing capped-file regression on the host:
+
+```sh
+cargo test --locked --manifest-path recipes/core/uutils/source/Cargo.toml -p uu_dd --lib
+cargo test --locked --manifest-path recipes/core/uutils/source/Cargo.toml \
+  --no-default-features --features dd --test tests test_dd::test_stats_are_reported_when_a_write_fails
+```
+
+The patch includes deterministic short-write, interruption, zero-progress and
+partial-error tests. The smoke image builds `uutils` from source and checks that
+`dd if=/dev/zero bs=1048576 count=4 status=none | wc -c` delivers all 4 MiB,
+reporting `FERRIC_TEST_PASS dd-pipe`. A prebuilt `uutils` package does not acquire
+this recipe patch until rebuilt. The original 64 MiB transfer failure is tracked
+in [#353](https://github.com/rexlunae/ferric-oxide/issues/353).
+
+Local validation on 31 October 2026 rebuilt the combined x86_64 `wayland` image
+through `cargo xtask build` at integration `6b6fbdf88068`. It reached login under
+KVM with four vCPUs and 4 GiB of memory, using snapshot disk writes. The default
+64 MiB `dd` pipe delivered 67,108,864 bytes, matched the expected SHA256, and
+compared equal to a separately written regular file. The exact Ion smoke-test
+fragment above also passed. Before the patch, the same default pipe delivered
+only 4 MiB. This validates the local pipe correction; a graphical COSMIC session
+and hardware performance remain untested.
+
+### Native entry point and image writer
+
 The native entry point and image writer have host tests:
 
 ```sh
@@ -916,8 +953,10 @@ the identifier fix in [#352](https://github.com/rexlunae/ferric-oxide/pull/352),
 the combined x86_64 `wayland` image built and reached login under KVM (four
 vCPUs, 4 GiB, snapshot disk writes). A 64 MiB regular-file write followed by a
 complete SHA256 readback matched the host-computed digest. An additional piped
-`dd` comparison delivered only 4 MiB and failed; that separate unresolved result
-is recorded in [#353](https://github.com/rexlunae/ferric-oxide/issues/353).
+`dd` comparison delivered only 4 MiB and failed, exposing the separate output
+short-write bug in [#353](https://github.com/rexlunae/ferric-oxide/issues/353).
+The recipe correction and successful full-transfer checks are documented under
+[Coreutils pipe transfers](#coreutils-pipe-transfers).
 This establishes local boot and file-I/O evidence, not hardware performance.
 The final combined build and boot/readback check was repeated after the
 cancellation-wakeup correction and the compiler-fixture fix in
