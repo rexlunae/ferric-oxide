@@ -521,6 +521,19 @@ A recipe therefore keeps writing `gperf`, `mdbook build` and so on. The
 the tools come from the host, which is what leaves a host build's `PATH` and
 execution unchanged.
 
+Some tools cannot work from a guest. CPython's cross build needs a runnable
+build interpreter of the same version, which is the tool itself built for the
+host, and build scripts drive it with `PYTHONPATH` and module trees that a guest
+command does not carry. A recipe that build-depends on itself (`host:<name>`),
+as CPython, ICU, groff and zig do, cross-builds with a host build of itself, so
+the cookbook keeps it on the host without being told. Any other recipe says so
+with `tool-runs-on = "host"` in its `[build]` table. Such a tool is built for
+and run on the host by the recipes
+that use it, from their `toolchain` directory on `PATH`, even with
+`build.build_tools = "guest"`, and `repo build-tools-list` leaves it out of the
+guest environment. The guest tools a recipe uses are in its `guest-tools`
+directory, and only those get shims.
+
 A `host:` name with no recipe has nothing to build for either target. Those
 entries are host-provided binaries and guest mode neither builds nor runs them.
 

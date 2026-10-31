@@ -237,8 +237,10 @@ pub fn package_toml(
 /// A `host:` recipe is a build tool. With `build.build_tools = "guest"` it is
 /// built for the target like any other package, because it runs inside a guest
 /// rather than on the host; otherwise it builds for the host.
-pub fn package_target(name: &RecipeName) -> &'static str {
-    if name.is_host() && !crate::build_tools_in_guest() {
+/// The target `name` builds for: the host for a `host:` tool that runs on the
+/// host (see [`crate::tool_runs_in_guest`]), and the image's target otherwise.
+pub fn package_target(name: &RecipeName, runs_on: crate::recipe::ToolRunsOn) -> &'static str {
+    if name.is_host() && !crate::tool_runs_in_guest(runs_on) {
         redoxer::host_target()
     } else {
         redoxer::target()

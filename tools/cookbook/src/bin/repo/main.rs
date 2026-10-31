@@ -1146,6 +1146,11 @@ fn handle_build_tools_list(recipes: &[CookRecipe]) -> Result<()> {
                 eprintln!("build-tools: no recipe for {name}; it stays a host tool");
                 continue;
             }
+            // A tool whose recipe keeps it on the host is built for the host
+            // by the recipes that use it, so the guest has no use for it.
+            if !CookRecipe::from_name(tool.with_host())?.runs_in_guest() {
+                continue;
+            }
             seen.insert(name.to_owned());
             println!("{name}");
         }
