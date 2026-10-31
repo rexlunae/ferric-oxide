@@ -29,9 +29,13 @@ the guest; tools that must run on the host include Python and LLVM. The build
 needs a working host C++ standard library and enough disk space for both LLVM
 builds described below.
 
-An x86_64 build of this configuration completed on 30 October 2026 and its
-image reached `redox login:` in a headless QEMU boot. The graphical COSMIC
-session was not validated. The installed `orbital-wayland` script selects
+An initial, uncommitted x86_64 bring-up snapshot completed on 30 October 2026
+and its image reached `redox login:` in a headless QEMU boot. That result
+predates the review fixes in the build PRs; a full rebuild of the reviewed
+combination ([#344](https://github.com/rexlunae/ferric-oxide/pull/344)–[#349](https://github.com/rexlunae/ferric-oxide/pull/349))
+is still pending. The initial boot does not validate that exact combination.
+The graphical COSMIC session was not validated. The installed
+`orbital-wayland` script selects
 `COSMIC_BACKEND=winit`, starts `cosmic-comp` nested inside Orbital and then
 runs the libcosmic example. Mesa uses software rendering; the compositor
 recipe still records performance and keyboard-input limitations. This build
