@@ -37,6 +37,7 @@ on:
       - "recipes/tests/ferric-iobench/**"
       - "recipes/tests/ferric-ring-test/**"
       - "recipes/tests/ferric-aslr-test/**"
+      - "recipes/tests/ferric-ioport-test/**"
       - ".github/workflows/host-tools.yml"
       - ".github/actions/prepare-cargo-git/**"
 
@@ -96,6 +97,14 @@ jobs:
         run: |
           rustup component add miri
           cargo miri test --locked -p ferric-exec-core -p ferric-devicetree
+      - name: Port-I/O authorization test checks
+        run: |
+          rustup target add x86_64-unknown-redox
+          cargo fmt --check --manifest-path recipes/tests/ferric-ioport-test/files/Cargo.toml
+          cargo clippy --locked --manifest-path recipes/tests/ferric-ioport-test/files/Cargo.toml \
+            --all-targets --target x86_64-unknown-redox -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps \
+            --manifest-path recipes/tests/ferric-ioport-test/files/Cargo.toml --target x86_64-unknown-redox
       - name: Docs
         run: cargo doc --locked --no-deps -p ferric-build -p ferric-abi -p ferric-aligned-buffer -p ferric-boot-time -p ferric-exec-core -p ferric-devicetree -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-iommu -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-timed -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry && cargo doc --locked --no-deps --all-features -p ferric-iommu -p ferric-trace && cargo doc --locked --no-deps --all-features -p fox-core
         env:
