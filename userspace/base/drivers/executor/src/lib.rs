@@ -1,5 +1,6 @@
 #![feature(negative_impls)]
 
+mod completion;
 mod event_read;
 mod task;
 
@@ -344,26 +345,28 @@ impl<Hw: Hardware> LocalExecutor<Hw> {
         let mut to_wake = Vec::new();
 
         Hw::poll_cqes(&self.global_ctxt, |cq_id, cqe| {
-            if let Some((task, comp_ptr)) = self
+            let completed = if let Some((task, comp_ptr)) = self
                 .awaiting_completion
                 .borrow_mut()
                 .get_mut(&cq_id)
                 .and_then(|per_cmd| per_cmd.remove(&Hw::get_cqe_cmdid(&cqe)))
             {
+                // SAFETY: registered futures are pinned, remove this entry before
+                // dropping, and are polled on this executor's single thread.
                 unsafe {
                     comp_ptr.as_ptr().write(Some(cqe));
                 }
-                to_wake.push(task);
-
-                if let Some(submitting) = self
-                    .awaiting_submission
+                Some(task)
+            } else {
+                None
+            };
+            completion::collect_wakeups(
+                completed,
+                self.awaiting_submission
                     .borrow_mut()
-                    .get_mut(&Hw::sq_cq(&self.global_ctxt, cq_id))
-                    .and_then(|q| q.pop_front())
-                {
-                    to_wake.push(submitting);
-                }
-            }
+                    .get_mut(&Hw::sq_cq(&self.global_ctxt, cq_id)),
+                &mut to_wake,
+            );
         });
 
         let woken = to_wake.len();
