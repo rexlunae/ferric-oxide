@@ -44,6 +44,14 @@ def is_unwanted_arch(item, allowed_prefix, all_prefixes, is_lib=False):
         
     return False
 
+def native_component(arg, comp_prefix):
+    """The component `arg` names, with the native backend replaced by the target's."""
+    if arg == "native":
+        return comp_prefix
+    if arg.startswith("native"):
+        return comp_prefix + arg[len("native"):]
+    return arg
+
 def main():
     toolchain_path = os.environ.get("COOKBOOK_HOST_SYSROOT")
     sysroot_path = os.environ.get("COOKBOOK_SYSROOT")
@@ -67,7 +75,10 @@ def main():
         sysroot_path = sysroot_path + "/usr"
         bindir = toolchain_path + "/bin"
 
-    cmd = [toolchain_path + LLVM_CONFIG] + sys.argv[1:]
+    # "native" names the host's backend to a host llvm-config, but the build is
+    # for the target, so ask for the target's backend instead.
+    args = [native_component(arg, comp_prefix) for arg in sys.argv[1:]]
+    cmd = [toolchain_path + LLVM_CONFIG] + args
 
     try:
         result = subprocess.run(
