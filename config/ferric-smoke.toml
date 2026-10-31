@@ -16,6 +16,8 @@ relibc = "source"
 bootloader = "source"
 redoxfs = "source"
 base = "source"
+# The recipe carries the dd short-output-write correction (#353).
+uutils = "source"
 ferric-xstate-test = "source"
 ferric-aslr-test = "source"
 ferric-guard-test = "source"
@@ -97,6 +99,13 @@ uname -a
 cat /scheme/sys/uname
 cat /scheme/sys/cpu
 ls /scheme
+# Default dd output must preserve data when a pipe accepts only part of a block.
+let dd_pipe_bytes = "$(dd if=/dev/zero bs=1048576 count=4 status=none | wc -c)"
+if test "$dd_pipe_bytes" = 4194304
+    echo FERRIC_TEST_PASS dd-pipe
+else
+    echo FERRIC_TEST_FAIL dd-pipe: expected 4194304 bytes, got $dd_pipe_bytes
+end
 # Two HDA controllers (boot-smoke.sh adds them): the first driver that registers
 # takes audiohw and the next must use audiohw.<pci-address> instead of failing.
 # Wait for the second scheme so a slow probe does not race the check.

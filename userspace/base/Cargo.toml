@@ -106,6 +106,7 @@ redox_syscall = { version = "0.9.4",  features = ["std"] }
 # Ferric Oxide: shared crates of the repository (../../crates; the base recipe links them
 # next to its copy of this tree).
 ferric-abi = { path = "../../crates/abi" }
+ferric-blkqueue = { path = "../../crates/blkqueue", default-features = false }
 ferric-iommu = { path = "../../crates/iommu" }
 ferric-irq = { path = "../../crates/irq" }
 ferric-rtl8125 = { path = "../../crates/rtl8125" }
@@ -117,6 +118,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 slab = "0.4.9"
 smallvec = "1"
+simple_endian = { version = "0.4.11", default-features = false, features = ["derive", "integer_impls", "little_endian", "byte_impls"] }
 spin = "0.10"
 static_assertions = "1.1.0"
 thiserror = "2"
