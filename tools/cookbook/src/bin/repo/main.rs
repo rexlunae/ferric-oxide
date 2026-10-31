@@ -468,7 +468,7 @@ fn repo_inner(config: &CliConfig, command: &CliCommand, recipe: &CookRecipe) -> 
             result?
         }
         CliCommand::Unfetch | CliCommand::Clean | CliCommand::CleanTarget => {
-            handle_clean(recipe, config, command)?
+            handle_clean(recipe, config.all.as_ref(), command)?
         }
         _ => unreachable!(),
     })
@@ -993,13 +993,17 @@ fn handle_nonstop_fail(recipe: &CookRecipe) -> cookbook::Result<()> {
     Ok(())
 }
 
-fn handle_clean(recipe: &CookRecipe, config: &CliConfig, command: &CliCommand) -> Result<bool> {
+fn handle_clean(
+    recipe: &CookRecipe,
+    all: Option<&AllOption>,
+    command: &CliCommand,
+) -> Result<bool> {
     let mut dir = recipe.dir.join("target");
     let mut cached = true;
     let unfetch = matches!(*command, CliCommand::Unfetch);
     let mut clean_target = true;
     if matches!(*command, CliCommand::CleanTarget) {
-        dir = dir.join(redoxer::target())
+        dir = dir.join(recipe.target)
     }
     if unfetch && recipe.rule == "binary" {
         // may contains downloaded binaries
@@ -1023,7 +1027,7 @@ fn handle_clean(recipe: &CookRecipe, config: &CliConfig, command: &CliCommand) -
             {
                 remove_all(&tar)?;
                 cached = false;
-            } else if config.all.is_some() {
+            } else if all.is_some() {
                 remove_all(&tar)?;
                 cached = false;
             }
@@ -1268,7 +1272,7 @@ fn handle_change_rule(
             lock.insert(recipe_name.to_string(), recipe_lock);
         }
         let clean_cached = if !cached && is_change_rule {
-            handle_clean(recipe, config, &CliCommand::Clean)?
+            handle_clean(recipe, config.all.as_ref(), &CliCommand::Clean)?
         } else {
             true
         };
@@ -1293,6 +1297,24 @@ use bail_options_err;
 
 #[cfg(test)]
 mod tests {
+    /// Cleaning a selected host tool must use its resolved host target; full
+    /// clean also removes the old guest artifacts after a placement change.
+    #[test]
+    fn cleaning_a_host_tool_uses_its_target_and_full_clean_removes_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recipe = CookRecipe::dummy(&"host:tool".try_into().unwrap());
+        recipe.dir = dir.path().to_owned();
+        recipe.target = "test-host";
+        let host = dir.path().join("target/test-host");
+        let guest = dir.path().join("target/test-guest");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&guest).unwrap();
+        assert!(!super::handle_clean(&recipe, None, &CliCommand::CleanTarget).unwrap());
+        assert!(!host.exists());
+        assert!(guest.exists());
+        assert!(!super::handle_clean(&recipe, None, &CliCommand::Clean).unwrap());
+        assert!(!dir.path().join("target").exists());
+    }
     /// The guest tools are named once each, without their selector, in cook order.
     #[test]
     fn guest_tools_are_listed_once_without_their_selector() {

@@ -9,14 +9,14 @@ template = "python"
 dev-dependencies = [
   "host:python312",
   "python312",
-  "python3-hatchling",
-  "python3-hatch-vcs",
-  "python3-setuptools-scm",
-  "python3-pathspec",
-  "python3-pluggy",
-  "python3-vcs-versioning",
-  "python3-packaging",
-  "python3-trove-classifiers",
+  "host:python3-hatchling",
+  "host:python3-hatch-vcs",
+  "host:python3-setuptools-scm",
+  "host:python3-pathspec",
+  "host:python3-pluggy",
+  "host:python3-vcs-versioning",
+  "host:python3-packaging",
+  "host:python3-trove-classifiers",
 ]
 
 [package]

@@ -915,6 +915,18 @@ linking relibc or booting a guest. Set `CC` to select the host C compiler.
 The image workflow runs this check before building the image; the C test also
 belongs to relibc's regular test suite.
 
+## Python and guest build-tool regressions
+
+`python3 scripts/ferric-ci/test-python-build-tools.py` exercises the cookbook's
+Python setup with a compiled host extension and an incompatible target copy.
+It requires the host Python's development headers (`python3-dev` on the CI
+runner) and a C compiler. `bash scripts/ferric-ci/test-build-tools-manifest.sh`
+checks that recipe placement edits regenerate the guest-tool list, while an
+unchanged list preserves the cached configuration. Both run in `host-tools.yml`
+without downloading or building recipes. The cookbook's Rust tests cover
+Python recipe placement and cleaning the resolved tool target. See
+[build-tool placement](./ferric-build.md#build-tools-in-the-guest) for the policy.
+
 ## Documentation checks
 
 The system chapters are ordinary mdBook pages listed in `docs/src/SUMMARY.md`.

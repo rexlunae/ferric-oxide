@@ -475,8 +475,9 @@ function PYTHON_INIT {
     OS=$(echo "${TARGET}" | cut -d - -f3-4)
     SYSTEM=$(echo "${TARGET}" | cut -d - -f3)
     export PYTHONPYCACHEPREFIX="${COOKBOOK_BUILD}" _PYTHON_HOST_PLATFORM="$OS-$ARCH"
-    export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}${COOKBOOK_SYSROOT}/usr/lib/${COOKBOOK_PYTHON_V}"
-    export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}${COOKBOOK_SYSROOT}/usr/lib/${COOKBOOK_PYTHON_V}/site-packages"
+    # Build modules execute in the host interpreter. Only the target's pure
+    # sysconfig data belongs on its search path, not target extension modules.
+    export PYTHONPATH="${COOKBOOK_TOOLCHAIN}/lib/${COOKBOOK_PYTHON_V}:${COOKBOOK_TOOLCHAIN}/lib/${COOKBOOK_PYTHON_V}/site-packages:${COOKBOOK_SYSROOT}/usr/lib/${COOKBOOK_PYTHON_V}${PYTHONPATH:+:$PYTHONPATH}"
     export _PYTHON_SYSCONFIGDATA_NAME="_sysconfigdata__${SYSTEM}_${ARCH}-${OS}"
 }
 COOKBOOK_PYTHON_PIP_FLAGS=(

@@ -528,13 +528,39 @@ build interpreter of the same version, which is the tool itself built for the
 host, and build scripts drive it with `PYTHONPATH` and module trees that a guest
 command does not carry. A recipe that build-depends on itself (`host:<name>`),
 as CPython, ICU, groff and zig do, cross-builds with a host build of itself, so
-the cookbook keeps it on the host without being told. Any other recipe says so
+the cookbook keeps it on the host without being told. Python-template tools
+also stay on the host: their compiled modules must match the build
+interpreter. Python build-module dependencies use `host:` selectors, including
+transitive modules; the target interpreter stays in the target sysroot for
+its cross-build configuration. Custom Python-module recipes such as
+`python3-vcs-versioning` declare `tool-runs-on = "host"` explicitly.
+Any other recipe says so
 with `tool-runs-on = "host"` in its `[build]` table. Such a tool is built for
 and run on the host by the recipes
 that use it, from their `toolchain` directory on `PATH`, even with
 `build.build_tools = "guest"`, and `repo build-tools-list` leaves it out of the
 guest environment. The guest tools a recipe uses are in its `guest-tools`
 directory, and only those get shims.
+
+Python builds search the host toolchain's standard library and site-packages
+first, followed by the target standard-library directory for its pure Python
+`_sysconfigdata` file. Target site-packages are excluded: a host interpreter
+cannot import their compiled extensions. The offline integration check
+`python3 scripts/ferric-ci/test-python-build-tools.py` compiles and imports a
+real host extension while an incompatible target copy is present, and checks
+that target sysconfig data remains usable. It requires the host Python's
+development headers and a C compiler; CI installs `python3-dev` for it.
+
+The guest-tool manifest is recomputed on every build, so recipe dependency or
+placement edits take effect without rebuilding the cookbook binary. Its file
+is replaced only when the list changes; an unchanged list keeps the guest
+image cached. `bash scripts/ferric-ci/test-build-tools-manifest.sh` checks both
+placement transitions and unchanged-list caching using the actual Make rules.
+
+`repo clean-target host:<recipe>` removes artifacts for the tool's currently
+resolved target. After changing placement, `repo clean host:<recipe>` removes
+all target directories for that recipe, including artifacts from its old
+placement; sources remain fetched.
 
 A `host:` name with no recipe has nothing to build for either target. Those
 entries are host-provided binaries and guest mode neither builds nor runs them.

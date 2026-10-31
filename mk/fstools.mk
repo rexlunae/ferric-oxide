@@ -172,13 +172,16 @@ ifeq ($(FERRIC_BUILD_TOOLS_EFFECTIVE),guest)
 GUEST_TOOLS_EDGE=$(GUEST_TOOL_STAMP)
 endif
 
-$(GUEST_TOOL_MANIFEST): $(FSTOOLS_TAG) $(FILESYSTEM_CONFIG)
+# Recipe dependencies and placement can change without changing the cookbook
+# binary or image config. Recompute the closure, preserving the manifest's
+# timestamp when its contents match so the guest image stays cached.
+$(GUEST_TOOL_MANIFEST): $(FSTOOLS_TAG) $(FILESYSTEM_CONFIG) FORCE
 	mkdir -p $(@D)
 	# The tools the image's own package set needs at build time; an explicit
 	# GUEST_TOOL_RECIPES overrides it for a narrower environment.
 	$(REPO_BIN) build-tools-list $(if $(GUEST_TOOL_RECIPES),$(GUEST_TOOL_RECIPES),\
 		--filesystem=$(FILESYSTEM_CONFIG)) > $@.partial
-	mv $@.partial $@
+	@if cmp -s $@.partial $@; then rm $@.partial; else mv $@.partial $@; fi
 
 # The package list below is written into the configuration, so the file itself is
 # a prerequisite: without it an existing checkout kept the old guest image, which

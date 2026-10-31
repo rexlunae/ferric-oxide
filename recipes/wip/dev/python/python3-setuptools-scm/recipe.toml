@@ -11,8 +11,8 @@ pyprojectpath = "setuptools-scm"
 pipflags = ["--no-deps"]
 dev-dependencies = [
     "host:python312",
-    "python3-setuptools",
-    "python3-vcs-versioning",
+    "host:python3-setuptools",
+    "host:python3-vcs-versioning",
     "python312",
 ]
 
