@@ -660,6 +660,13 @@ bash scripts/ferric-ci/test-native-toolchain.sh
 cargo xtask --dry-run build
 ```
 
+The C++ prerequisite tests cover successful compilation, missing standard-library
+headers with the compiler's diagnostic, a missing compiler and the Podman bypass.
+Their stand-in compilers pass a script to an existing shell executable. They do
+not execute newly written fixture files, which can fail with `ETXTBSY` when
+parallel subprocess creation briefly inherits a writable fixture descriptor.
+The production check still invokes the selected C++ compiler directly.
+
 The shell regression uses a small synthetic runtime archive and mock Rust/Clang
 tools, with no network or package installation. It checks compiler exclusion,
 argument quoting, explicit LLD/Redox settings and rejection of unsupported
