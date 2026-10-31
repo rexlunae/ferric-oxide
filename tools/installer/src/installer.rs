@@ -563,32 +563,56 @@ where
     callback(fs)
 }
 
-/// Where a `no_mount` install stages the tree it then archives into `image`.
+/// A new, private directory for a `no_mount` install to stage the tree it then
+/// archives into `image`, removed when the guard is dropped.
 ///
-/// It sits beside the image, on the filesystem that has to hold the image
-/// anyway: the tree is as large as the image's contents, which can be many
-/// gigabytes, and `/tmp` is often a small RAM-backed tmpfs. A tree left behind
-/// by an interrupted install is removed first.
+/// The tree is as large as the image's contents, which can be many gigabytes, and
+/// `/tmp` is often a small RAM-backed tmpfs. So when `image` is a regular file the
+/// directory goes beside it, on the filesystem that has to hold the image anyway.
+/// A block device's directory (`/dev`) holds no such space, and the image's
+/// directory may not be writable, so those use the temporary directory (`TMPDIR`).
+///
+/// The directory gets a fresh random name and mode 0700 (`mkdtemp`), so nothing
+/// already at a predictable path is reused or removed, and nobody else can plant
+/// files or links in it. Dropping the guard removes the tree on every path out,
+/// a failed archive included.
 ///
 /// # Errors
-/// Returns an error when `image` names no file, or a leftover tree cannot be
-/// removed.
-fn staging_dir(image: &Path) -> Result<PathBuf> {
-    let name = image
-        .file_name()
-        .with_context(|| format!("{} names no image file", image.display()))?;
-    let mut staging_name = std::ffi::OsString::from(".");
-    staging_name.push(name);
-    staging_name.push(".staging");
-    let staging = image.with_file_name(staging_name);
-    match fs::remove_dir_all(&staging) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| format!("removing {}", staging.display()));
+/// Returns an error when no staging directory can be created.
+fn staging_dir(image: &Path) -> Result<tempfile::TempDir> {
+    let staging = || {
+        use std::os::unix::fs::PermissionsExt;
+        let mut builder = tempfile::Builder::new();
+        builder
+            .prefix(".redox_installer.staging.")
+            .permissions(fs::Permissions::from_mode(0o700));
+        builder
+    };
+    let beside = fs::metadata(image)
+        .is_ok_and(|metadata| metadata.is_file())
+        .then(|| image.parent())
+        .flatten()
+        .map(|dir| {
+            if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                dir
+            }
+        });
+    if let Some(dir) = beside {
+        match staging().tempdir_in(dir) {
+            Ok(staging) => return Ok(staging),
+            // The image file is writable but its directory is not.
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("creating a staging directory in {}", dir.display()));
+            }
         }
     }
-    Ok(staging)
+    staging()
+        .tempdir()
+        .context("creating a staging directory in the temporary directory")
 }
 
 fn decide_mount_path(mount_path: Option<&Path>) -> PathBuf {
@@ -1235,7 +1259,7 @@ fn install_inner(config: Config, output: &Path) -> Result<()> {
             .transpose()?;
         with_whole_disk(output, &disk_option, move |fs| {
             if let Some(staging) = staging {
-                with_redoxfs_ar_owned(fs, Some(&staging), move |mount_path| {
+                with_redoxfs_ar_owned(fs, Some(staging.path()), move |mount_path| {
                     install_dir_unprivileged(config, mount_path, cookbook)
                 })
             } else {
@@ -1263,20 +1287,41 @@ pub fn install(config: Config, output: impl AsRef<Path>) -> Result<()> {
 pub(crate) mod tests {
     use super::*;
 
-    /// The staging tree goes beside the image, not in /tmp, and a tree an
-    /// interrupted install left there is cleared.
+    /// For an image file the staging tree goes beside it, in a new private
+    /// directory: nothing already there is reused or removed, and the tree is
+    /// removed with its guard.
     #[test]
-    fn staging_is_beside_the_image_and_starts_empty() {
+    fn staging_is_a_private_directory_beside_an_image_file() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("harddrive.img");
-        let leftover = dir.path().join(".harddrive.img.staging/usr/bin");
-        fs::create_dir_all(&leftover).unwrap();
-        fs::write(leftover.join("stale"), b"x").unwrap();
+        fs::write(&image, b"").unwrap();
+        // A directory with the old fixed name holds someone's files.
+        let theirs = dir.path().join(".harddrive.img.staging");
+        fs::create_dir(&theirs).unwrap();
+        fs::write(theirs.join("notes"), b"keep").unwrap();
 
         let staging = staging_dir(&image).unwrap();
-        assert_eq!(staging, dir.path().join(".harddrive.img.staging"));
-        assert!(!staging.exists());
-        assert!(staging_dir(Path::new("/")).is_err());
+        let path = staging.path().to_path_buf();
+        assert_eq!(path.parent(), Some(dir.path()));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(fs::read(theirs.join("notes")).unwrap(), b"keep");
+        fs::write(path.join("file"), b"x").unwrap();
+        drop(staging);
+        assert!(!path.exists());
+        assert!(theirs.join("notes").exists());
+    }
+
+    /// An output that is not a regular file (a block device under /dev) stages
+    /// in the temporary directory instead of beside it.
+    #[test]
+    fn staging_for_a_device_uses_the_temporary_directory() {
+        let staging = staging_dir(Path::new("/dev/null")).unwrap();
+        assert!(!staging.path().starts_with("/dev"));
+        assert!(staging.path().starts_with(std::env::temp_dir()));
     }
 
     /// A cookbook checkout with a signing key and a repository holding
