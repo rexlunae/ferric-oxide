@@ -31,6 +31,7 @@ touch "$rust_root/lib/rustlib/mock-host/bin/rust-lld"
 cat > "$mock/clang" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$FAKE_CLANG_ARGS"
+printf '%s' "${LD_LIBRARY_PATH-unset}" > "$FAKE_CLANG_ARGS.ld_library_path"
 STUB
 cp "$mock/clang" "$mock/clang++"
 cat > "$mock/gcc" <<'STUB'
@@ -103,6 +104,13 @@ for target in x86_64-unknown-redox aarch64-unknown-redox; do
     esac
     # Plain clang is the host compiler unless a Redox target is named.
     for tool in clang clang++; do
+        # A recipe's host toolchain libraries must not reach the host compiler.
+        for compiler in "$prefix/sysroot/bin/$tool" "$prefix/sysroot/bin/$target-$tool"; do
+            LD_LIBRARY_PATH=/recipe/toolchain/lib "$compiler" --target="$target" -c lib.c
+            test "$(cat "$FAKE_CLANG_ARGS.ld_library_path")" = unset
+            LD_LIBRARY_PATH=/recipe/toolchain/lib "$prefix/sysroot/bin/$tool" -c lib.c
+            test "$(cat "$FAKE_CLANG_ARGS.ld_library_path")" = unset
+        done
         "$prefix/sysroot/bin/$tool" -c host.c
         if grep -q -- '--config=' "$FAKE_CLANG_ARGS"; then
             echo "Plain $tool used the Redox target config" >&2; exit 1
