@@ -392,6 +392,11 @@ including when the waiting future has been cancelled. Admin, single-queue and
 per-core I/O queues all use this rule. This is a correctness requirement, enabled
 in every NVMe build.
 
+A hardware completion also wakes one waiting submitter even when cancellation
+has removed its completion owner. Cancellation does not return a hardware queue
+credit; completion does. This keeps a full queue from stranding its submitters
+when the command that frees its next slot has been cancelled.
+
 The pool uses 8 KiB per queue pair, does not allocate on submission or completion,
 and permits up to 65,535 outstanding commands independently of submission-ring
 capacity. It follows the distinction between consumed entries and completed

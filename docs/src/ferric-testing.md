@@ -876,6 +876,11 @@ complete commands out of order, cross the entire 16-bit identifier range while
 one command remains outstanding, exhaust and resume the pool, reject duplicate
 completions, and keep queue pairs independent. The pool is also checked without
 `std` or `alloc`; its doctest and strict Clippy/Rustdoc checks run in host-tools CI.
+`cargo test --locked -p ferric-exec-core --test driver_completion` compiles the
+driver's actual completion dispatch on the host: live completions wake their
+owner and one FIFO submitter, cancelled completions still wake a submitter,
+and empty queues do not produce extra wakeups. The same tests run in the
+`executor` package.
 
 The driver job compiles the default NVMe driver, `perf`, and
 `perf,percore,grant-dma` configurations. The target check remains an image build
