@@ -888,6 +888,22 @@ and a boot with writes large enough to reuse submission positions, followed by
 filesystem readback. Preserve a failing boot's first serial log and NMI context
 dump rather than treating a later successful boot as proof the failure was fixed.
 
+The NVMe package's host tests also cover completion publication:
+`cargo test --locked --manifest-path userspace/base/Cargo.toml -p nvmed`.
+A deterministic controller publishes a new completion between a premature
+payload read and the phase read, for both phase values. Reading the phase first
+must deliver the new command identifier; an unpublished slot must not be read.
+A byte fixture checks the generated little-endian completion layout.
+
+The profile-image boot at `95b031f0e` retained a driver abort during storage
+stress on a completion whose command identifier was not outstanding.
+The old x86-64 binary loaded the CID before status; its phase check therefore
+could accept a torn snapshot. One unmodified local boot also passed, confirming
+that a later pass alone does not establish a fix. The deterministic regression
+and phase-first implementation address that publication race; retain the full
+profile-image smoke boot as the target check. The profile workflow also runs
+when NVMe completion/command code, the command-ID pool or the executor changes.
+
 Local validation on 31 October 2026 reproduced a first-boot `fox` database write
 stall before the fix: seven disk-ring operations remained without completions
 after the NVMe hardware queues and executor completion maps had drained. With
