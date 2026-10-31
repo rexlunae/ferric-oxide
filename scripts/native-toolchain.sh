@@ -49,6 +49,11 @@ sysroot="$prefix/sysroot"
 rm -rf "$sysroot"
 mkdir -p "$sysroot/bin" "$sysroot/lib"
 cp -R "$staging/$target" "$sysroot/$target"
+# The archive's include directory also holds the C library headers of the
+# relibc it was built with. Only its C++ headers are wanted: the C headers come
+# from the checkout's relibc, installed over this afterwards, and a header that
+# relibc no longer has would otherwise linger here (mk/prefix.mk does the same).
+find "$sysroot/$target/include" -mindepth 1 -maxdepth 1 ! -name c++ -exec rm -rf {} +
 cp -R "$staging/lib/gcc" "$sysroot/lib/gcc"
 mkdir -p "$sysroot/share"
 cp -R "$staging/share/aclocal" "$staging/share/libtool" "$sysroot/share/"
@@ -118,6 +123,12 @@ quote_cfg() { printf '"%s"\n' "${1//\"/\\\"}"; }
     quote_cfg "--gcc-install-dir=$sysroot/lib/gcc/$target/$version"
 } > "$sysroot/bin/$target.cfg"
 # Shell quoting is separate from Clang config-file quoting.
+#
+# The host compiler runs without LD_LIBRARY_PATH. A recipe puts its host
+# toolchain's libraries there for the tools it builds with, and a host build of
+# LLVM among them (mesa's llvm-config) has the soname the host clang links
+# against, so the compiler would load that LLVM instead of its own and fail.
+# Its RUNPATH already finds its own libraries.
 for tool in clang clang++; do
     compiler="$clang_path"
     [ "$tool" = clang ] || compiler=$(command -v clang++)
@@ -141,7 +152,7 @@ done
 WRAPPER
         printf 'if [ "$link_executable" = yes ]; then args+=(-Wl,--dynamic-linker=/usr/lib/%s -Wl,-T,' "$interpreter"
         quote_sh "$root/scripts/native/runtime.ld"
-        printf '); fi\nexec '
+        printf '); fi\nexec env -u LD_LIBRARY_PATH '
         quote_sh "$compiler"
         printf ' --config='
         quote_sh "$sysroot/bin/$target.cfg"
@@ -159,7 +170,7 @@ for tool in clang clang++; do
         printf '#!/usr/bin/env bash\nfor arg in "$@"; do\n'
         printf '    case "$arg" in --target=*-unknown-redox) exec '
         quote_sh "$sysroot/bin/$target-$tool"
-        printf ' "$@" ;; esac\ndone\nexec '
+        printf ' "$@" ;; esac\ndone\nexec env -u LD_LIBRARY_PATH '
         quote_sh "$compiler"
         printf ' "$@"\n'
     } > "$sysroot/bin/$tool"

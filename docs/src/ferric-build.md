@@ -62,7 +62,12 @@ runtime data, Cargo dependencies and application packages.
 The native toolchain (`build.toolchain = "llvm"`, `mk/llvm.mk`) uses host Clang
 and rustup's compiler, LLD and LLVM binary utilities. It extracts target headers,
 libraries and startup objects from the existing upstream GCC toolchain archive
-without installing or executing its Linux compiler binaries. Rust's current
+without installing or executing its Linux compiler binaries. Of the archive's
+headers it keeps only the C++ ones; the C headers come from the checkout's
+relibc, so a header relibc no longer ships does not linger. The Clang wrappers
+run the host compiler without `LD_LIBRARY_PATH`: a recipe puts its host tools'
+libraries there, and a host build of LLVM among them would otherwise replace the
+compiler's own `libLLVM`. Rust's current
 Redox target still links `libgcc`; existing C++ packages require `libstdc++` and
 its headers. Replacing these ABI runtimes with compiler-rt/libc++ is separate
 work. Native builds do not compile GCC, LLVM or Rust itself.

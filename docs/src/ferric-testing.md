@@ -897,6 +897,17 @@ responses and failed-dispatch cleanup. Normal `fmap` still creates eager
 mappings, and no scheme responds to `RequestMmap`; this protocol coverage is
 not an end-to-end lazy-fault test. Run the helper host and Miri commands above.
 
+## Socket ancillary-data headers
+
+`bash scripts/ferric-ci/test-socket-header.sh` regenerates relibc's socket
+header and its required type headers with `cbindgen`, then compiles and runs
+`crates/relibc/tests/sys_socket/cmsg_nxthdr.c` on the host with
+`-Wsign-compare -Werror`. It checks aligned traversal, a final header that
+fits exactly, truncated buffers and invalid current-message lengths without
+linking relibc or booting a guest. Set `CC` to select the host C compiler.
+The image workflow runs this check before building the image; the C test also
+belongs to relibc's regular test suite.
+
 ## Documentation checks
 
 The system chapters are ordinary mdBook pages listed in `docs/src/SUMMARY.md`.

@@ -31,6 +31,7 @@ touch "$rust_root/lib/rustlib/mock-host/bin/rust-lld"
 cat > "$mock/clang" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$FAKE_CLANG_ARGS"
+printf '%s' "${LD_LIBRARY_PATH-unset}" > "$FAKE_CLANG_ARGS.ld_library_path"
 STUB
 cp "$mock/clang" "$mock/clang++"
 cat > "$mock/gcc" <<'STUB'
@@ -69,16 +70,19 @@ chmod +x "$mock/"* "$rust_root/bin/"*
 for target in x86_64-unknown-redox aarch64-unknown-redox; do
     prefix="$temp/prefix with a 'quote/$target"
     fixture="$temp/fixture/$target"
-    mkdir -p "$prefix" "$fixture/$target/include" "$fixture/$target/lib" "$fixture/lib/gcc/$target/13.2.0" "$fixture/bin" \
+    mkdir -p "$prefix" "$fixture/$target/include/c++/13.2.0" "$fixture/$target/lib" "$fixture/lib/gcc/$target/13.2.0" "$fixture/bin" \
         "$fixture/share/aclocal" "$fixture/share/libtool/build-aux"
-    touch "$fixture/$target/include/stdio.h" "$fixture/$target/lib/libc.a" "$fixture/lib/gcc/$target/13.2.0/crtbegin.o" "$fixture/bin/gcc" \
+    touch "$fixture/$target/include/stdio.h" "$fixture/$target/include/c++/13.2.0/vector" "$fixture/$target/lib/libc.a" "$fixture/lib/gcc/$target/13.2.0/crtbegin.o" "$fixture/bin/gcc" \
         "$fixture/share/aclocal/libtool.m4" "$fixture/share/libtool/build-aux/ltmain.sh"
     printf '#!/bin/sh\npkgauxdir=/usr/share/libtool/build-aux\naclocaldir=/usr/share/aclocal\n' > "$fixture/bin/libtoolize.orig"
     tar -cf "$prefix/target-runtime.tar.gz" -C "$fixture" .
     export FAKE_RUST_ROOT="$rust_root" FAKE_CLANG_ARGS="$temp/clang-args" FAKE_CARGO_ARGS="$temp/cargo-args"
     PATH="$mock:$PATH" bash "$root/scripts/native-toolchain.sh" "$prefix" "$target"
     test ! -e "$prefix/sysroot/bin/gcc"
-    test -f "$prefix/sysroot/$target/include/stdio.h"
+    # The archive's C++ headers stay; its C library headers belong to the relibc
+    # it was built with and give way to the checkout's.
+    test -f "$prefix/sysroot/$target/include/c++/13.2.0/vector"
+    test ! -e "$prefix/sysroot/$target/include/stdio.h"
     test -L "$prefix/sysroot/bin/rustc"
     test -L "$prefix/sysroot/lib/gcc/$target/13.2.0/crtbeginT.o"
     test -f "$prefix/sysroot/share/aclocal/libtool.m4"
@@ -100,6 +104,13 @@ for target in x86_64-unknown-redox aarch64-unknown-redox; do
     esac
     # Plain clang is the host compiler unless a Redox target is named.
     for tool in clang clang++; do
+        # A recipe's host toolchain libraries must not reach the host compiler.
+        for compiler in "$prefix/sysroot/bin/$tool" "$prefix/sysroot/bin/$target-$tool"; do
+            LD_LIBRARY_PATH=/recipe/toolchain/lib "$compiler" --target="$target" -c lib.c
+            test "$(cat "$FAKE_CLANG_ARGS.ld_library_path")" = unset
+            LD_LIBRARY_PATH=/recipe/toolchain/lib "$prefix/sysroot/bin/$tool" -c lib.c
+            test "$(cat "$FAKE_CLANG_ARGS.ld_library_path")" = unset
+        done
         "$prefix/sysroot/bin/$tool" -c host.c
         if grep -q -- '--config=' "$FAKE_CLANG_ARGS"; then
             echo "Plain $tool used the Redox target config" >&2; exit 1

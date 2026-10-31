@@ -306,6 +306,7 @@ VARIED_NAMES=\
 	sys_mman/mmap \
 	sys_mman/posix_madvise \
 	sys_resource/constants \
+	sys_socket/cmsg_nxthdr \
 	sys_socket/getpeername \
 	sys_socket/msg_nosignal \
 	sys_stat/stat \

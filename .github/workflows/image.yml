@@ -63,6 +63,9 @@ jobs:
       - name: Install cbindgen
         run: command -v cbindgen || "$HOME/.cargo/bin/cargo" install --locked cbindgen
 
+      - name: Socket header regression tests
+        run: bash scripts/ferric-ci/test-socket-header.sh
+
       # Several crates (relibc's, redoxfs's) have git dependencies (Ferric mirrors on GitHub).
       # Cargo only fetches a git dependency when its locked commit is missing from
       # ~/.cargo/git/db, so caching that directory keeps a fetch failure from failing
