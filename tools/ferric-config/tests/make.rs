@@ -75,7 +75,7 @@ impl Fixture {
     }
 }
 
-const INVALID_X86: &str = "[target]\narch='x86_64'\n[image]\nconfig='native'\n[kernel]\ntrace=true\nprofiling=true\npti=true\nregbuf=true\n";
+const INVALID_X86: &str = "[target]\narch='x86_64'\n[image]\nconfig='native'\n[kernel]\ntrace=true\nprofiling=true\nregbuf=true\n[kernel.cpu]\nkpti='always'\n";
 
 #[test]
 fn architecture_override_is_resolved_before_validation_without_editing_saved_choices() {
@@ -84,9 +84,16 @@ fn architecture_override_is_resolved_before_validation_without_editing_saved_cho
     assert_eq!(&result[..3], ["aarch64", "", "native"]);
     let features: Vec<_> = result[3].split(',').collect();
     assert!(features.contains(&"regbuf"));
-    for x86 in ["trace", "profiling", "pti", "x86_kvm_pv"] {
+    for x86 in ["trace", "profiling", "x86_kvm_pv"] {
         assert!(!features.contains(&x86), "{result:?}");
     }
+    assert!(
+        !fixture
+            .0
+            .path()
+            .join("build/ferric/kernel-config.toml")
+            .exists()
+    );
     assert!(!result[4].contains("x86"));
     assert_eq!(
         std::fs::read_to_string(fixture.0.path().join("ferric.toml")).unwrap(),
@@ -99,6 +106,75 @@ fn architecture_override_is_resolved_before_validation_without_editing_saved_cho
             .status
             .success()
     );
+}
+
+#[test]
+fn retired_pti_option_is_rejected_before_generating_build_files() {
+    let fixture = Fixture::new("[kernel]\npti=true\n");
+    for command in ["check", "generate"] {
+        let output = fixture.config(&[command]);
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("unknown option kernel.pti"), "{stderr}");
+    }
+    assert!(!fixture.0.path().join("build/ferric/config.mk").exists());
+}
+
+#[test]
+fn retired_pti_migrates_through_the_cli() {
+    for kernel in [
+        "[kernel]\npti=true\nnuma=true\n",
+        "kernel = { pti=true, numa=true }\n",
+    ] {
+        let original =
+            format!("{kernel}\n# Keep the saved architecture.\n[target]\narch='x86_64'\n");
+        let fixture = Fixture::new(&original);
+        for args in [
+            &["unset", "kernel.pti"][..],
+            &["set", "kernel.cpu.kpti=always"][..],
+            &["check"][..],
+            &["generate", "--no-touch"][..],
+        ] {
+            let output = fixture.config(args);
+            assert!(
+                output.status.success(),
+                "{args:?}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let text = std::fs::read_to_string(fixture.0.path().join("ferric.toml")).unwrap();
+        assert!(text.contains("# Keep the saved architecture."));
+        let saved: toml::Value = toml::from_str(&text).unwrap();
+        assert!(saved["kernel"].get("pti").is_none());
+        assert_eq!(saved["kernel"]["numa"].as_bool(), Some(true));
+        assert_eq!(saved["target"]["arch"].as_str(), Some("x86_64"));
+        assert_eq!(saved["kernel"]["cpu"]["kpti"].as_str(), Some("always"));
+        let generated =
+            std::fs::read_to_string(fixture.0.path().join("build/ferric/kernel-config.toml"))
+                .unwrap();
+        let generated: toml::Value = toml::from_str(&generated).unwrap();
+        assert_eq!(
+            generated["arch"]["x86_64"]["features"]["kpti"].as_str(),
+            Some("always")
+        );
+    }
+}
+
+#[test]
+fn unsetting_an_absent_unknown_key_or_a_table_preserves_the_configuration() {
+    let original = "[kernel]\npti=true\nnuma=true\n";
+    let fixture = Fixture::new(original);
+    for id in ["kernel.pti_typo", "kernel.pti.missing", "kernel"] {
+        let output = fixture.config(&["unset", id]);
+        assert!(!output.status.success(), "{id}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(&format!("unknown option {id}")), "{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.path().join("ferric.toml")).unwrap(),
+            original
+        );
+    }
 }
 
 #[test]

@@ -58,7 +58,8 @@ host (`tool-runs-on = "host"`), because build systems query `llvm-config` there,
 even with `build.build_tools = "guest"`. Without a host build in the recipe's
 toolchain, the wrapper uses the host sysroot's `llvm-config`, which the upstream
 prefix toolchain ships. `scripts/ferric-ci/test-llvm-config-wrapper.sh` checks
-the wrapper with stand-in `llvm-config` programs.
+the wrapper with stand-in `llvm-config` programs. The host-tools workflow runs
+it for changes to the wrapper, LLVM and Mesa recipes, or the fixture itself.
 
 ## Orbital (historical reference)
 
