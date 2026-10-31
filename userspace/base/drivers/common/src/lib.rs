@@ -289,6 +289,11 @@ impl Drop for PhysBorrowed {
 /// prevent system instability caused by a faulty driver. Processes with (bitmap-enabled) IO port
 /// rights can use the IN/OUT instructions. This is not the same as IOPL 3; the CLI instruction is
 /// still not allowed.
+///
+/// # Errors
+/// Returns `EPERM` unless the calling thread's effective UID is zero when the
+/// request is made, or a descriptor or kernel-call error. This enables all
+/// ports; delegated port ranges are not implemented yet.
 pub fn acquire_port_io_rights() -> Result<()> {
     extern "C" {
         fn redox_cur_thrfd_v0() -> usize;

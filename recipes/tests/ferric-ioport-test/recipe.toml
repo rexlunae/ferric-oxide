@@ -1,0 +1,11 @@
+# Checks the kernel's port-I/O authorization without executing IN/OUT.
+[source]
+path = "recipes/tests/ferric-ioport-test/files"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""

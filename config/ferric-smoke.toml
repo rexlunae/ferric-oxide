@@ -28,6 +28,8 @@ ferric-futex-test = "source"
 ferric-exit-test = "source"
 # Reads /scheme/sys/proc (kernel.sys_proc, which CI turns on); skips otherwise.
 ferric-proc-test = "source"
+# Requests port-I/O access as root and as unprivileged children; no port accesses.
+ferric-ioport-test = "source"
 ferric-syscall-fuzz = "source"
 # pcid-spawner starts it for QEMU's edu device (boot-smoke.sh adds one): it gets a
 # DMA domain from pcid and has the device DMA through it.
@@ -135,6 +137,7 @@ ferric-iobench || echo FERRIC_TEST_FAIL iobench exited with an error
 ferric-futex-test || echo FERRIC_TEST_FAIL futex exited with an error
 ferric-exit-test || echo FERRIC_TEST_FAIL exit-busy-thread exited with an error
 ferric-proc-test || echo FERRIC_TEST_FAIL proc exited with an error
+ferric-ioport-test || echo FERRIC_TEST_FAIL ioport exited with an error
 ferric-scheme-self-test || echo FERRIC_TEST_FAIL scheme-self-open exited with an error
 ferric-trace-test || echo FERRIC_TEST_FAIL trace exited with an error
 # Saves a capture through the ring mappings and reads it back, on a kernel with kernel.trace. The /scheme listing says

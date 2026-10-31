@@ -990,6 +990,27 @@ linking relibc or booting a guest. Set `CC` to select the host C compiler.
 The image workflow runs this check before building the image; the C test also
 belongs to relibc's regular test suite.
 
+## Port-I/O authorization
+
+`ferric-ioport-test` runs on x86_64 Redox in the smoke image. It starts separate
+children to request port access as root (must succeed), as user 1000 (must
+return `EPERM`), and through a handle opened as root before dropping the
+effective UID to 1000 while keeping real UID 0 (must also return `EPERM`).
+The children never execute `IN` or `OUT`; this tests authorization, not device
+access or revocation of rights enabled earlier. Other targets print a skip.
+
+Compile and lint the target test independently with:
+
+```sh
+cargo clippy --locked --manifest-path recipes/tests/ferric-ioport-test/files/Cargo.toml \
+    --all-targets --target x86_64-unknown-redox -- -D warnings
+```
+
+`host-tools.yml` checks its formatting, target compilation, Clippy and
+Rustdoc. The image workflow builds the recipe and boots it in its smoke
+matrix. Kernel changes also require the kernel lint ratchet; host compilation
+alone does not exercise the credential check.
+
 ## Documentation checks
 
 The system chapters are ordinary mdBook pages listed in `docs/src/SUMMARY.md`.
