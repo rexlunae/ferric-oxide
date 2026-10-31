@@ -174,6 +174,10 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs, _stack_end: usize) -> ! 
 
         let numa_region_mask = crate::memory::init_mm(mapper.allocator_mut());
 
+        // SAFETY: The kernel page tables and frame allocator are ready, and no
+        // application processor has started. LPSS must not use the boot mapping.
+        device::serial::init_lpss_after_memory();
+
         // Set up the IDT's IST
         idt::init_bsp_after_mem();
 

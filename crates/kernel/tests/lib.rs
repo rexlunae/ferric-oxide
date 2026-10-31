@@ -8,6 +8,21 @@
 
 extern crate alloc;
 
+#[cfg(all(test, feature = "serial_debug", feature = "lpss_debug"))]
+mod serial_support;
+#[cfg(all(
+    test,
+    feature = "serial_debug",
+    feature = "lpss_debug",
+    feature = "system76_ec_debug"
+))]
+use serial_support::system76_ec;
+#[cfg(all(test, feature = "serial_debug", feature = "lpss_debug"))]
+use serial_support::{devices, memory, syscall};
+#[cfg(all(test, feature = "serial_debug", feature = "lpss_debug"))]
+#[path = "../src/arch/x86_shared/device/serial.rs"]
+mod x86_serial;
+
 #[path = "../src/arch/x86_shared/device/apic_id.rs"]
 mod apic_id;
 #[path = "../src/scheme/chown.rs"]

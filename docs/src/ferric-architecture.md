@@ -87,6 +87,13 @@ Image composition determines the exact daemons and scripts. Inspect
 files before assuming a service is installed. The smoke-test image replaces
 the console stage with its test script.
 
+On x86, legacy port-I/O debug UARTs are probed before memory initialization.
+With `kernel.serial_debug` and `kernel.lpss_debug` enabled, the LPSS MMIO probe
+runs after the kernel installs its page tables and initializes the frame
+allocator, before application processors start. It uses the final physical-map
+address. Mapping it during early serial setup would attempt to insert a 4 KiB
+mapping into the bootloader's huge-page mapping, before the allocator is ready.
+
 ## Schemes, descriptors and services
 
 A scheme is a named service accessed through file descriptors. Scheme-rooted
