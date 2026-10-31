@@ -41,7 +41,7 @@ correction [#357](https://github.com/rexlunae/ferric-oxide/pull/357), completed
 build using existing recipe outputs; the changed kernel, base drivers and
 `uutils` were rebuilt during validation.
 
-The final local integration `d5b2d41c4b11` included the LPSS implementation
+The COSMIC validation integration `d5b2d41c4b11` included the LPSS implementation
 [`17ff802c6`](https://github.com/rexlunae/ferric-oxide/commit/17ff802c6a845c6a4f5d2f695a9cbf66852ea808), with
 `kernel.lpss_debug = true` and `kernel.cpu.kpti = "always"`. Its headless KVM
 snapshot boot, with four vCPUs and 4 GiB RAM, reported KPTI enabled and reached
@@ -50,6 +50,14 @@ SHA256 and full file-comparison checks; the exact Ion `dd-pipe` smoke fragment
 also passed. Snapshot disk writes preserved the built image. Its SHA256 was
 `41110d0146ebd52bb31e2b5f57e55a4e11194b66721068585d0060a6b436c737`;
 the generated CycloneDX SBOM contained 103 components.
+
+A later completion-publication correction in #352 was validated at local
+integration `b880ecc74737` by a native profiler-image source rebuild and full
+KVM smoke boot, including storage stress, profile collection and package
+verification. Both profile workflow postchecks passed, with 1,975 samples and
+zero unreadable stacks. The COSMIC image hash above records the earlier build;
+see [NVMe validation](./ferric-testing.md#nvme-command-identifiers) for the
+publication regression.
 
 The first-failure logs are retained for the preceding NVMe command-ID reuse
 hang, truncated pipe transfer ([#353](https://github.com/rexlunae/ferric-oxide/issues/353))
