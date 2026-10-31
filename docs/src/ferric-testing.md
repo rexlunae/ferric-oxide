@@ -650,6 +650,34 @@ include old Redox versions and are not validation of current Ferric features.
 
 ## Native build checks
 
+### Coreutils pipe transfers
+
+The `uutils` recipe applies `dd-short-writes.patch` to retain every byte when an
+output write accepts only part of a block. `iflag=fullblock` controls input reads;
+it is not required to complete output writes. Interrupted writes resume at the
+unwritten suffix, zero-progress writes fail, and terminal errors retain the
+complete/partial record and byte counts already committed. This follows Rust's
+[`Write` contract](https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.write),
+including its permitted short writes.
+
+After the cookbook prepares the recipe source, run its unit tests and the
+existing capped-file regression on the host:
+
+```sh
+cargo test --locked --manifest-path recipes/core/uutils/source/Cargo.toml -p uu_dd --lib
+cargo test --locked --manifest-path recipes/core/uutils/source/Cargo.toml \
+  --no-default-features --features dd --test tests test_dd::test_stats_are_reported_when_a_write_fails
+```
+
+The patch includes deterministic short-write, interruption, zero-progress and
+partial-error tests. The smoke image builds `uutils` from source and checks that
+`dd if=/dev/zero bs=1048576 count=4 status=none | wc -c` delivers all 4 MiB,
+reporting `FERRIC_TEST_PASS dd-pipe`. A prebuilt `uutils` package does not acquire
+this recipe patch until rebuilt. The original 64 MiB transfer failure is tracked
+in [#353](https://github.com/rexlunae/ferric-oxide/issues/353).
+
+### Native entry point and image writer
+
 The native entry point and image writer have host tests:
 
 ```sh
