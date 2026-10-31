@@ -90,16 +90,27 @@ fn read_published_completion(
 /// Completion queue
 pub struct NvmeCompQueue {
     // Size must be a power of two.
+    /// Controller-written little-endian completion slots.
     pub data: Dma<[UnsafeCell<NvmeCompWire>]>,
+    /// Next slot the host will consume.
     pub head: u16,
+    /// Publication phase expected for the current ring cycle.
     pub phase: bool,
+    /// Register acknowledging the host's consumed queue head.
     pub doorbell: &'static mut Mmio<u32>,
     last_doorbell: u16,
 }
 
 impl NvmeCompQueue {
+    /// Allocate a zeroed completion ring for this queue's doorbell.
+    ///
+    /// # Errors
+    ///
+    /// Returns a syscall error if DMA memory cannot be allocated or mapped.
     pub fn new(doorbell: &'static mut Mmio<u32>) -> Result<Self> {
         Ok(Self {
+            // SAFETY: Every wire field is an integer with valid all-zero bits.
+            // Initial zero phase tags differ from the first expected phase.
             data: unsafe { Dma::zeroed_slice(256)?.assume_init() },
             head: 0,
             phase: true,
@@ -141,6 +152,7 @@ impl NvmeCompQueue {
         ((self.head_status() & 1) != 0) == self.phase
     }
 
+    /// Acknowledge newly consumed completion slots to the controller.
     pub fn kick(&mut self) {
         if self.last_doorbell != self.head {
             self.doorbell.write(u32::from(self.head));

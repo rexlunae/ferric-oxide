@@ -903,6 +903,11 @@ that a later pass alone does not establish a fix. The deterministic regression
 and phase-first implementation address that publication race; retain the full
 profile-image smoke boot as the target check. The profile workflow also runs
 when NVMe completion/command code, the command-ID pool or the executor changes.
+The corrected native profiler image at local integration `b880ecc74737` completed
+the full KVM smoke boot, including storage stress, profile collection/flamegraph,
+fuzzing, signed package verification and shutdown. Both additional profile
+workflow checks (fox manifests and loaded-image/profile records) passed. This
+used the CI profiler/frame-pointer settings with a native source rebuild.
 
 Local validation on 31 October 2026 reproduced a first-boot `fox` database write
 stall before the fix: seven disk-ring operations remained without completions
