@@ -9,6 +9,10 @@ template = "custom"
 dependencies = [
     "zstd",
 ]
+# As a build tool this provides llvm-config, which build systems query on the
+# host for the flags of the target's LLVM (bin/${TARGET}-llvm-config), so it
+# cannot run in a guest.
+tool-runs-on = "host"
 script = """
 DYNAMIC_INIT
 ARCH="$(echo "${TARGET}" | cut -d - -f1)"
