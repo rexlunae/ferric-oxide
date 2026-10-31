@@ -27,7 +27,8 @@ Redox.
 
 Older configurations containing `kernel.pti` must remove that obsolete boolean.
 Use `kernel.cpu.kpti = "always"` to require the implemented isolation path;
-its default is `"auto"`. See [KPTI and PCID](../../docs/src/ferric-memory.md#kpti-and-pcid).
+its default is `"auto"`. See
+[KPTI and PCID](../../docs/src/ferric-memory.md#kpti-and-pcid).
 Validation rejects the removed option before generating build files.
 
 ## Using it
