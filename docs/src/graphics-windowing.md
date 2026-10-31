@@ -31,15 +31,16 @@ builds described below.
 
 On 31 October 2026, the reviewed build-fix combination
 ([#344](https://github.com/rexlunae/ferric-oxide/pull/344)–[#349](https://github.com/rexlunae/ferric-oxide/pull/349)),
-together with the NVMe command-identifier correction in
-[#352](https://github.com/rexlunae/ferric-oxide/pull/352), completed
+together with the NVMe command-identifier and cancellation-wakeup corrections in
+[#352](https://github.com/rexlunae/ferric-oxide/pull/352) and compiler-test fixture
+correction in [#354](https://github.com/rexlunae/ferric-oxide/pull/354), completed
 `COOKBOOK_MAKE_JOBS=6 cargo xtask build` on x86_64. This was an incremental
 build using existing recipe outputs; the changed base drivers rebuilt. The
 tested integration combined documentation-stack snapshot
-[`6fbb112ecb22`](https://github.com/rexlunae/ferric-oxide/commit/6fbb112ecb22de20626f80717958b426e4f550f7)
-(including build-tool policy `fd5e2fcf3991` and Mesa host LLVM `c132cc44cf46`)
+[`b7da63fdbbbb`](https://github.com/rexlunae/ferric-oxide/commit/b7da63fdbbbb34312738480378b387319c879b53)
+(including build-tool policy `2d09db4c1927` and Mesa host LLVM `4cc7fe72e662`)
 with NVMe implementation
-[`5d4e54f32175`](https://github.com/rexlunae/ferric-oxide/commit/5d4e54f321755394651fa3d5107346e020bade96).
+[`a080d862e41e`](https://github.com/rexlunae/ferric-oxide/commit/a080d862e41e34e29f0300adf2f9c5bd7631287a).
 Its headless KVM boot reached
 `redox login:` with four vCPUs and 4 GiB RAM, and a 64 MiB filesystem write
 passed full SHA256 readback against the host-computed digest. Snapshot disk
