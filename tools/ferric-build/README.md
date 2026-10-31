@@ -40,7 +40,8 @@ Tools that recipes need while building but that should not stay in the image
 there by default on a native build, in one guest environment reused for the
 whole build, so the host does not need them. Self-dependent tools and recipes
 marked `tool-runs-on = "host"` stay on the host (notably Python and LLVM).
-Cross-compiled builds use the host tools instead and warn about it. See `build.build_tools` and
+Cross-compiled builds use the host tools instead and warn about it. See
+`build.build_tools` and
 `build.keep_build_tools` in the [build chapter](../../docs/src/ferric-build.md#build-tools-in-the-guest).
 
 The initial `native` image builds the local kernel, UEFI bootloader, relibc,
@@ -96,8 +97,8 @@ Native toolchain setup uses Clang already on `PATH` and LLVM tools from rustup;
 setup does not build GCC, LLVM or Rust compilers. An image can still build LLVM
 as a package dependency: the COSMIC `wayland` configuration builds target LLVM
 for Mesa and host LLVM for `llvm-config`. See [Mesa and LLVM](../../docs/src/graphics-windowing.md#mesa-and-llvm).
-Existing target GCC runtime libraries and
-C++ headers remain necessary for the current Rust and package ABI. They are
+Existing target GCC runtime libraries and C++ headers remain necessary for the
+current Rust and package ABI. They are
 extracted from the upstream toolchain archive without installing host GCC
 executables. The `recipe` toolchain remains available for GCC-specific recipes.
 

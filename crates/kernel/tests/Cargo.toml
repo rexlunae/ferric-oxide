@@ -16,6 +16,12 @@ ferric-irq = { path = "../../irq", optional = true }
 spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin_mutex", "rwlock"] }
 
 [features]
+# Exercise both early port-I/O and late MMIO probes in the ordinary host suite.
+default = ["serial_debug", "lpss_debug"]
+# Match the actual serial module's kernel feature names; hardware access is mocked.
+serial_debug = []
+lpss_debug = []
+system76_ec_debug = []
 irq-percpu = ["dep:ferric-irq"]
 # Exercise wait-list destruction with the kernel's diagnostic enabled.
 drop_panic = []

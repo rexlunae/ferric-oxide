@@ -11,7 +11,7 @@ standalone desktop; its inherited recipes and defaults may not work.
 
 ## COSMIC build configuration
 
-After the [native build setup](./ferric-build.md), select the existing image
+On x86_64, after the [native build setup](./ferric-build.md), select the existing image
 configuration and build it:
 
 ```sh
@@ -29,55 +29,41 @@ the guest; tools that must run on the host include Python and LLVM. The build
 needs a working host C++ standard library and enough disk space for both LLVM
 builds described below.
 
-On 31 October 2026, the build-fix combination
-([#344](https://github.com/rexlunae/ferric-oxide/pull/344)–[#349](https://github.com/rexlunae/ferric-oxide/pull/349)),
-with the NVMe/executor correction
-[#352](https://github.com/rexlunae/ferric-oxide/pull/352), compiler-test fixture
-[#354](https://github.com/rexlunae/ferric-oxide/pull/354), `dd` pipe correction
-[#355](https://github.com/rexlunae/ferric-oxide/pull/355), obsolete kernel-option
-removal [#356](https://github.com/rexlunae/ferric-oxide/pull/356), and LPSS startup
-correction [#357](https://github.com/rexlunae/ferric-oxide/pull/357), completed
-`COOKBOOK_MAKE_JOBS=6 cargo xtask build` on x86_64. This was an incremental
-build using existing recipe outputs; the changed kernel, base drivers and
-`uutils` were rebuilt during validation.
+On 31 October 2026, merged main
+[`f91836459d4d`](https://github.com/rexlunae/ferric-oxide/commit/f91836459d4d4e504cfddddce83d9adce5f42fa0)
+completed `COOKBOOK_MAKE_JOBS=6 cargo xtask build` for the x86_64 `wayland`
+image. The run retained recipe caches and rebuilt both target and host LLVM,
+Mesa, COSMIC applications and the selected Wayland examples. The target LLVM
+build selected X86; the host build selected X86, AArch64, RISC-V and WebAssembly,
+as required by the Mesa query wrapper.
 
-The COSMIC validation integration `d5b2d41c4b11` included the LPSS implementation
-[`17ff802c6`](https://github.com/rexlunae/ferric-oxide/commit/17ff802c6a845c6a4f5d2f695a9cbf66852ea808), with
-`kernel.lpss_debug = true` and `kernel.cpu.kpti = "always"`. Its headless KVM
-snapshot boot, with four vCPUs and 4 GiB RAM, reported KPTI enabled and reached
-`redox login:`. A 64 MiB regular-file write and piped transfer passed byte-count,
-SHA256 and full file-comparison checks; the exact Ion `dd-pipe` smoke fragment
-also passed. Snapshot disk writes preserved the built image. Its SHA256 was
-`41110d0146ebd52bb31e2b5f57e55a4e11194b66721068585d0060a6b436c737`;
-the generated CycloneDX SBOM contained 103 components.
+The resulting image was 9,600,761,856 bytes, with SHA256
+`6efa4ba34be3765896127421ee3154fbbe28b8c3ab99c0aa938b8afe6db6feb8`.
+Its `image.cdx.json` CycloneDX SBOM contained 103 components and every package
+selected explicitly by `config/wayland.toml`.
 
-A later completion-publication correction in #352 was validated at local
-integration `b880ecc74737` by a native profiler-image source rebuild and full
-KVM smoke boot, including storage stress, profile collection and package
-verification. Both profile workflow postchecks passed, with 1,975 samples and
-zero unreadable stacks. The COSMIC image hash above records the earlier build;
-see the [NVMe validation recorded with #352](https://github.com/rexlunae/ferric-oxide/blob/bacf514ca0e577c67bda9c55d5bdd02a98fa4456/docs/src/ferric-testing.md#nvme-command-identifiers)
-for the publication regression.
+That image booted to login under headless KVM with four vCPUs and 4 GiB RAM.
+The saved configuration kept `kernel.lpss_debug = true` and
+`kernel.cpu.kpti = "always"`; the runtime banner confirmed KPTI enabled.
+A 64 MiB regular-file write and piped transfer passed byte-count, SHA256 and
+full file-comparison checks, and the exact Ion `dd-pipe` smoke fragment passed.
+Snapshot disk writes preserved the image, whose checksum was verified again
+after the guest check. The saved `ferric.toml` was unchanged.
 
-The benchmark timing correction in
-[#360](https://github.com/rexlunae/ferric-oxide/pull/360) subsequently passed all
-24 CI checks and merged. Native `ferric-smoke` validation at `cdd49290e7d8`
-included that correction with LPSS enabled and KPTI required: its full KVM
-AMD-Vi smoke boot and storage, IOMMU and timer postchecks passed. This was a
-separate smoke image; it does not change the earlier COSMIC image hash above.
+This main commit includes the merged build, NVMe completion-publication, pipe
+and LPSS startup corrections. First-failure logs are retained for the earlier
+NVMe command-ID hang, truncated pipe transfer and early LPSS MMIO panic; see
+[validation](./ferric-testing.md) for their host and guest regressions. The
+separate profiler and AMD-Vi smoke checks remain evidence for their respective
+configurations, rather than measurements of desktop performance.
 
-The first-failure logs are retained for the preceding NVMe command-ID reuse
-hang, truncated pipe transfer ([#353](https://github.com/rexlunae/ferric-oxide/issues/353))
-and early LPSS MMIO panic. The successful check includes the corresponding
-corrections above. See [validation](./ferric-testing.md) for their host and guest
-regressions.
 The graphical COSMIC session was not validated. The installed
-`orbital-wayland` script selects
-`COSMIC_BACKEND=winit`, starts `cosmic-comp` nested inside Orbital and then
-runs the libcosmic example. Mesa uses software rendering; the compositor
-recipe still records performance and keyboard-input limitations. This build
-result does not establish a usable graphical session, hardware acceleration
-or the Phase 6 exit criteria. ARM64 COSMIC image validation remains pending.
+`orbital-wayland` script selects `COSMIC_BACKEND=winit`, starts `cosmic-comp`
+nested inside Orbital and then runs the libcosmic example. Mesa uses software
+rendering; the compositor recipe still records performance and keyboard-input
+limitations. This build result does not establish a usable graphical session,
+hardware acceleration or the Phase 6 exit criteria. ARM64 COSMIC image
+validation remains pending.
 
 ## Drivers
 
