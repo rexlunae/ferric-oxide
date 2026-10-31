@@ -898,6 +898,11 @@ complete SHA256 readback matched the host-computed digest. An additional piped
 `dd` comparison delivered only 4 MiB and failed; that separate unresolved result
 is recorded in [#353](https://github.com/rexlunae/ferric-oxide/issues/353).
 This establishes local boot and file-I/O evidence, not hardware performance.
+The final combined build and boot/readback check was repeated after the
+cancellation-wakeup correction and the compiler-fixture fix in
+[#354](https://github.com/rexlunae/ferric-oxide/pull/354), at local integration
+`54c17278747c` (NVMe/executor source `a080d862e41e`). The cancellation case is
+covered by the host regression; the guest check exercises startup and file I/O.
 
 ### NVMe phase accounting
 
