@@ -23,7 +23,7 @@ use parking_lot::ReentrantMutex;
 use pcid_interface::irq_helpers::InterruptVector;
 use syscall::error::{Error, Result, EIO};
 
-use super::{CqId, Iv, Nvme, NvmeCmd, SqId, ThreadCtxt, THREAD_CTXT};
+use super::{CqId, Iv, Nvme, NvmeCmd, QueuePair, SqId, ThreadCtxt, THREAD_CTXT};
 
 impl Nvme {
     /// Asks the controller for `wanted` I/O submission and completion queues in all (the first
@@ -87,7 +87,7 @@ impl Nvme {
             // SAFETY: all-zero bytes and integers are initialized.
             buffer: RefCell::new(unsafe { Dma::zeroed()?.assume_init() }),
             buffer_prp: RefCell::new(unsafe { Dma::zeroed()?.assume_init() }),
-            queues: RefCell::new(HashMap::from([(qid, (sq, cq))])),
+            queues: RefCell::new(HashMap::from([(qid, QueuePair::new(sq, cq))])),
             io_queue: qid,
         };
         for (i, prp) in ctxt.buffer_prp.borrow_mut().iter_mut().enumerate() {
@@ -128,7 +128,7 @@ impl Nvme {
             .queues
             .borrow()
             .get(&qid)
-            .is_some_and(|(_, cq)| cq.has_entry());
+            .is_some_and(|queue| queue.completion.has_entry());
         waiting
     }
 

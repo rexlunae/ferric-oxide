@@ -1,0 +1,309 @@
+diff --git a/src/uu/dd/src/dd.rs b/src/uu/dd/src/dd.rs
+index 701c04b4c..bab13fceb 100644
+--- a/src/uu/dd/src/dd.rs
++++ b/src/uu/dd/src/dd.rs
+@@ -844,6 +844,65 @@ struct Output<'a> {
+     settings: &'a Settings,
+ }
+ 
++/// An output failure together with all bytes committed before it.
++#[derive(Debug, thiserror::Error)]
++#[error("{source}")]
++struct WriteFailure {
++    stats: WriteStat,
++    #[source]
++    source: io::Error,
++}
++
++impl WriteFailure {
++    fn statistics(error: &io::Error) -> WriteStat {
++        error
++            .get_ref()
++            .and_then(|source| source.downcast_ref::<Self>())
++            .map_or_else(WriteStat::default, |failure| failure.stats)
++    }
++}
++
++/// Complete output blocks while retaining progress if a later write fails.
++///
++/// Short writes are normal for pipes and must not depend on input flags.
++/// Unlike `write_all`, this also counts the prefix committed before an error.
++fn write_output_blocks(
++    writer: &mut impl Write,
++    buf: &[u8],
++    block_size: usize,
++) -> io::Result<WriteStat> {
++    let mut stats = WriteStat::default();
++    for chunk in buf.chunks(block_size) {
++        let mut written = 0;
++        while written < chunk.len() {
++            let result = match writer.write(&chunk[written..]) {
++                Ok(0) => Err(io::ErrorKind::WriteZero.into()),
++                result => result,
++            };
++            match result {
++                Ok(count) => {
++                    written += count;
++                    stats.bytes_total += count as u128;
++                }
++                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
++                Err(source) => {
++                    stats.writes_partial += u64::from(written != 0);
++                    return Err(io::Error::new(
++                        source.kind(),
++                        WriteFailure { stats, source },
++                    ));
++                }
++            }
++        }
++        if chunk.len() == block_size {
++            stats.writes_complete += 1;
++        } else {
++            stats.writes_partial += 1;
++        }
++    }
++    Ok(stats)
++}
++
+ impl<'a> Output<'a> {
+     /// Instantiate this struct with stdout as a destination.
+     fn new_stdout(settings: &'a Settings) -> UResult<Self> {
+@@ -978,57 +1037,9 @@ impl<'a> Output<'a> {
+         // TODO Is there a way to discard filesystem cache on other targets?
+     }
+ 
+-    /// writes a block of data. optionally retries when first try didn't complete
+-    ///
+-    /// this is needed by gnu-test: tests/dd/stats.s
+-    /// the write can be interrupted by a system signal.
+-    /// e.g. SIGUSR1 which is send to report status
+-    /// without retry, the data might not be fully written to destination.
+-    fn write_block(&mut self, chunk: &[u8]) -> io::Result<usize> {
+-        let full_len = chunk.len();
+-        let mut base_idx = 0;
+-        loop {
+-            match self.dst.write(&chunk[base_idx..]) {
+-                Ok(wlen) => {
+-                    base_idx += wlen;
+-                    // take iflags.fullblock as oflags shall not have this option
+-                    if (base_idx >= full_len) || !self.settings.iflags.fullblock {
+-                        return Ok(base_idx);
+-                    }
+-                }
+-                Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
+-                Err(e) => return Err(e),
+-            }
+-        }
+-    }
+-
+-    /// Write the given bytes one block at a time.
+-    ///
+-    /// This may write partial blocks (for example, if the underlying
+-    /// call to [`Write::write`] writes fewer than `buf.len()`
+-    /// bytes). The returned [`WriteStat`] object will include the
+-    /// number of partial and complete blocks written during execution
+-    /// of this function.
++    /// Complete every output block, or return an error carrying committed progress.
+     fn write_blocks(&mut self, buf: &[u8]) -> io::Result<WriteStat> {
+-        let mut writes_complete = 0;
+-        let mut writes_partial = 0;
+-        let mut bytes_total = 0;
+-
+-        for chunk in buf.chunks(self.settings.obs) {
+-            let wlen = self.write_block(chunk)?;
+-            if wlen < self.settings.obs {
+-                writes_partial += 1;
+-            } else {
+-                writes_complete += 1;
+-            }
+-            bytes_total += wlen;
+-        }
+-
+-        Ok(WriteStat {
+-            writes_complete,
+-            writes_partial,
+-            bytes_total: bytes_total.try_into().unwrap_or(0u128),
+-        })
++        write_output_blocks(&mut self.dst, buf, self.settings.obs)
+     }
+ 
+     /// Flush the output to disk, if configured to do so.
+@@ -1259,8 +1270,14 @@ fn dd_copy(mut i: Input, o: Output) -> io::Result<()> {
+             }
+             break;
+         }
+-        let Ok(wstat_update) = o.write_blocks(data).map_err(|e| copy_error = Some(e)) else {
+-            break;
++        let wstat_update = match o.write_blocks(data) {
++            Ok(stats) => stats,
++            Err(error) => {
++                rstat += rstat_update;
++                wstat += WriteFailure::statistics(&error);
++                copy_error = Some(error);
++                break;
++            }
+         };
+ 
+         // Discard the system file cache for the read portion of
+@@ -1325,34 +1342,32 @@ fn dd_copy(mut i: Input, o: Output) -> io::Result<()> {
+ fn finalize<T>(
+     mut output: BlockWriter,
+     rstat: ReadStat,
+-    wstat: WriteStat,
++    mut wstat: WriteStat,
+     start: Instant,
+     prog_tx: &mpsc::Sender<ProgUpdate>,
+     output_thread: thread::JoinHandle<T>,
+     truncate: bool,
+ ) -> io::Result<()> {
+-    // Flush the output in case a partial write has been buffered but
+-    // not yet written.
+-    let wstat_update = output.flush()?;
+-
+-    // Sync the output, if configured to do so.
+-    output.sync()?;
+-
+-    // Truncate the file to the final cursor location.
+-    if truncate {
+-        output.truncate()?;
+-    }
++    // Report committed bytes even if a final buffered write, sync or truncate fails.
++    let result = match output.flush() {
++        Ok(update) => {
++            wstat += update;
++            output
++                .sync()
++                .and_then(|()| if truncate { output.truncate() } else { Ok(()) })
++        }
++        Err(error) => {
++            wstat += WriteFailure::statistics(&error);
++            Err(error)
++        }
++    };
+ 
+-    // Print the final read/write statistics.
+-    let wstat = wstat + wstat_update;
+     let prog_update = ProgUpdate::new(rstat, wstat, start.elapsed(), ProgUpdateType::Final);
+     prog_tx.send(prog_update).unwrap_or(());
+-    // Wait for the output thread to finish
+     output_thread
+         .join()
+         .expect("Failed to join with the output thread.");
+-
+-    Ok(())
++    result
+ }
+ 
+ #[cfg(any(target_os = "linux", target_os = "android"))]
+@@ -1616,6 +1631,98 @@ mod tests {
+     use crate::{Output, Parser, calc_bsize};
+ 
+     use std::path::Path;
++    use std::{collections::VecDeque, io};
++
++    use crate::{WriteFailure, write_output_blocks};
++
++    struct ShortWriter {
++        steps: VecDeque<Result<usize, io::ErrorKind>>,
++        bytes: Vec<u8>,
++        calls: usize,
++    }
++
++    impl io::Write for ShortWriter {
++        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++            self.calls += 1;
++            let count = self
++                .steps
++                .pop_front()
++                .unwrap_or(Ok(buf.len()))
++                .map_err(io::Error::from)?
++                .min(buf.len());
++            self.bytes.extend_from_slice(&buf[..count]);
++            Ok(count)
++        }
++
++        fn flush(&mut self) -> io::Result<()> {
++            Ok(())
++        }
++    }
++
++    fn short_writer(steps: impl IntoIterator<Item = Result<usize, io::ErrorKind>>) -> ShortWriter {
++        ShortWriter {
++            steps: steps.into_iter().collect(),
++            bytes: Vec::new(),
++            calls: 0,
++        }
++    }
++
++    #[test]
++    fn short_output_writes_preserve_every_byte_and_record() {
++        let data: Vec<u8> = (0..17).collect();
++        let mut writer = short_writer([
++            Ok(2),
++            Err(io::ErrorKind::Interrupted),
++            Ok(1),
++            Ok(5),
++            Ok(3),
++            Ok(5),
++            Ok(1),
++        ]);
++        let stats = write_output_blocks(&mut writer, &data, 8).unwrap();
++        assert_eq!(writer.bytes, data);
++        assert_eq!(
++            (
++                stats.writes_complete,
++                stats.writes_partial,
++                stats.bytes_total
++            ),
++            (2, 1, 17)
++        );
++    }
++
++    #[test]
++    fn output_error_keeps_completed_and_partial_progress() {
++        let data: Vec<u8> = (0..20).collect();
++        for error in [io::ErrorKind::BrokenPipe, io::ErrorKind::WriteZero] {
++            let stop = if error == io::ErrorKind::WriteZero {
++                Ok(0)
++            } else {
++                Err(error)
++            };
++            let mut writer = short_writer([Ok(8), Ok(3), stop]);
++            let failure = write_output_blocks(&mut writer, &data, 8).unwrap_err();
++            assert_eq!(failure.kind(), error);
++            let stats = WriteFailure::statistics(&failure);
++            assert_eq!(
++                (
++                    stats.writes_complete,
++                    stats.writes_partial,
++                    stats.bytes_total
++                ),
++                (1, 1, 11)
++            );
++            assert_eq!(writer.bytes, &data[..11]);
++        }
++    }
++
++    #[test]
++    fn empty_output_does_not_issue_a_zero_length_write() {
++        let mut writer = short_writer([Ok(0)]);
++        let stats = write_output_blocks(&mut writer, &[], 8).unwrap();
++        assert_eq!(stats.bytes_total, 0);
++        assert_eq!(writer.calls, 0);
++    }
+ 
+     /// `dd` has to accept a `bs=` far larger than the data it will copy, the
+     /// way GNU dd does, so the copy buffer must not fault in its pages.
+diff --git a/src/uu/dd/src/progress.rs b/src/uu/dd/src/progress.rs
+index 45786850c..bf6d043c2 100644
+--- a/src/uu/dd/src/progress.rs
++++ b/src/uu/dd/src/progress.rs
+@@ -337,7 +337,7 @@ impl std::ops::AddAssign for ReadStat {
+ ///
+ /// This contains information about the number of blocks written to
+ /// the output file and the total number of bytes written.
+-#[derive(Clone, Copy, Default)]
++#[derive(Clone, Copy, Debug, Default)]
+ pub(crate) struct WriteStat {
+     /// The number of complete blocks that have been written.
+     pub(crate) writes_complete: u64,

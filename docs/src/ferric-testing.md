@@ -650,6 +650,43 @@ include old Redox versions and are not validation of current Ferric features.
 
 ## Native build checks
 
+### Coreutils pipe transfers
+
+The `uutils` recipe applies `dd-short-writes.patch` to retain every byte when an
+output write accepts only part of a block. `iflag=fullblock` controls input reads;
+it is not required to complete output writes. Interrupted writes resume at the
+unwritten suffix, zero-progress writes fail, and terminal errors retain the
+complete/partial record and byte counts already committed. This follows Rust's
+[`Write` contract](https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.write),
+including its permitted short writes.
+
+After the cookbook prepares the recipe source, run its unit tests and the
+existing capped-file regression on the host:
+
+```sh
+cargo test --locked --manifest-path recipes/core/uutils/source/Cargo.toml -p uu_dd --lib
+cargo test --locked --manifest-path recipes/core/uutils/source/Cargo.toml \
+  --no-default-features --features dd --test tests test_dd::test_stats_are_reported_when_a_write_fails
+```
+
+The patch includes deterministic short-write, interruption, zero-progress and
+partial-error tests. The smoke image builds `uutils` from source and checks that
+`dd if=/dev/zero bs=1048576 count=4 status=none | wc -c` delivers all 4 MiB,
+reporting `FERRIC_TEST_PASS dd-pipe`. A prebuilt `uutils` package does not acquire
+this recipe patch until rebuilt. The original 64 MiB transfer failure is tracked
+in [#353](https://github.com/rexlunae/ferric-oxide/issues/353).
+
+Local validation on 31 October 2026 rebuilt the combined x86_64 `wayland` image
+through `cargo xtask build` at integration `6b6fbdf88068`. It reached login under
+KVM with four vCPUs and 4 GiB of memory, using snapshot disk writes. The default
+64 MiB `dd` pipe delivered 67,108,864 bytes, matched the expected SHA256, and
+compared equal to a separately written regular file. The exact Ion smoke-test
+fragment above also passed. Before the patch, the same default pipe delivered
+only 4 MiB. This validates the local pipe correction; a graphical COSMIC session
+and hardware performance remain untested.
+
+### Native entry point and image writer
+
 The native entry point and image writer have host tests:
 
 ```sh
@@ -867,6 +904,65 @@ locked client. The retry remains correct for legitimate signal interruptions.
 Repeat image boots and repeated `ferric-blkgrant-test` worker-policy runs
 exercise the real parking/handoff path; retain the first failure and its logs.
 Linux KVM/Kleya confirmation remains required.
+
+### NVMe command identifiers
+
+`cargo test --locked -p ferric-blkqueue` tests the identifier pool used by every
+NVMe queue pair. The regressions retain commands while submission positions wrap,
+complete commands out of order, cross the entire 16-bit identifier range while
+one command remains outstanding, exhaust and resume the pool, reject duplicate
+completions, and keep queue pairs independent. The pool is also checked without
+`std` or `alloc`; its doctest and strict Clippy/Rustdoc checks run in host-tools CI.
+`cargo test --locked -p ferric-exec-core --test driver_completion` compiles the
+driver's actual completion dispatch on the host: live completions wake their
+owner and one FIFO submitter, cancelled completions still wake a submitter,
+and empty queues do not produce extra wakeups. The same tests run in the
+`executor` package.
+
+The driver job compiles the default NVMe driver, `perf`, and
+`perf,percore,grant-dma` configurations. The target check remains an image build
+and a boot with writes large enough to reuse submission positions, followed by
+filesystem readback. Preserve a failing boot's first serial log and NMI context
+dump rather than treating a later successful boot as proof the failure was fixed.
+
+The NVMe package's host tests also cover completion publication:
+`cargo test --locked --manifest-path userspace/base/Cargo.toml -p nvmed`.
+A deterministic controller publishes a new completion between a premature
+payload read and the phase read, for both phase values. Reading the phase first
+must deliver the new command identifier; an unpublished slot must not be read.
+A byte fixture checks the generated little-endian completion layout.
+
+The profile-image boot at `95b031f0e` retained a driver abort during storage
+stress on a completion whose command identifier was not outstanding.
+The old x86-64 binary loaded the CID before status; its phase check therefore
+could accept a torn snapshot. One unmodified local boot also passed, confirming
+that a later pass alone does not establish a fix. The deterministic regression
+and phase-first implementation address that publication race; retain the full
+profile-image smoke boot as the target check. The profile workflow also runs
+when NVMe completion/command code, the command-ID pool or the executor changes.
+The corrected native profiler image at local integration `b880ecc74737` completed
+the full KVM smoke boot, including storage stress, profile collection/flamegraph,
+fuzzing, signed package verification and shutdown. Both additional profile
+workflow checks (fox manifests and loaded-image/profile records) passed. This
+used the CI profiler/frame-pointer settings with a native source rebuild.
+
+Local validation on 31 October 2026 reproduced a first-boot `fox` database write
+stall before the fix: seven disk-ring operations remained without completions
+after the NVMe hardware queues and executor completion maps had drained. With
+the identifier fix in [#352](https://github.com/rexlunae/ferric-oxide/pull/352),
+the combined x86_64 `wayland` image built and reached login under KVM (four
+vCPUs, 4 GiB, snapshot disk writes). A 64 MiB regular-file write followed by a
+complete SHA256 readback matched the host-computed digest. An additional piped
+`dd` comparison delivered only 4 MiB and failed, exposing the separate output
+short-write bug in [#353](https://github.com/rexlunae/ferric-oxide/issues/353).
+The recipe correction and successful full-transfer checks are documented under
+[Coreutils pipe transfers](#coreutils-pipe-transfers).
+This establishes local boot and file-I/O evidence, not hardware performance.
+The final combined build and boot/readback check was repeated after the
+cancellation-wakeup correction and the compiler-fixture fix in
+[#354](https://github.com/rexlunae/ferric-oxide/pull/354), at local integration
+`54c17278747c` (NVMe/executor source `a080d862e41e`). The cancellation case is
+covered by the host regression; the guest check exercises startup and file I/O.
 
 ### NVMe phase accounting
 
