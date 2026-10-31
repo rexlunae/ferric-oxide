@@ -7,7 +7,7 @@ shallow_clone = true
 [build]
 template = "python"
 dev-dependencies = [
-    "python3-setuptools",
+    "host:python3-setuptools",
     "host:python312",
     "python312",
 ]
