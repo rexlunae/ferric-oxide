@@ -3,9 +3,67 @@
 Orbital remains the inherited default desktop, but is deprecated for new
 Ferric Oxide graphics development. The replacement direction is Wayland with
 Smithay, Mesa and Xwayland, as described in [Phase 6 of the roadmap](./ferric-roadmap.md#phase-6-graphics-and-desktop).
-Implementation is deferred until the current PR backlog is merged. Orbital is
-not planned to be brought up to a working or supported state; existing recipes
-and image defaults remain only as legacy artifacts and may not work.
+COSMIC remains an optional desktop choice to support. Its experimental image
+configuration currently uses Orbital to host a nested compositor; this is a
+build bring-up path, and the accelerated display stack remains future work.
+Orbital is not planned to be brought up to a working or supported state as a
+standalone desktop; its inherited recipes and defaults may not work.
+
+## COSMIC build configuration
+
+On x86_64, after the [native build setup](./ferric-build.md), select the existing image
+configuration and build it:
+
+```sh
+cargo run -p ferric-config -- set image.config wayland
+cargo xtask build
+cargo xtask run --no-build
+```
+
+The `image.config` option in `features.toml` selects `config/wayland.toml`.
+That configuration includes `cosmic-comp`, `cosmic-app-library`, the
+`libcosmic-wayland` example, GTK and Mesa, together with the inherited desktop
+packages. It does not install the complete COSMIC shell, panel and applet set.
+`build.build_tools = "guest"` runs eligible build tools such as `gperf` in
+the guest; tools that must run on the host include Python and LLVM. The build
+needs a working host C++ standard library and enough disk space for both LLVM
+builds described below.
+
+On 31 October 2026, merged main
+[`f91836459d4d`](https://github.com/rexlunae/ferric-oxide/commit/f91836459d4d4e504cfddddce83d9adce5f42fa0)
+completed `COOKBOOK_MAKE_JOBS=6 cargo xtask build` for the x86_64 `wayland`
+image. The run retained recipe caches and rebuilt both target and host LLVM,
+Mesa, COSMIC applications and the selected Wayland examples. The target LLVM
+build selected X86; the host build selected X86, AArch64, RISC-V and WebAssembly,
+as required by the Mesa query wrapper.
+
+The resulting image was 9,600,761,856 bytes, with SHA256
+`6efa4ba34be3765896127421ee3154fbbe28b8c3ab99c0aa938b8afe6db6feb8`.
+Its `image.cdx.json` CycloneDX SBOM contained 103 components and every package
+selected explicitly by `config/wayland.toml`.
+
+That image booted to login under headless KVM with four vCPUs and 4 GiB RAM.
+The saved configuration kept `kernel.lpss_debug = true` and
+`kernel.cpu.kpti = "always"`; the runtime banner confirmed KPTI enabled.
+A 64 MiB regular-file write and piped transfer passed byte-count, SHA256 and
+full file-comparison checks, and the exact Ion `dd-pipe` smoke fragment passed.
+Snapshot disk writes preserved the image, whose checksum was verified again
+after the guest check. The saved `ferric.toml` was unchanged.
+
+This main commit includes the merged build, NVMe completion-publication, pipe
+and LPSS startup corrections. First-failure logs are retained for the earlier
+NVMe command-ID hang, truncated pipe transfer and early LPSS MMIO panic; see
+[validation](./ferric-testing.md) for their host and guest regressions. The
+separate profiler and AMD-Vi smoke checks remain evidence for their respective
+configurations, rather than measurements of desktop performance.
+
+The graphical COSMIC session was not validated. The installed
+`orbital-wayland` script selects `COSMIC_BACKEND=winit`, starts `cosmic-comp`
+nested inside Orbital and then runs the libcosmic example. Mesa uses software
+rendering; the compositor recipe still records performance and keyboard-input
+limitations. This build result does not establish a usable graphical session,
+hardware acceleration or the Phase 6 exit criteria. ARM64 COSMIC image
+validation remains pending.
 
 ## Drivers
 

@@ -708,6 +708,10 @@ fragment above also passed. Before the patch, the same default pipe delivered
 only 4 MiB. This validates the local pipe correction; a graphical COSMIC session
 and hardware performance remain untested.
 
+The final COSMIC image was rebuilt and rechecked from merged main after the
+implementation fixes landed; its source commit, image checksum and boot/I/O
+evidence are recorded under [COSMIC build configuration](./graphics-windowing.md#cosmic-build-configuration).
+
 ### Native entry point and image writer
 
 The native entry point and image writer have host tests:
