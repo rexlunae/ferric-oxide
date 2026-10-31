@@ -725,20 +725,6 @@ rebuild = ["kernel"]
 help = "Use the KVM paravirtualized clock when running under KVM."
 
 [[option]]
-id = "kernel.pti"
-menu = "kernel"
-type = "bool"
-title = "Page table isolation (KPTI)"
-default = false
-depends = "target.arch == 'x86_64'"
-experimental = true
-kernel_feature = "pti"
-rebuild = ["kernel"]
-help = """
-Unmap the kernel from user page tables (Meltdown mitigation). Upstream
-marks this broken with threading; enable only to test it."""
-
-[[option]]
 id = "kernel.serial_debug"
 menu = "kernel"
 type = "bool"
