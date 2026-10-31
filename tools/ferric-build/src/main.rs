@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, ExitStatus};
+use std::process::{Command, ExitCode, ExitStatus, Stdio};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use thiserror::Error;
@@ -153,6 +153,10 @@ enum BuildError {
         .0.join(", ")
     )]
     MissingPrograms(Vec<&'static str>),
+    #[error(
+        "the host C++ compiler cannot build a program that uses the C++ standard library:\n{diagnostic}\nClang uses the newest GCC installation it finds (`clang++ -v` names it); install that version's libstdc++ development package (for example libstdc++-16-dev for GCC 16)"
+    )]
+    HostCxx { diagnostic: String },
     #[error("cannot decode ferric-config's CPU variant plan")]
     VariantPlan {
         #[source]
@@ -290,10 +294,54 @@ fn doctor(arch: Architecture, podman: bool) -> Result<()> {
             ),
         }
     }
-    if missing.is_empty() {
+    if !missing.is_empty() {
+        return Err(BuildError::MissingPrograms(missing));
+    }
+    // Host recipes compile C++ with the host's clang++; recipes in Podman use
+    // the container's compiler instead.
+    if !podman {
+        check_host_cxx()?;
+        eprintln!("clang++: builds C++ standard library programs");
+    }
+    Ok(())
+}
+
+/// Checks that the host's `clang++` finds the C++ standard library headers.
+///
+/// # Errors
+/// [`BuildError::HostCxx`] with the compiler's diagnostic when it cannot, and
+/// [`BuildError::Start`] when it cannot be started.
+fn check_host_cxx() -> Result<()> {
+    let mut child = Command::new("clang++")
+        .args(["-x", "c++", "-fsyntax-only", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| BuildError::Start {
+            program: "clang++".into(),
+            source,
+        })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(b"#include <memory>\nint main() { return *std::make_unique<int>(0); }\n")
+            .map_err(|source| BuildError::Start {
+                program: "clang++".into(),
+                source,
+            })?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|source| BuildError::Start {
+            program: "clang++".into(),
+            source,
+        })?;
+    if output.status.success() {
         Ok(())
     } else {
-        Err(BuildError::MissingPrograms(missing))
+        Err(BuildError::HostCxx {
+            diagnostic: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
     }
 }
 

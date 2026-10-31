@@ -29,7 +29,11 @@ native C/C++ compiler and SDK (Xcode Command Line Tools on macOS) and QEMU
 Application packages build from source, so the build machine also needs the
 programs recipes run (Autoconf, Automake, Meson, CMake, Ninja and others; see
 [Prerequisites](../../docs/src/building-redox.md#prerequisites)). `doctor`, which
-`setup` runs first, fails listing every missing one.
+`setup` runs first, fails listing every missing one. It also compiles a small
+C++ program with the host's `clang++`, because host recipes need the C++
+standard library headers. Clang uses the newest GCC installation it finds, so a
+machine with a newer GCC runtime than its libstdc++ development package fails
+there.
 
 Tools that recipes need while building but that should not stay in the image
 (`build.dev-dependencies`, the `host:` recipes) are built for the guest and run
