@@ -347,12 +347,12 @@ pub fn build(
         if have_toolchain {
             build_deps_dir(logger, &toolchain_dir, &dep_host_pkgars)?
         } else {
-            true
+            drop_stale_deps_dir(&toolchain_dir)?
         },
         if have_guest_tools {
             build_deps_dir(logger, &guest_tools_dir, &dep_guest_tool_pkgars)?
         } else {
-            true
+            drop_stale_deps_dir(&guest_tools_dir)?
         },
     );
 
@@ -382,16 +382,10 @@ pub fn build(
             if toolchain_cached && have_toolchain {
                 fs::remove_all(&toolchain_dir)?;
                 build_deps_dir(logger, &toolchain_dir, &dep_host_pkgars)?;
-            } else if !have_toolchain && toolchain_dir.is_dir() {
-                // No toolchain applies, so a leftover one from host tools would
-                // put host-built libraries in front of the target ones.
-                fs::remove_all(&toolchain_dir)?;
             }
             if guest_tools_cached && have_guest_tools {
                 fs::remove_all(&guest_tools_dir)?;
                 build_deps_dir(logger, &guest_tools_dir, &dep_guest_tool_pkgars)?;
-            } else if !have_guest_tools && guest_tools_dir.is_dir() {
-                fs::remove_all(&guest_tools_dir)?;
             }
         }
     } else {
@@ -831,6 +825,27 @@ fn shell_quote(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Removes `deps_dir` when the recipe no longer has packages for it, and says
+/// whether it was already absent.
+///
+/// A directory left by an earlier build would still be used: a leftover
+/// `toolchain` puts host-built libraries in front of the target ones, and a
+/// leftover `guest-tools` keeps generating shims for a tool that now runs on the
+/// host, ahead of its host binary. Finding one means the recipe's dependencies
+/// changed, so it reports the build as not cached.
+///
+/// # Errors
+/// Returns an error when the directory exists and cannot be removed.
+#[allow(clippy::result_large_err)]
+fn drop_stale_deps_dir(deps_dir: &Path) -> Result<bool> {
+    if deps_dir.exists() {
+        fs::remove_all(deps_dir)?;
+        Ok(false)
+    } else {
+        Ok(true)
+    }
+}
+
 fn build_deps_dir(
     logger: &PtyOut,
     deps_dir: &PathBuf,
@@ -1054,6 +1069,20 @@ fn hint_incorrect_pkey(logger: &PtyOut, source_pubkey: &Path, source_pkgar: &Pat
 
 #[cfg(test)]
 mod tests {
+    /// A tool that moved from the guest to the host leaves its `guest-tools`
+    /// directory behind. It must go, and its going counts as a dependency
+    /// change, or its shims would shadow the host binary.
+    #[test]
+    fn a_leftover_deps_dir_is_removed_and_invalidates_the_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let guest_tools = temp.path().join("guest-tools");
+        std::fs::create_dir_all(guest_tools.join("bin")).unwrap();
+        std::fs::write(guest_tools.join("bin/python3.12"), "").unwrap();
+        assert!(!super::drop_stale_deps_dir(&guest_tools).unwrap());
+        assert!(!guest_tools.exists());
+        assert!(super::drop_stale_deps_dir(&guest_tools).unwrap());
+    }
+
     use fox_core::cookbook::RecipeName;
     use std::os::unix;
     use std::os::unix::fs::PermissionsExt;

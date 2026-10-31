@@ -416,9 +416,11 @@ With `guest`, `mk/fstools.mk` installs one guest build environment per
 configuration under `build/<arch>/<config>/build-tools/` and reuses it for the
 whole image build instead of booting a guest per tool. It is keyed on the tool
 list and the repository's `Cargo.lock`, so a later build reuses it until either
-changes. That list comes from `repo build-tools-list`, which prints the
-recursive `build.dev-dependencies` of the image's package set, one recipe per
-line. `build.guest_env` enables the reuse and is active whenever
+changes. That list comes from `repo build-tools-list`, one recipe per line. It
+resolves the image's recipes as `repo cook-list` does and prints every `host:`
+recipe in the result that is built for the target: the tools of the image's
+packages, of their dependencies and of other tools. A tool that runs on the host
+(see below) is left out. `build.guest_env` enables the reuse and is active whenever
 `build.build_tools = "guest"`.
 
 The environment directory holds everything a later build compares: the tool list
