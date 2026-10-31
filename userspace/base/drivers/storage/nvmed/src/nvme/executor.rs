@@ -62,7 +62,9 @@ impl Hardware for NvmeHw {
                 queue.submission.head = cqe.sq_head;
                 assert!(
                     queue.command_ids.release(cqe.cid),
-                    "nvmed: completion must identify an outstanding command"
+                    "nvmed: completion must identify an outstanding command: cq={sq_cq_id} cid={} status={:#06x}",
+                    cqe.cid,
+                    cqe.status,
                 );
                 handle(*sq_cq_id, cqe);
             }
