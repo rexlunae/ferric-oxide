@@ -49,6 +49,10 @@ The [`image_size`](src/size.rs) function is the library entry point.
 ## Images without FUSE or root privileges
 
 `--no-mount` builds a staging tree and writes it through the Rust RedoxFS API.
+The tree is staged beside the output image, as `.<image name>.staging`, and
+removed afterwards. It is as large as the image's contents, so it goes on the
+filesystem that holds the image rather than in `/tmp`, which is often a small
+RAM-backed tmpfs.
 Guest ownership is recorded during installation and applied inside the image;
 it does not require changing host file ownership. Package files default to
 guest root, while explicit file declarations and account homes retain their

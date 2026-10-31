@@ -563,6 +563,34 @@ where
     callback(fs)
 }
 
+/// Where a `no_mount` install stages the tree it then archives into `image`.
+///
+/// It sits beside the image, on the filesystem that has to hold the image
+/// anyway: the tree is as large as the image's contents, which can be many
+/// gigabytes, and `/tmp` is often a small RAM-backed tmpfs. A tree left behind
+/// by an interrupted install is removed first.
+///
+/// # Errors
+/// Returns an error when `image` names no file, or a leftover tree cannot be
+/// removed.
+fn staging_dir(image: &Path) -> Result<PathBuf> {
+    let name = image
+        .file_name()
+        .with_context(|| format!("{} names no image file", image.display()))?;
+    let mut staging_name = std::ffi::OsString::from(".");
+    staging_name.push(name);
+    staging_name.push(".staging");
+    let staging = image.with_file_name(staging_name);
+    match fs::remove_dir_all(&staging) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("removing {}", staging.display()));
+        }
+    }
+    Ok(staging)
+}
+
 fn decide_mount_path(mount_path: Option<&Path>) -> PathBuf {
     let mount_path = mount_path.map(|p| p.to_path_buf()).unwrap_or_else(|| {
         PathBuf::from(if cfg!(target_os = "redox") {
@@ -1199,9 +1227,15 @@ fn install_inner(config: Config, output: &Path) -> Result<()> {
             efi_partition_path: efi_partition_path.as_ref().map(|s| s.as_str()),
             skip_partitions: config.general.skip_partitions.unwrap_or(false),
         };
+        let staging = config
+            .general
+            .no_mount
+            .unwrap_or(false)
+            .then(|| staging_dir(output))
+            .transpose()?;
         with_whole_disk(output, &disk_option, move |fs| {
-            if config.general.no_mount.unwrap_or(false) {
-                with_redoxfs_ar_owned(fs, None, move |mount_path| {
+            if let Some(staging) = staging {
+                with_redoxfs_ar_owned(fs, Some(&staging), move |mount_path| {
                     install_dir_unprivileged(config, mount_path, cookbook)
                 })
             } else {
@@ -1228,6 +1262,22 @@ pub fn install(config: Config, output: impl AsRef<Path>) -> Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The staging tree goes beside the image, not in /tmp, and a tree an
+    /// interrupted install left there is cleared.
+    #[test]
+    fn staging_is_beside_the_image_and_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("harddrive.img");
+        let leftover = dir.path().join(".harddrive.img.staging/usr/bin");
+        fs::create_dir_all(&leftover).unwrap();
+        fs::write(leftover.join("stale"), b"x").unwrap();
+
+        let staging = staging_dir(&image).unwrap();
+        assert_eq!(staging, dir.path().join(".harddrive.img.staging"));
+        assert!(!staging.exists());
+        assert!(staging_dir(Path::new("/")).is_err());
+    }
 
     /// A cookbook checkout with a signing key and a repository holding
     /// `app` (which needs `lib`) and `lib`.
