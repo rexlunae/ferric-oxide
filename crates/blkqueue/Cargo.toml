@@ -12,5 +12,5 @@ default = []
 ## The table of descriptor openers (`openers`) and the close gate (`order`), which need a
 ## heap.
 alloc = []
-## The job result slot (`slot`), which needs threads and locks.
+## The job result slot (`slot`) and synchronized benchmark runner (`round`).
 std = ["alloc"]

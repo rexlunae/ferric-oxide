@@ -23,6 +23,8 @@
 //!   requests are done, for a scheme that serves requests concurrently.
 //! - `slot` (with the `std` feature) is a job's result slot between the thread that waits
 //!   and the worker that runs it, which settles once, done or abandoned.
+//! - `round` (with `std`) starts benchmark clocks once all submitters are ready
+//!   and stops them before thread teardown.
 //!
 //! # Examples
 //!
@@ -51,6 +53,8 @@ pub mod ids;
 pub mod openers;
 #[cfg(feature = "alloc")]
 pub mod order;
+#[cfg(feature = "std")]
+pub mod round;
 #[cfg(feature = "std")]
 pub mod slot;
 pub mod timing;

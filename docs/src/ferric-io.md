@@ -325,7 +325,12 @@ With `drivers.nvme_percore` (off by default; needs `kernel.irq_percpu`),
 `ferric-blkgrant-test` prints `FERRIC_BENCH nvme-read-4k-t<N>` with the
 throughput of 4 KiB `pread`s from 1, 2 and 4 threads at once. It is a
 same-boot A/B: three rounds of each queue policy in alternating order, or
-nine when the first three fail (see below). It reports the medians (`copy_iops` for the default policy, `single_iops` for
+nine when the first three fail (see below). Buffers are prepared before the
+round, all submitters wait at the shared `ferric_blkqueue::round` start gate,
+and timing ends at the last completed read before buffer destruction and
+thread joining. The iobench runner uses that same gate. Per-round
+`FERRIC_BENCH_SAMPLE` lines are emitted after measurement, retaining the paired
+policy order for diagnosis. It reports the medians (`copy_iops` for the default policy, `single_iops` for
 `MainQueue`, `workers_iops` for `Workers`) and the verdict of
 `ferric_blkqueue::ab`. Rounds are paired: the median of the default's
 per-round ratio to the single queue (`ab_ratio`, which cancels drift during
@@ -334,9 +339,13 @@ and 15%). When the first three rounds fail, the benchmark runs six more
 rounds of each policy and decides on all nine (`ab_rounds` says how many ran).
 A round whose single queue measured nothing counts as a tie if the default
 measured nothing too, and as a win for the default otherwise. While the scheme serves one call at a
-time, `Adaptive` runs exactly the `MainQueue` path, and one unlucky round
-used to fail the boot. With the extra rounds, identical code passes, while a
-default that is slower in every round still fails. Runner hardware varies
+time, `Adaptive` runs exactly the `MainQueue` path. The earlier runner included
+thread creation, buffer allocation and thread teardown in its I/O clock. A
+nine-round AMD-Vi gate failure exposed this measurement gap, tracked in
+[#359](https://github.com/rexlunae/ferric-oxide/issues/359). The synchronized runner
+excludes those costs; the tolerance and confirmation rule remain unchanged and
+still reject slower candidates. That correction alone does not establish the
+cause of the original failure. Runner hardware varies
 about 2x between CI jobs, so numbers from different runs make a poor gate.
 CI fails a boot whose line says `ab=fail`.
 
