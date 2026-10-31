@@ -7,6 +7,7 @@ use std::sync::Arc;
 use common::dma::Dma;
 use common::io::{Io, Mmio};
 use common::timeout::Timeout;
+use ferric_blkqueue::command_ids::CommandIds;
 use parking_lot::{Mutex, ReentrantMutex, RwLock};
 use pcid_interface::irq_helpers::InterruptVector;
 use pcid_interface::PciFunctionHandle;
@@ -130,10 +131,26 @@ pub struct ThreadCtxt {
 
     // Yes, technically NVME allows multiple submission queues to be mapped to the same completion
     // queue, but we don't use that feature.
-    queues: RefCell<HashMap<u16, (NvmeCmdQueue, NvmeCompQueue)>>,
+    queues: RefCell<HashMap<u16, QueuePair>>,
 
     /// Ferric Oxide: the I/O submission queue this thread's reads and writes go to.
     io_queue: SqId,
+}
+
+struct QueuePair {
+    submission: NvmeCmdQueue,
+    completion: NvmeCompQueue,
+    command_ids: CommandIds,
+}
+
+impl QueuePair {
+    fn new(submission: NvmeCmdQueue, completion: NvmeCompQueue) -> Self {
+        Self {
+            submission,
+            completion,
+            command_ids: CommandIds::new(),
+        }
+    }
 }
 
 impl ThreadCtxt {
@@ -143,24 +160,29 @@ impl ThreadCtxt {
         cmd_init: impl FnOnce(CmdId) -> NvmeCmd,
         fail: impl FnOnce(),
     ) -> Option<(CqId, CmdId)> {
-        match self.queues.borrow_mut().get_mut(&sq_id).unwrap() {
-            (sq, _cq) => {
-                if sq.is_full() {
-                    fail();
-                    return None;
-                }
-                let cmd_id = sq.tail;
-                let _tail = sq.submit_unchecked(cmd_init(cmd_id));
-
-                Some((sq_id, cmd_id))
-            }
+        let mut queues = self.queues.borrow_mut();
+        let queue = queues
+            .get_mut(&sq_id)
+            .expect("submission queue is registered before use");
+        if queue.submission.is_full() {
+            fail();
+            return None;
         }
+        let Some(cmd_id) = queue.command_ids.allocate() else {
+            fail();
+            return None;
+        };
+        queue.submission.submit_unchecked(cmd_init(cmd_id));
+        Some((sq_id, cmd_id))
     }
 
     pub fn submit(&self, sq_id: SqId) {
-        match self.queues.borrow_mut().get_mut(&sq_id).unwrap() {
-            (sq, _cq) => sq.kick(),
-        }
+        self.queues
+            .borrow_mut()
+            .get_mut(&sq_id)
+            .expect("submission queue is registered before use")
+            .submission
+            .kick();
     }
 }
 
@@ -309,7 +331,7 @@ impl Nvme {
             cc |= (4 << 20) | (6 << 16);
             regs.cc.write(cc);
 
-            queues.insert(0, (asq, acq));
+            queues.insert(0, QueuePair::new(asq, acq));
         }
 
         log::debug!("Enabling controller.");
@@ -499,7 +521,7 @@ impl Nvme {
             .lock()
             .queues
             .borrow_mut()
-            .insert(1, (sq, cq));
+            .insert(1, QueuePair::new(sq, cq));
         self.sq_ivs.write().insert(1, 0);
         self.cq_ivs.write().insert(1, 0);
 

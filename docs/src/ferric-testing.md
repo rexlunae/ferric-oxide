@@ -868,6 +868,63 @@ Repeat image boots and repeated `ferric-blkgrant-test` worker-policy runs
 exercise the real parking/handoff path; retain the first failure and its logs.
 Linux KVM/Kleya confirmation remains required.
 
+### NVMe command identifiers
+
+`cargo test --locked -p ferric-blkqueue` tests the identifier pool used by every
+NVMe queue pair. The regressions retain commands while submission positions wrap,
+complete commands out of order, cross the entire 16-bit identifier range while
+one command remains outstanding, exhaust and resume the pool, reject duplicate
+completions, and keep queue pairs independent. The pool is also checked without
+`std` or `alloc`; its doctest and strict Clippy/Rustdoc checks run in host-tools CI.
+`cargo test --locked -p ferric-exec-core --test driver_completion` compiles the
+driver's actual completion dispatch on the host: live completions wake their
+owner and one FIFO submitter, cancelled completions still wake a submitter,
+and empty queues do not produce extra wakeups. The same tests run in the
+`executor` package.
+
+The driver job compiles the default NVMe driver, `perf`, and
+`perf,percore,grant-dma` configurations. The target check remains an image build
+and a boot with writes large enough to reuse submission positions, followed by
+filesystem readback. Preserve a failing boot's first serial log and NMI context
+dump rather than treating a later successful boot as proof the failure was fixed.
+
+The NVMe package's host tests also cover completion publication:
+`cargo test --locked --manifest-path userspace/base/Cargo.toml -p nvmed`.
+A deterministic controller publishes a new completion between a premature
+payload read and the phase read, for both phase values. Reading the phase first
+must deliver the new command identifier; an unpublished slot must not be read.
+A byte fixture checks the generated little-endian completion layout.
+
+The profile-image boot at `95b031f0e` retained a driver abort during storage
+stress on a completion whose command identifier was not outstanding.
+The old x86-64 binary loaded the CID before status; its phase check therefore
+could accept a torn snapshot. One unmodified local boot also passed, confirming
+that a later pass alone does not establish a fix. The deterministic regression
+and phase-first implementation address that publication race; retain the full
+profile-image smoke boot as the target check. The profile workflow also runs
+when NVMe completion/command code, the command-ID pool or the executor changes.
+The corrected native profiler image at local integration `b880ecc74737` completed
+the full KVM smoke boot, including storage stress, profile collection/flamegraph,
+fuzzing, signed package verification and shutdown. Both additional profile
+workflow checks (fox manifests and loaded-image/profile records) passed. This
+used the CI profiler/frame-pointer settings with a native source rebuild.
+
+Local validation on 31 October 2026 reproduced a first-boot `fox` database write
+stall before the fix: seven disk-ring operations remained without completions
+after the NVMe hardware queues and executor completion maps had drained. With
+the identifier fix in [#352](https://github.com/rexlunae/ferric-oxide/pull/352),
+the combined x86_64 `wayland` image built and reached login under KVM (four
+vCPUs, 4 GiB, snapshot disk writes). A 64 MiB regular-file write followed by a
+complete SHA256 readback matched the host-computed digest. An additional piped
+`dd` comparison delivered only 4 MiB and failed; that separate unresolved result
+is recorded in [#353](https://github.com/rexlunae/ferric-oxide/issues/353).
+This establishes local boot and file-I/O evidence, not hardware performance.
+The final combined build and boot/readback check was repeated after the
+cancellation-wakeup correction and the compiler-fixture fix in
+[#354](https://github.com/rexlunae/ferric-oxide/pull/354), at local integration
+`54c17278747c` (NVMe/executor source `a080d862e41e`). The cancellation case is
+covered by the host regression; the guest check exercises startup and file I/O.
+
 ### NVMe phase accounting
 
 `cargo test --locked -p ferric-blkqueue --all-features` tests the actual

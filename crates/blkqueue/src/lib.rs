@@ -13,6 +13,8 @@
 //!   driver-block and its clients (the same-boot benchmark compares the policies with it).
 //! - [`ab`] summarises that benchmark's rounds and holds its pass rule.
 //! - [`timing`] pairs request service/command samples and drains reporting windows.
+//! - [`command_ids`] reserves a command's identifier until completion, independently
+//!   of the controller consuming its submission-ring entry.
 //! - [`ids`] reads the finished jobs' ids back from the workers' pipe, keeping a part of an
 //!   id that one read splits for the next, and reserves the id a worker reports as it exits.
 //! - `openers` (with the `alloc` feature) records which process opened each disk
@@ -43,6 +45,7 @@ pub mod ab;
 pub mod abi;
 #[cfg(feature = "alloc")]
 pub mod activity;
+pub mod command_ids;
 pub mod ids;
 #[cfg(feature = "alloc")]
 pub mod openers;
