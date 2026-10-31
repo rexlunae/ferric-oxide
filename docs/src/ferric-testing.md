@@ -717,6 +717,7 @@ cargo test --locked -p ferric-build -p ferric-config
 cargo test --locked -p redox_cookbook --lib
 cargo test --locked -p redox_installer --no-default-features --features installer
 bash scripts/ferric-ci/test-native-toolchain.sh
+bash scripts/ferric-ci/test-llvm-config-wrapper.sh
 cargo xtask --dry-run build
 ```
 

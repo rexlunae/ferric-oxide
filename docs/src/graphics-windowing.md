@@ -38,6 +38,29 @@ software Vulkan in dynamic builds, and links the inherited `liborbital`
 backend. It does not enable hardware GPU drivers. This describes the build
 configuration, not a verified working Orbital session.
 
+### Mesa and LLVM
+
+Mesa uses LLVM for its software rasterizer, so building the `mesa` recipe builds
+LLVM twice:
+
+- `llvm21`, the target's LLVM, which Mesa links;
+- `host:llvm21`, a host build of the same recipe, which Mesa's build queries
+  through `bin/<target>-llvm-config`. That wrapper runs the host build's
+  `llvm-config`, keeps only the target architecture's libraries and components,
+  asks for the target's backend where Mesa asks for `native`, and rewrites the
+  paths it reports to the recipe's target sysroot.
+
+Building the same recipe keeps the two at the same LLVM version. The host build
+carries every backend a Redox target uses (X86, AArch64, RISC-V and
+WebAssembly), so a build for another architecture than the build machine's
+still finds its target's backend. It is a build tool that always runs on the
+host (`tool-runs-on = "host"`), because build systems query `llvm-config` there,
+even with `build.build_tools = "guest"`. Without a host build in the recipe's
+toolchain, the wrapper uses the host sysroot's `llvm-config`, which the upstream
+prefix toolchain ships. `scripts/ferric-ci/test-llvm-config-wrapper.sh` checks
+the wrapper with stand-in `llvm-config` programs. The host-tools workflow runs
+it for changes to the wrapper, LLVM and Mesa recipes, or the fixture itself.
+
 ## Orbital (historical reference)
 
 The sections below describe the inherited Redox design, feature list and old

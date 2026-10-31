@@ -13,6 +13,9 @@ on:
       - "Cargo.lock"
       - "mk/fstools.mk"
       - "mk/llvm.mk"
+      - "bin/*-llvm-config"
+      - "recipes/dev/llvm21/**"
+      - "recipes/libs/mesa/**"
       - "scripts/native-toolchain.sh"
       - "scripts/native/**"
       - ".cargo/config.toml"
@@ -77,6 +80,8 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q python3.12-dev
           python3.12 scripts/ferric-ci/test-python-build-tools.py
+      - name: llvm-config wrapper tests
+        run: bash scripts/ferric-ci/test-llvm-config-wrapper.sh
       - name: Perf A/B gate regression tests
         run: bash scripts/ferric-ci/test-perf-ab.sh
       - name: Trace-overhead gate regression tests

@@ -16,6 +16,12 @@ dependencies = [
 ]
 dev-dependencies = [
     "llvm21.dev",
+    # llvm-config for the host (llvm21.runtime), which bin/${TARGET}-llvm-config
+    # runs and points at the target's llvm21.dev. It checks for the libraries
+    # beside it, so it needs the host build's libraries too.
+    "host:llvm21",
+    "host:llvm21.dev",
+    "host:llvm21.runtime",
 ]
 script = """
 DYNAMIC_INIT

@@ -3,6 +3,11 @@
 # This script wraps llvm-config that intended for cross compiling to Redox.
 # Because we can't run llvm-config compiled to Redox, we wrap it here
 # and filter out architectures that do not match the current $TARGET.
+#
+# The host llvm-config is the one in the recipe's toolchain when it builds
+# with a host build of the llvm recipe (host:llvm21, as mesa does), and the
+# host sysroot's otherwise (the upstream prefix toolchain ships one). Its paths
+# are rewritten to the matching place in the target sysroot.
 
 import os
 import sys
@@ -39,6 +44,14 @@ def is_unwanted_arch(item, allowed_prefix, all_prefixes, is_lib=False):
         
     return False
 
+def native_component(arg, comp_prefix):
+    """The component `arg` names, with the native backend replaced by the target's."""
+    if arg == "native":
+        return comp_prefix
+    if arg.startswith("native"):
+        return comp_prefix + arg[len("native"):]
+    return arg
+
 def main():
     toolchain_path = os.environ.get("COOKBOOK_HOST_SYSROOT")
     sysroot_path = os.environ.get("COOKBOOK_SYSROOT")
@@ -53,8 +66,19 @@ def main():
     target_built_name, comp_prefix, lib_prefix = mapped_archs
     toolchain_path = toolchain_path.rstrip(os.sep)
     sysroot_path = sysroot_path.rstrip(os.sep)
+    bindir = toolchain_path + "/usr/bin"
 
-    cmd = [toolchain_path + LLVM_CONFIG] + sys.argv[1:]
+    # A recipe toolchain lays packages out under usr/, like the target sysroot.
+    recipe_toolchain = os.environ.get("COOKBOOK_TOOLCHAIN", "").rstrip(os.sep)
+    if recipe_toolchain and os.path.isfile(recipe_toolchain + "/usr" + LLVM_CONFIG):
+        toolchain_path = recipe_toolchain + "/usr"
+        sysroot_path = sysroot_path + "/usr"
+        bindir = toolchain_path + "/bin"
+
+    # "native" names the host's backend to a host llvm-config, but the build is
+    # for the target, so ask for the target's backend instead.
+    args = [native_component(arg, comp_prefix) for arg in sys.argv[1:]]
+    cmd = [toolchain_path + LLVM_CONFIG] + args
 
     try:
         result = subprocess.run(
@@ -81,7 +105,7 @@ def main():
             libpath = toolchain_path + "/lib"
             output = output.replace(f"llvm-config: error: missing: {libpath}/lib", "-l")
             output = output.replace(f".a", "")
-            output = re.sub('-lLLVMX86\w+ ?', '', output, count=0, flags=0) # TODO: why?
+            output = re.sub(r'-lLLVMX86\w+ ?', '', output, count=0, flags=0) # TODO: why?
             output = f"-L{libpath} {output}"
         else:
             print(result.stderr)
@@ -90,7 +114,7 @@ def main():
         output = result.stdout.strip()
 
     if "--bindir" in args_set:
-        output = toolchain_path + "/usr/bin"
+        output = bindir
         
     elif "--targets-built" in args_set:
         output = target_built_name

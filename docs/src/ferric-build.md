@@ -70,7 +70,9 @@ libraries there, and a host build of LLVM among them would otherwise replace the
 compiler's own `libLLVM`. Rust's current
 Redox target still links `libgcc`; existing C++ packages require `libstdc++` and
 its headers. Replacing these ABI runtimes with compiler-rt/libc++ is separate
-work. Native builds do not compile GCC, LLVM or Rust itself.
+work. Native builds do not compile GCC, LLVM or Rust to compile with. Mesa is
+the one recipe that builds LLVM on the host, as a build tool: see
+[Mesa and LLVM](./graphics-windowing.md#mesa-and-llvm).
 
 The same archive supplies Redox's libtool: its m4 macros, `ltmain.sh` and
 `libtoolize`, which know how to link shared libraries for Redox. They go into the
