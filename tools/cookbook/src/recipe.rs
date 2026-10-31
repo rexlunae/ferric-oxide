@@ -146,6 +146,25 @@ pub struct BuildRecipe {
     pub compiler: Option<BuildCompiler>,
     #[serde(rename = "dev-dependencies")]
     pub dev_dependencies: Vec<RecipeName>,
+    /// Ferric Oxide: where this recipe runs when another recipe uses it as a
+    /// build tool (`host:`).
+    #[serde(rename = "tool-runs-on")]
+    pub tool_runs_on: ToolRunsOn,
+}
+
+/// Where a recipe runs when it is a build tool (a `host:` dependency).
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolRunsOn {
+    /// Wherever `build.build_tools` puts build tools: in the guest build
+    /// environment, or on the host.
+    #[default]
+    Configured,
+    /// Always built for and run on the host. For a tool that cannot work from
+    /// a guest: one whose own cross build needs a runnable copy of itself, as
+    /// CPython's does, or one that build scripts drive with environment
+    /// variables and module trees that a guest command does not carry.
+    Host,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Serialize)]
@@ -229,6 +248,26 @@ pub struct CookRecipe {
     pub pinned: bool,
 }
 
+/// Where recipe `name`, built from `build`, runs as a build tool.
+///
+/// A recipe that build-depends on itself (`host:<name>`) cross-builds with a
+/// host build of itself: CPython, ICU, groff and zig do. A copy built for the
+/// target could never satisfy that, so such a recipe runs on the host whatever
+/// its `tool-runs-on` says. Python modules also run inside the host build
+/// interpreter, including their compiled extensions. Otherwise the field decides.
+fn tool_runs_on(name: &str, build: &BuildRecipe) -> ToolRunsOn {
+    let builds_with_itself = build
+        .dev_dependencies
+        .iter()
+        .chain(&build.dependencies)
+        .any(|dependency| dependency.is_host() && dependency.without_prefix() == name);
+    if builds_with_itself || matches!(build.kind, BuildKind::Python { .. }) {
+        ToolRunsOn::Host
+    } else {
+        build.tool_runs_on
+    }
+}
+
 /// How a `host:` recipe's dependency `dependency` builds, or `None` to drop it.
 ///
 /// `owner` is the recipe's own name without its selector, and
@@ -243,8 +282,8 @@ pub struct CookRecipe {
 ///   dependency keeps following the recipe's own build, which for a guest-built
 ///   tool is the target build its libraries are usable from. Dropping the
 ///   package outright would lose the target libraries it needs.
-/// * a `host:` dependency of another recipe stays as written: it is a build
-///   tool, built for the target alongside this one in guest mode.
+/// * a `host:` dependency of another recipe stays as written: its own
+///   placement decides whether it runs on the host or in the guest.
 /// * an unprefixed one is a target package, so a guest-built tool keeps it as
 ///   written and a host tool's moves to the host build. Leaving it unprefixed
 ///   for a host tool would have it link the target libraries (`libgmp`,
@@ -299,10 +338,17 @@ impl Recipe {
 }
 
 impl CookRecipe {
+    /// Whether this is a build tool (`host:`) built for the target and run in
+    /// the guest build environment, rather than built for the host.
+    pub fn runs_in_guest(&self) -> bool {
+        self.name.is_host() && crate::tool_runs_in_guest(self.recipe.build.tool_runs_on)
+    }
+
     pub fn new(name: RecipeName, dir: PathBuf, mut recipe: Recipe) -> Result<Self, PackageError> {
-        let target = cook_package::package_target(&name);
+        recipe.build.tool_runs_on = tool_runs_on(name.without_prefix(), &recipe.build);
+        let target = cook_package::package_target(&name, recipe.build.tool_runs_on);
         if name.is_host() {
-            let tools_are_target = crate::build_tools_in_guest();
+            let tools_are_target = crate::tool_runs_in_guest(recipe.build.tool_runs_on);
             let fn_map =
                 |p: RecipeName| map_tool_dependency(p, name.without_prefix(), tools_are_target);
             recipe.build.dependencies = recipe
@@ -836,6 +882,80 @@ mod tests {
     /// target packages: an unprefixed dependency stays unprefixed (that is what
     /// makes it a target package), and a `target:` pin keeps its package and
     /// only loses the pin, so the library it names is still linked.
+    #[test]
+    fn a_recipe_that_builds_with_itself_runs_on_the_host() {
+        let build = |toml: &str| toml::from_str::<super::Recipe>(toml).unwrap().build;
+        let python =
+            build("[build]\ntemplate = \"none\"\ndev-dependencies = [\"host:python312\"]\n");
+        assert_eq!(
+            super::tool_runs_on("python312", &python),
+            super::ToolRunsOn::Host
+        );
+        // Another tool's host build is just a tool, and leaves the choice alone.
+        let xcb = build("[build]\ntemplate = \"none\"\ndev-dependencies = [\"host:python312\"]\n");
+        assert_eq!(
+            super::tool_runs_on("xcb-proto", &xcb),
+            super::ToolRunsOn::Configured
+        );
+        let marked = build("[build]\ntemplate = \"none\"\ntool-runs-on = \"host\"\n");
+        assert_eq!(
+            super::tool_runs_on("perl", &marked),
+            super::ToolRunsOn::Host
+        );
+    }
+
+    /// Build modules must have the ABI of the interpreter that imports them.
+    #[test]
+    fn python_build_modules_and_their_libraries_stay_on_the_host() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for name in [
+            "python3-yaml",
+            "python3-cython",
+            "python3-setuptools",
+            "python3-vcs-versioning",
+        ] {
+            let path = root.join("recipes/wip/dev/python").join(name);
+            let recipe = super::Recipe::new(&path.join("recipe.toml")).unwrap();
+            let cooked =
+                super::CookRecipe::new(RecipeName::new(name).unwrap().with_host(), path, recipe)
+                    .unwrap();
+            assert_eq!(
+                cooked.recipe.build.tool_runs_on,
+                super::ToolRunsOn::Host,
+                "{name}"
+            );
+            assert_eq!(cooked.target, redoxer::host_target(), "{name}");
+            assert!(
+                cooked
+                    .recipe
+                    .build
+                    .dependencies
+                    .iter()
+                    .chain(&cooked.recipe.build.dev_dependencies)
+                    .all(RecipeName::is_host),
+                "{name}: host modules must not link target libraries"
+            );
+        }
+        let target = super::CookRecipe::new(
+            RecipeName::new("python3-cython").unwrap(),
+            std::path::PathBuf::new(),
+            super::Recipe {
+                build: super::BuildRecipe::new(super::BuildKind::Python {
+                    pyprojectpath: None,
+                    pipflags: Vec::new(),
+                    legacysetup: false,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            target.target,
+            redoxer::target(),
+            "installed modules still target Redox"
+        );
+    }
+
     #[test]
     fn a_guest_built_tool_keeps_its_target_dependencies() {
         let map = |name: &str| {

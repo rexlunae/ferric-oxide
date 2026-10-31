@@ -330,6 +330,7 @@ dependencies = [
 - `build.pipflags` : Data type for Python `pip` flags (array)
 - `build.dev-dependencies` : Data type to add the build tools needed by the application or library
 - `build.dev-dependencies = ["host:tool1",]` : Build tool recipe name (can be removed if the `build.dev-dependencies` data type is not present)
+- `build.tool-runs-on = "host"` : Keeps this recipe on the host when another recipe uses it as a build tool, even with Ferric Oxide's `build.build_tools = "guest"` (see [Build tools in the guest](./ferric-build.md#build-tools-in-the-guest))
 - `build.dependencies` : Data type to add dynamically or statically linked library dependencies, read the [Dependencies](#dependencies) section for more details.
 - `build.dependencies = ["library1",]` : Library recipe name (can be removed if the `build.dependencies` data type is not present)
 - `build.script` : Data type to load the custom commands for compilation and packaging

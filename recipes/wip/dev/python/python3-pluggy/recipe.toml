@@ -12,9 +12,9 @@ legacysetup = true
 dev-dependencies = [
     "host:python312",
     "python312",
-    "python3-setuptools",
-    "python3-setuptools-scm",
-    "python3-vcs-versioning",
+    "host:python3-setuptools",
+    "host:python3-setuptools-scm",
+    "host:python3-vcs-versioning",
 ]
 
 [package]
