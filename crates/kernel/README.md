@@ -90,6 +90,10 @@ cargo test --locked --manifest-path crates/kernel/Cargo.toml -p rmm --features s
 ```
 
 These tests do not boot the kernel or execute interrupt/context-switch assembly.
+They also import the x86 serial initialization module with mock UARTs and a
+mapper that rejects access before memory initialization. Legacy port-I/O output
+starts early; `kernel.lpss_debug` uses MMIO only after the kernel mapper and
+allocator are ready. Hardware LPSS validation remains separate from these tests.
 
 ## Funding - _Unix-style Signals and Process Management_
 
