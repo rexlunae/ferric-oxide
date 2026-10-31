@@ -1034,6 +1034,26 @@ linking relibc or booting a guest. Set `CC` to select the host C compiler.
 The image workflow runs this check before building the image; the C test also
 belongs to relibc's regular test suite.
 
+## Python and guest build-tool regressions
+
+`python3.12 scripts/ferric-ci/test-python-build-tools.py` exercises the cookbook's
+Python setup with a compiled host extension and an incompatible target copy.
+It requires Python 3.12, its development headers (`python3.12-dev` on the CI
+runner) and a C compiler. It rejects other Python versions and keeps the
+prescript's `COOKBOOK_PYTHON_V` unchanged to check the recipe's actual ABI.
+`bash scripts/ferric-ci/test-build-tools-manifest.sh`
+checks that recipe placement edits regenerate the guest-tool list, while an
+unchanged list preserves the cached configuration. Both run in `host-tools.yml`
+without downloading or building recipes. The cookbook's Rust tests cover
+Python recipe placement and cleaning the resolved tool target. The
+`guest_build_dependencies` integration test runs `repo cook` over local shell
+recipes: a guest-built tool invokes an installed host-only dependency, keeps
+target libraries in its link sysroot, and receives shims for a nested guest
+tool. It uses signed package creation and installation plus the real build
+prescript, replacing only the compiler-environment wrapper; it needs no
+compiler or guest boot. See
+[build-tool placement](./ferric-build.md#build-tools-in-the-guest) for the policy.
+
 ## Port-I/O authorization
 
 `ferric-ioport-test` runs on x86_64 Redox in the smoke image. It starts separate

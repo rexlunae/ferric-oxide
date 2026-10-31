@@ -9,7 +9,7 @@ template = "python"
 dev-dependencies = [
   "host:python312",
   "python312",
-  "python3-flit_core",
+  "host:python3-flit_core",
 ]
 
 [package]

@@ -31,9 +31,22 @@ pub fn cross_target() -> Option<String> {
 /// recipe's dependencies are mapped for a target build — unprefixed ones stay
 /// target packages and a `target:` pin keeps its package without the pin
 /// ([`recipe::CookRecipe::new`]) — and the recipe builds against the target
-/// sysroot with no host toolchain ([`cook::cook_build`]).
+/// sysroot, keeping host build dependencies in a separate toolchain
+/// ([`cook::cook_build`]).
 pub fn build_tools_in_guest() -> bool {
     build_tools_in_guest_for(std::env::var("FERRIC_BUILD_TOOLS").ok().as_deref())
+}
+
+/// Whether a build tool that runs `runs_on` is built for the target and run in
+/// the guest: when [`build_tools_in_guest`], unless its recipe keeps it on the
+/// host ([`recipe::ToolRunsOn::Host`]).
+pub fn tool_runs_in_guest(runs_on: recipe::ToolRunsOn) -> bool {
+    tool_runs_in_guest_for(build_tools_in_guest(), runs_on)
+}
+
+/// The decision in [`tool_runs_in_guest`], without the process environment.
+fn tool_runs_in_guest_for(guest: bool, runs_on: recipe::ToolRunsOn) -> bool {
+    guest && runs_on == recipe::ToolRunsOn::Configured
 }
 
 /// The decision in [`build_tools_in_guest`], on the value itself, so it can be
@@ -368,7 +381,8 @@ pub(crate) use cook::pty::log_to_pty;
 
 #[cfg(test)]
 mod tests {
-    use super::build_tools_in_guest_for;
+    use super::{build_tools_in_guest_for, tool_runs_in_guest_for};
+    use crate::recipe::ToolRunsOn;
 
     /// Only the `guest` value moves a recipe's build tools to the target.
     /// An unset or empty setting keeps the inherited host behaviour, which is
@@ -379,5 +393,26 @@ mod tests {
         assert!(!build_tools_in_guest_for(Some("host")));
         assert!(!build_tools_in_guest_for(Some("")));
         assert!(!build_tools_in_guest_for(None));
+    }
+
+    /// A tool that must run on the host stays there in guest mode; every other
+    /// tool follows the setting.
+    #[test]
+    fn a_host_only_tool_never_runs_in_the_guest() {
+        assert!(tool_runs_in_guest_for(true, ToolRunsOn::Configured));
+        assert!(!tool_runs_in_guest_for(true, ToolRunsOn::Host));
+        assert!(!tool_runs_in_guest_for(false, ToolRunsOn::Configured));
+        assert!(!tool_runs_in_guest_for(false, ToolRunsOn::Host));
+    }
+
+    /// The field is optional and spelled as recipes write it.
+    #[test]
+    fn tool_runs_on_reads_from_a_recipe() {
+        let recipe: crate::recipe::Recipe =
+            toml::from_str("[build]\ntemplate = \"none\"\ntool-runs-on = \"host\"\n").unwrap();
+        assert_eq!(recipe.build.tool_runs_on, ToolRunsOn::Host);
+        let recipe: crate::recipe::Recipe =
+            toml::from_str("[build]\ntemplate = \"none\"\n").unwrap();
+        assert_eq!(recipe.build.tool_runs_on, ToolRunsOn::Configured);
     }
 }

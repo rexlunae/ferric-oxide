@@ -7,10 +7,12 @@ shallow_clone = true
 
 [build]
 template = "custom"
+# This custom recipe calls cookbook_python; its build modules run in host Python.
+tool-runs-on = "host"
 dev-dependencies = [
   "host:python312",
   "python312",
-  "python3-setuptools",
+  "host:python3-setuptools",
   "host:python3-setuptools",
   "host:python3-packaging",
 ]

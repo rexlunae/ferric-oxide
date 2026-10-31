@@ -152,6 +152,9 @@ impl CliCommand {
         *self == CliCommand::Fetch
             || *self == CliCommand::Cook
             || *self == CliCommand::CookList
+            // It resolves the recipes exactly as the cook does, so the guest
+            // environment holds every tool the cook will run.
+            || *self == CliCommand::BuildToolsList
             || *self == CliCommand::CaptureRev
             || *self == CliCommand::ChangeRule
     }
@@ -465,7 +468,7 @@ fn repo_inner(config: &CliConfig, command: &CliCommand, recipe: &CookRecipe) -> 
             result?
         }
         CliCommand::Unfetch | CliCommand::Clean | CliCommand::CleanTarget => {
-            handle_clean(recipe, config, command)?
+            handle_clean(recipe, config.all.as_ref(), command)?
         }
         _ => unreachable!(),
     })
@@ -906,7 +909,7 @@ fn builds_from_source(
 fn fetches_artifacts(command: &CliCommand) -> bool {
     matches!(
         command,
-        CliCommand::Fetch | CliCommand::Cook | CliCommand::CookList
+        CliCommand::Fetch | CliCommand::Cook | CliCommand::CookList | CliCommand::BuildToolsList
     )
 }
 
@@ -990,13 +993,17 @@ fn handle_nonstop_fail(recipe: &CookRecipe) -> cookbook::Result<()> {
     Ok(())
 }
 
-fn handle_clean(recipe: &CookRecipe, config: &CliConfig, command: &CliCommand) -> Result<bool> {
+fn handle_clean(
+    recipe: &CookRecipe,
+    all: Option<&AllOption>,
+    command: &CliCommand,
+) -> Result<bool> {
     let mut dir = recipe.dir.join("target");
     let mut cached = true;
     let unfetch = matches!(*command, CliCommand::Unfetch);
     let mut clean_target = true;
     if matches!(*command, CliCommand::CleanTarget) {
-        dir = dir.join(redoxer::target())
+        dir = dir.join(recipe.target)
     }
     if unfetch && recipe.rule == "binary" {
         // may contains downloaded binaries
@@ -1020,7 +1027,7 @@ fn handle_clean(recipe: &CookRecipe, config: &CliConfig, command: &CliCommand) -
             {
                 remove_all(&tar)?;
                 cached = false;
-            } else if config.all.is_some() {
+            } else if all.is_some() {
                 remove_all(&tar)?;
                 cached = false;
             }
@@ -1124,33 +1131,39 @@ fn handle_push(recipes: &Vec<CookRecipe>, config: &CliConfig) -> Result<()> {
     Ok(())
 }
 
-/// Prints the build tools the selected recipes need, one recipe name per line.
+/// Prints the build tools the guest build environment must hold, one per line.
 ///
-/// A recipe's `build.dev-dependencies` are the tools it runs while it builds.
 /// `make` collects this list to install the guest build environment for
-/// `build.build_tools = "guest"`, so it names the tools themselves rather than
-/// their whole dependency graph: a tool's own dependencies are installed with
-/// it when the environment is built.
+/// `build.build_tools = "guest"`. It names the tools themselves: a tool's own
+/// runtime dependencies are installed with it when the environment is built.
 ///
-/// Only tools that are recipes are listed: a `host:` name can also be a program
-/// the host provides, and nothing can be built for the guest from that.
+/// `recipes` is the cook's own list (`build-tools-list` resolves its recipes as
+/// `cook-list` does), with every recipe's build and dev dependencies. Every
+/// `host:` recipe in it that is built for the target is a tool the cook runs in
+/// the guest: a tool of an image package, of one of its dependencies, or of
+/// another tool, including a tool that a host-only tool builds with. A tool that
+/// runs on the host is built for the host where it is used, so it is left out.
+#[allow(clippy::result_large_err)]
 fn handle_build_tools_list(recipes: &[CookRecipe]) -> Result<()> {
-    let mut seen = BTreeSet::new();
-    for recipe in recipes {
-        for tool in &recipe.recipe.build.dev_dependencies {
-            let name = tool.without_prefix();
-            if name.is_empty() || seen.contains(name) {
-                continue;
-            }
-            if staged_pkg::find(name).is_none() {
-                eprintln!("build-tools: no recipe for {name}; it stays a host tool");
-                continue;
-            }
-            seen.insert(name.to_owned());
-            println!("{name}");
-        }
+    for name in guest_tool_names(recipes, CookRecipe::runs_in_guest) {
+        println!("{name}");
     }
     Ok(())
+}
+
+/// The distinct names, without their `host:` selector, of the `recipes` that
+/// `runs_in_guest` accepts, in the order they first appear.
+fn guest_tool_names(
+    recipes: &[CookRecipe],
+    runs_in_guest: impl Fn(&CookRecipe) -> bool,
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    recipes
+        .iter()
+        .filter(|recipe| runs_in_guest(recipe))
+        .map(|recipe| recipe.name.without_prefix().to_owned())
+        .filter(|name| seen.insert(name.clone()))
+        .collect()
 }
 
 fn handle_tree(recipes: &Vec<CookRecipe>, cmd: TreeOptions, config: &CliConfig) -> Result<()> {
@@ -1259,7 +1272,7 @@ fn handle_change_rule(
             lock.insert(recipe_name.to_string(), recipe_lock);
         }
         let clean_cached = if !cached && is_change_rule {
-            handle_clean(recipe, config, &CliCommand::Clean)?
+            handle_clean(recipe, config.all.as_ref(), &CliCommand::Clean)?
         } else {
             true
         };
@@ -1284,6 +1297,47 @@ use bail_options_err;
 
 #[cfg(test)]
 mod tests {
+    /// Cleaning a selected host tool must use its resolved host target; full
+    /// clean also removes the old guest artifacts after a placement change.
+    #[test]
+    fn cleaning_a_host_tool_uses_its_target_and_full_clean_removes_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recipe = CookRecipe::dummy(&"host:tool".try_into().unwrap());
+        recipe.dir = dir.path().to_owned();
+        recipe.target = "test-host";
+        let host = dir.path().join("target/test-host");
+        let guest = dir.path().join("target/test-guest");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&guest).unwrap();
+        assert!(!super::handle_clean(&recipe, None, &CliCommand::CleanTarget).unwrap());
+        assert!(!host.exists());
+        assert!(guest.exists());
+        assert!(!super::handle_clean(&recipe, None, &CliCommand::Clean).unwrap());
+        assert!(!dir.path().join("target").exists());
+    }
+    /// The guest tools are named once each, without their selector, in cook order.
+    #[test]
+    fn guest_tools_are_listed_once_without_their_selector() {
+        use cookbook::recipe::{CookRecipe, Recipe};
+        use fox_core::cookbook::RecipeName;
+        let recipe = |name: &str| {
+            CookRecipe::new(
+                RecipeName::new(name).unwrap(),
+                std::path::PathBuf::from("/recipes").join(name),
+                toml::from_str::<Recipe>("[build]\ntemplate = \"none\"\n").unwrap(),
+            )
+            .unwrap()
+        };
+        let recipes = [
+            recipe("host:gperf"),
+            recipe("fontconfig"),
+            recipe("host:python312"),
+            recipe("host:gperf"),
+        ];
+        let in_guest = |r: &CookRecipe| r.name.is_host() && r.name.without_prefix() != "python312";
+        assert_eq!(super::guest_tool_names(&recipes, in_guest), ["gperf"]);
+    }
+
     use super::{CliCommand, builds_from_source, offline_cook_without_binaries};
     use cookbook::recipe::CookRecipe;
 
