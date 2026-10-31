@@ -70,6 +70,11 @@ in `tools/ferric-config/tests/profiles.rs`. They exercise the public CLI and
 generated Makefile, then load the selected filesystem configuration through the
 installer's include resolver. They check inherited source packages, the effective
 boot script, image overrides and retention of saved CPU/kernel settings.
+`tests/catalog.rs` also checks every direct or conditional kernel Cargo feature
+named by the catalog against `crates/kernel/Cargo.toml`, including options that
+are disabled by default. The Make/CLI regressions reject the retired `kernel.pti`
+setting before writing build files and keep the supported `kernel.cpu.kpti`
+policy inactive when selecting ARM64.
 
 Use `cargo clippy --all-targets -- -D warnings` and `cargo doc --no-deps`
 in changed workspaces as required by `AGENTS.md`, accounting for the documented
@@ -694,6 +699,7 @@ cargo test --locked -p ferric-build -p ferric-config
 cargo test --locked -p redox_cookbook --lib
 cargo test --locked -p redox_installer --no-default-features --features installer
 bash scripts/ferric-ci/test-native-toolchain.sh
+bash scripts/ferric-ci/test-llvm-config-wrapper.sh
 cargo xtask --dry-run build
 ```
 
@@ -980,6 +986,16 @@ reporting still need an instrumented target boot.
 cross-thread worker completion and failed delivery. The existing Redox driver
 builds cover percore, perf and grant-DMA integration. Smoke CI retains the
 serial Adaptive default and its enforced same-boot queue performance gates.
+
+With its `std` feature, `ferric-blkqueue::round` supplies the shared start gate
+for the registered-buffer and iobench benchmarks. Host tests cover synchronized
+start, caller-prepared state, excluding destruction and joins, worker panic,
+thread creation failure, and releasing waiting submitters when the start hook
+panics. Run `cargo test --locked -p ferric-blkqueue --all-features` plus the two
+recipe runner tests in `host-tools.yml`. Raw per-round `FERRIC_BENCH_SAMPLE`
+lines preserve the paired observations; the 5–15% tolerance and three-plus-six
+round gate are unchanged. The original AMD-Vi failure is tracked in
+[#359](https://github.com/rexlunae/ferric-oxide/issues/359).
 
 
 ### Profiler CPU wakeup acknowledgements

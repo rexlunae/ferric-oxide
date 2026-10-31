@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use ferric_blkgrant::abi::{EncodeError, Request as DiskRequest, Slot, Transfer};
 use ferric_blkqueue::QueuePolicy;
 use ferric_blkqueue::ab::{self, Comparison, Verdict};
+use ferric_blkqueue::round::{SpawnError, run_each};
 use ferric_regbuf::abi::{
     Access, BytesError, GrantId, GrantInfo, GrantSpec, REGION_PATH, Request, SCHEME_NAME,
 };
@@ -63,6 +64,8 @@ enum Failure {
     NoPartition,
     /// A benchmark thread panicked.
     Thread,
+    /// A benchmark submitter could not start.
+    Spawn(SpawnError),
 }
 
 impl fmt::Display for Failure {
@@ -79,6 +82,7 @@ impl fmt::Display for Failure {
             Self::Encode(err) => write!(f, "cannot encode a disk request: {err}"),
             Self::NoPartition => f.write_str("the NVMe disk has no partitions to test on"),
             Self::Thread => f.write_str("a benchmark thread panicked"),
+            Self::Spawn(err) => write!(f, "start benchmark submitters: {err}"),
         }
     }
 }
@@ -88,6 +92,7 @@ impl std::error::Error for Failure {
         match self {
             Self::Payload(err) => Some(err),
             Self::Encode(err) => Some(err),
+            Self::Spawn(err) => Some(err),
             _ => None,
         }
     }
@@ -464,26 +469,21 @@ fn bench_round(read: &Disk, threads: usize) -> Result<u32, Failure> {
     const SIZE: usize = 4 << 10;
     let span = (read.len / SIZE as u64).max(1) * SIZE as u64;
     let per_thread = BENCH_ROUND_BYTES / threads / SIZE;
-    let start = Instant::now();
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads)
-            .map(|t| {
-                scope.spawn(move || {
-                    let mut buf = vec![0; SIZE];
-                    let first = (t * per_thread) as u64;
-                    for i in 0..per_thread as u64 {
-                        let at = ((first + i) * SIZE as u64) % span;
-                        io("pread", read.file.read_at(&mut buf, at))?;
-                    }
-                    Ok(())
-                })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .try_for_each(|worker| worker.join().unwrap_or(Err(Failure::Thread)))
-    })?;
-    let iops = (per_thread * threads) as f64 / start.elapsed().as_secs_f64().max(1e-9);
+    let readers = (0..threads)
+        .map(|thread| ((thread * per_thread) as u64, vec![0; SIZE]))
+        .collect();
+    let timed = run_each(readers, |(first, buf)| {
+        for i in 0..per_thread as u64 {
+            let at = ((*first + i) * SIZE as u64) % span;
+            io("pread", read.file.read_at(buf, at))?;
+        }
+        Ok(())
+    })
+    .map_err(Failure::Spawn)?;
+    for result in timed.results {
+        result.ok_or(Failure::Thread)??;
+    }
+    let iops = (per_thread * threads) as f64 / timed.elapsed.as_secs_f64().max(1e-9);
     Ok(iops as u32)
 }
 
@@ -528,6 +528,19 @@ fn bench_threads(read: &Disk) -> Result<(), Failure> {
             (true, Verdict::Pass) => "pass",
             (true, _) => "fail",
         };
+        // Print only after all measurements, preserving the original paired order.
+        for (round, ((single, copy), workers)) in samples[0]
+            .iter()
+            .zip(&samples[1])
+            .zip(&samples[2])
+            .take(rounds)
+            .enumerate()
+        {
+            println!(
+                "FERRIC_BENCH_SAMPLE nvme-read-4k-t{threads} round={round} \
+                 single_iops={single} copy_iops={copy} workers_iops={workers}",
+            );
+        }
         println!(
             "FERRIC_BENCH nvme-read-4k-t{threads} bytes={} copy_mib_s={:.1} copy_iops={} \
              single_iops={} workers_iops={} ab_ratio={} ab_tolerance={} ab_rounds={rounds} \
@@ -614,7 +627,14 @@ fn step(name: &str, t: &mut Test, f: Step) -> Result<(), ()> {
             Ok(())
         }
         Err(err) => {
-            println!("FERRIC_TEST_FAIL {name}: {err}");
+            let mut message = err.to_string();
+            let mut source = std::error::Error::source(&err);
+            while let Some(cause) = source {
+                message.push_str(": ");
+                message.push_str(&cause.to_string());
+                source = cause.source();
+            }
+            println!("FERRIC_TEST_FAIL {name}: {message}");
             Err(())
         }
     }

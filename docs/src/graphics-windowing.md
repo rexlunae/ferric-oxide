@@ -59,6 +59,13 @@ zero unreadable stacks. The COSMIC image hash above records the earlier build;
 see the [NVMe validation recorded with #352](https://github.com/rexlunae/ferric-oxide/blob/bacf514ca0e577c67bda9c55d5bdd02a98fa4456/docs/src/ferric-testing.md#nvme-command-identifiers)
 for the publication regression.
 
+The benchmark timing correction in
+[#360](https://github.com/rexlunae/ferric-oxide/pull/360) subsequently passed all
+24 CI checks and merged. Native `ferric-smoke` validation at `cdd49290e7d8`
+included that correction with LPSS enabled and KPTI required: its full KVM
+AMD-Vi smoke boot and storage, IOMMU and timer postchecks passed. This was a
+separate smoke image; it does not change the earlier COSMIC image hash above.
+
 The first-failure logs are retained for the preceding NVMe command-ID reuse
 hang, truncated pipe transfer ([#353](https://github.com/rexlunae/ferric-oxide/issues/353))
 and early LPSS MMIO panic. The successful check includes the corresponding
@@ -123,7 +130,8 @@ host (`tool-runs-on = "host"`), because build systems query `llvm-config` there,
 even with `build.build_tools = "guest"`. Without a host build in the recipe's
 toolchain, the wrapper uses the host sysroot's `llvm-config`, which the upstream
 prefix toolchain ships. `scripts/ferric-ci/test-llvm-config-wrapper.sh` checks
-the wrapper with stand-in `llvm-config` programs.
+the wrapper with stand-in `llvm-config` programs. The host-tools workflow runs
+it for changes to the wrapper, LLVM and Mesa recipes, or the fixture itself.
 
 ## Orbital (historical reference)
 

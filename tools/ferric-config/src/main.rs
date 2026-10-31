@@ -372,7 +372,7 @@ fn run(cli: Cli) -> Result<ExitCode, CliError> {
         Cmd::Unset { ids } => {
             let (mut user, _, _) = load(&ctx)?;
             for id in ids {
-                if ctx.schema.get(&id).is_none() && !user.values.contains_key(&id) {
+                if ctx.schema.get(&id).is_none() && !user.contains_option(&id) {
                     return Err(CliError::UnknownOption {
                         id,
                         hint: String::new(),

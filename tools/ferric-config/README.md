@@ -25,6 +25,14 @@ There are three files:
 Without a `ferric.toml` nothing changes and the build behaves like upstream
 Redox.
 
+Older configurations containing `kernel.pti` must remove that obsolete boolean.
+Run `cargo run -q -p ferric-config -- unset kernel.pti` to remove it from the
+saved file. To require the implemented isolation path, then run
+`cargo run -q -p ferric-config -- set kernel.cpu.kpti always`;
+its default is `"auto"`. See
+[KPTI and PCID](../../docs/src/ferric-memory.md#kpti-and-pcid).
+Validation rejects the removed option before generating build files.
+
 ## Using it
 
 ```sh
@@ -44,7 +52,6 @@ The editor is a tree of menus:
 │  [ ] NUMA awareness                                           │
 │  [*] Self-modifying code (CPU feature patching)               │
 │  [*] KVM paravirtual clock                                    │
-│  [ ] Page table isolation (KPTI) (EXPERIMENTAL)               │
 │  ...                                                          │
 │      CPU feature use  --->                                    │
 └───────────────────────────────────────────────────────────────┘
@@ -111,6 +118,10 @@ $T check --override target.arch=aarch64
 $T generate --override target.arch=aarch64 --override image.config=native
 $T variants --json             # enabled CPU variants and each CPU type's minimum
 ```
+
+`unset` can remove a retired or misspelled leaf key that is present in the saved
+file. It rejects unknown keys absent from the file and table names, and keeps
+unrelated choices. `check` still rejects any unknown settings left in the file.
 
 `check` and `generate` accept repeated `--override OPTION=VALUE` arguments.
 They apply before dependency resolution and validation, and do not edit

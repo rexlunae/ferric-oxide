@@ -13,6 +13,9 @@ on:
       - "Cargo.lock"
       - "mk/fstools.mk"
       - "mk/llvm.mk"
+      - "bin/*-llvm-config"
+      - "recipes/dev/llvm21/**"
+      - "recipes/libs/mesa/**"
       - "scripts/native-toolchain.sh"
       - "scripts/native/**"
       - ".cargo/config.toml"
@@ -35,6 +38,7 @@ on:
       - "userspace/base/drivers/storage/nvmed/**"
       - "userspace/base/drivers/pcid/**"
       - "recipes/tests/ferric-iobench/**"
+      - "recipes/tests/ferric-blkgrant-test/**"
       - "recipes/tests/ferric-ring-test/**"
       - "recipes/tests/ferric-aslr-test/**"
       - "recipes/tests/ferric-ioport-test/**"
@@ -93,6 +97,7 @@ jobs:
           cargo test --locked --workspace
           cargo test --locked --manifest-path recipes/tests/ferric-ring-test/files/Cargo.toml
           cargo test --locked --manifest-path recipes/tests/ferric-aslr-test/files/Cargo.toml
+          cargo test --locked --manifest-path recipes/tests/ferric-blkgrant-test/files/Cargo.toml
       - name: Device-tree memory safety
         run: |
           rustup component add miri
@@ -155,6 +160,8 @@ jobs:
           cargo clippy --locked --all-targets -p ferric-blkqueue --all-features -- -D warnings
           cargo test --locked -p ferric-blkqueue --all-features
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-blkqueue --all-features
+          cargo clippy --locked --all-targets --target x86_64-unknown-redox \
+            --manifest-path recipes/tests/ferric-blkgrant-test/files/Cargo.toml -- -D warnings
       # ferric-jbd2: JBD2 journal recovery planning, which ext4d's journal replay
       # (fs.ext4_journal_replay) uses; no_std, so also built for a bare-metal target.
       - name: ferric-jbd2
