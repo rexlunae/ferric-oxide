@@ -2371,6 +2371,7 @@ name = "scheme-utils"
 version = "0.0.0"
 dependencies = [
  "libredox",
+ "plain",
  "redox-scheme",
  "redox_syscall 0.9.4",
 ]

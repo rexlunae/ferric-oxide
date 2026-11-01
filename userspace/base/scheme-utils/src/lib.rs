@@ -7,10 +7,12 @@ use std::num::Wrapping;
 use syscall::{EBADF, Error, Result};
 
 mod blocking;
+mod credentials;
 mod readiness_based;
 mod resource;
 
 pub use blocking::Blocking;
+pub use credentials::proc_credentials;
 pub use readiness_based::ReadinessBased;
 pub use resource::{ResourceOpenResult, ResourceSync, resource_scheme};
 
