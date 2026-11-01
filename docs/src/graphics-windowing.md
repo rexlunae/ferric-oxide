@@ -9,6 +9,112 @@ build bring-up path, and the accelerated display stack remains future work.
 Orbital is not planned to be brought up to a working or supported state as a
 standalone desktop; its inherited recipes and defaults may not work.
 
+## Planned native graphics stack
+
+The direction agreed on 31 October 2026 is a small native Wayland compositor
+built with Smithay, backed by Ferric's Rust display and input services. The
+requirements are existing protocols and toolkit support, Rust-oriented APIs,
+reuse of license-compatible graphics drivers, and a graphical boot path with
+few dependencies. Both Wayland and X11 application support are required.
+This section describes planned work; the nested COSMIC build below is the
+current integration path.
+
+### Compositor and application protocols
+
+Use [Smithay](https://github.com/Smithay/smithay) as the MIT-licensed Rust
+compositor foundation, with Ferric-specific platform integration and a minimal
+window-management policy. Rust applications can use existing Wayland crates
+and toolkits; applications in other languages use the same protocols. A new
+Ferric-specific application protocol is not part of this design.
+
+Provide native Wayland and integrated rootless
+[Xwayland](https://wayland.freedesktop.org/docs/book/Xwayland.html), so X11
+windows can share the desktop with Wayland windows. Validate input, focus,
+clipboard, drag-and-drop, resizing and fullscreen behavior across the two
+protocols. Start Xwayland on demand in profiles that enable it, keeping it
+outside the early-boot dependency chain.
+
+Keep COSMIC as an optional complete desktop session. It uses its own
+compositor; share the Ferric platform integration where practical and arrange
+an explicit display/input ownership handoff for that session. The current
+COSMIC-inside-Orbital nesting remains build scaffolding. A complete COSMIC
+shell, panel and applet set is separate integration work.
+
+Useful license-compatible Orbital code may supply reusable platform or drawing
+pieces. Evolving that code into the new minimal layer is acceptable, but the
+inherited Orbital protocol and desktop are not compatibility requirements.
+
+### From graphical boot to a session
+
+Aim for one small compositor tool and codebase covering early userspace boot,
+recovery, a greeter and a minimal desktop. Start it from initfs when display
+and input services are available, using the firmware framebuffer and
+Smithay's [Pixman renderer](https://smithay.github.io/smithay/smithay/backend/renderer/pixman/index.html).
+The boot path should not require Mesa, LLVM, a desktop D-Bus session or the
+Linux compatibility runtime. Smithay's optional Linux backends can be replaced
+by [native display, input and session adapters](https://docs.rs/smithay/latest/smithay/backend/).
+Drivers remain separate services in the microkernel architecture.
+
+The UEFI bootloader still handles the pre-kernel graphical environment. Define
+framebuffer ownership and presentation handoff from firmware/bootloader to
+userspace, from the boot framebuffer to an accelerated driver, and between
+the greeter and user sessions. Preserve display continuity where possible;
+allow explicit restarts or ownership transfers at security boundaries. A
+single process spanning firmware and every desktop session is not required.
+
+Use software composition for boot, recovery and initial validation. Hardware
+acceleration remains a separate required desktop milestone. Optional desktop,
+Xwayland and driver choices must enter `features.toml` through `ferric-config`
+as they are implemented; this design adds no configuration keys or defaults.
+
+### Rendering and interchangeable driver backends
+
+Use Mesa for EGL, OpenGL/OpenGL ES and Vulkan. Bring up native virtio-gpu in
+QEMU/KVM, with [VirGL](https://docs.mesa3d.org/drivers/virgl.html) for OpenGL
+followed by [Venus](https://docs.mesa3d.org/drivers/venus.html) for Vulkan.
+Check host and guest requirements and verify actual host GPU use separately
+from software rendering. Bare-metal enablement proceeds one GPU family at a
+time.
+
+Native Rust drivers, compatibility-hosted drivers and eventual driver VMs
+should expose common native display, buffer and synchronization contracts.
+Extend the existing DRM-style display/dumb-buffer plumbing in `driver-graphics`
+and `graphics-ipc`; it is not a complete accelerated GPU interface. Mesa also
+needs the selected driver's memory management, command submission, buffer
+sharing and fence interfaces. Grant-based sharing needs graphics-specific
+formats, ownership and synchronization semantics.
+
+A LinuxKPI-style runtime is an option for recompiling selected driver sources
+against versioned APIs. It must reproduce the driver's execution assumptions,
+including locking, interrupt context, work queues, memory ordering, DMA
+lifetimes and recovery. A Linux driver VM is another option. Neither exists
+today; selection and licensing remain open. Reuse must meet the repository's
+license policy: [Mesa is mostly MIT-licensed](https://docs.mesa3d.org/license.html),
+but individual components and driver dependencies need review. Hosting code
+behind a shim does not change its license.
+
+The planned [Linux userspace ABI](./ferric-linux-compat.md) will let supported
+unmodified Linux applications reach this desktop through native Wayland or
+Xwayland. Its syscall, filesystem and device compatibility must share Rust
+mechanisms with relibc. GPU acceleration for those binaries also requires the
+interfaces used by their userspace drivers. Linux application compatibility
+and kernel-driver compatibility have separate validation requirements.
+
+### Bring-up and completion criteria
+
+1. Establish native framebuffer presentation and keyboard/pointer delivery in a
+   fullscreen Wayland session. Validate focus and resize handling, damage-based
+   redraw and frame pacing; measure idle CPU use and input-to-display latency.
+2. Exercise boot, recovery, greeter and session ownership transfers, including
+   repeated teardown and restart. Integrate and validate Xwayland clients.
+3. Add virtio-gpu acceleration and verify buffer sharing, synchronization and
+   GPU use. Repeat application and latency checks with acceleration enabled.
+4. Enable a reference bare-metal GPU backend, integrate the optional COSMIC
+   session, and test the declared Linux ABI profile with graphical applications.
+
+Track results and gaps against [Phase 6](./ferric-roadmap.md#phase-6-graphics-and-desktop).
+These are validation requirements, not claims that the current image passes.
+
 ## COSMIC build configuration
 
 On x86_64, after the [native build setup](./ferric-build.md), select the existing image
@@ -57,8 +163,14 @@ NVMe command-ID hang, truncated pipe transfer and early LPSS MMIO panic; see
 separate profiler and AMD-Vi smoke checks remain evidence for their respective
 configurations, rather than measurements of desktop performance.
 
-The graphical COSMIC session was not validated. The installed
-`orbital-wayland` script selects `COSMIC_BACKEND=winit`, starts `cosmic-comp`
+The build validation above was headless. A subsequent manual graphical test
+on 31 October 2026 displayed the libcosmic example's "Page 4" window inside
+the nested compositor, but the user reported severe slowness and unresponsive
+keyboard and pointer input. This is a partial rendering observation, not a
+successful usability test or a measured performance result; the causes remain
+unresolved.
+
+The installed `orbital-wayland` script selects `COSMIC_BACKEND=winit`, starts `cosmic-comp`
 nested inside Orbital and then runs the libcosmic example. Mesa uses software
 rendering; the compositor recipe still records performance and keyboard-input
 limitations. This build result does not establish a usable graphical session,

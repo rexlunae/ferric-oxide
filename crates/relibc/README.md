@@ -15,6 +15,16 @@ Currently Redox and Linux are supported.
 `redox-rt` is a runtime library that provides much of the code that enables POSIX on Redox, like `fork`, `exec`, signal handling, etc.
 Relibc uses it as backend in `src/platform/redox`, and it's intended to eventually be usable independently, without relibc.
 
+## Planned Linux compatibility in Ferric Oxide
+
+Ferric's [Linux userspace compatibility design](../../docs/src/ferric-linux-compat.md)
+requires Linux syscall handling and compatible filesystem views to share Rust
+runtime/platform mechanisms with relibc and use Ferric's native base services.
+The PAL and `redox-rt` are starting points for extracting reusable components
+with explicit target-process context. This compatibility runtime is not
+implemented. The existing `src/platform/linux` backend runs relibc on Linux;
+it does not provide Linux binary execution on Ferric.
+
 ## Math library
 
 `libm` comes from the `openlibm` submodule. relibc builds it with `OS=Redox`,

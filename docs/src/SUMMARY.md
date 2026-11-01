@@ -12,6 +12,7 @@
   - [Kernel Tracing](./ferric-tracing.md)
   - [Kernel Async Executor (design)](./ferric-async.md)
   - [Virtualization (prepared)](./ferric-virt.md)
+  - [Linux Userspace Compatibility (planned)](./ferric-linux-compat.md)
   - [Package Tooling: fox](./ferric-packaging.md)
   - [WebAssembly Interfaces](./ferric-wasm.md)
   - [Validation and Debugging](./ferric-testing.md)

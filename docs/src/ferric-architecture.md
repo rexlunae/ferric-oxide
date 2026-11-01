@@ -2,9 +2,13 @@
 
 Ferric Oxide retains Redox's division between a kernel that manages execution,
 memory and communication, and user-space services that provide filesystems,
-devices and higher-level facilities. Applications use Redox system calls and
-relibc rather than a Linux kernel ABI. Linux application compatibility is
-developed through libraries and ports; it does not make this a Linux kernel.
+devices and higher-level facilities. Native applications use Redox system calls
+and relibc. Linux application support currently comes through libraries and
+target ports. A native Linux userspace ABI is now a
+[planned requirement](./ferric-linux-compat.md): Linux syscall handling and
+Linux-compatible filesystem/device views will share Rust runtime mechanisms
+with relibc and use Ferric's base services. There is no Linux binary execution
+environment in the current image.
 
 ## Source and build boundaries
 
