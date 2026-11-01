@@ -44,6 +44,7 @@ on:
       - "recipes/tests/ferric-ioport-test/**"
       - ".github/workflows/host-tools.yml"
       - ".github/actions/prepare-cargo-git/**"
+      - ".github/actions/prepare-image-runner/**"
 
 concurrency:
   # A new push to a pull request supersedes its older run; runs on main and
@@ -90,6 +91,8 @@ jobs:
         run: bash scripts/ferric-ci/test-check-sched-bench-log.sh
       - name: One-shot timer log check regression tests
         run: bash scripts/ferric-ci/test-check-oneshot-log.sh
+      - name: Image runner disk preparation tests
+        run: bash scripts/ferric-ci/test-prepare-image-runner.sh
       - name: Format
         run: cargo fmt --all --check
       - name: Test

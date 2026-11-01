@@ -362,6 +362,23 @@ The edu driver is started through `pcid-spawner`, separately from the console
 test script. Its PCI matching configuration is in the IOMMU test recipe.
 Tests may skip absent optional features; do not interpret a skip as coverage.
 
+Image, profiler-image and CET-image builds use
+`.github/actions/prepare-image-runner` before restoring build caches or compiling
+packages. Hosted Ubuntu runners carry large SDKs that these container builds
+do not use. The jobs explicitly bind those host SDK directories under
+`/ferric-host-sdks`, then remove their contents to make room for source builds
+and image staging. Deleting the container's own SDK paths would only affect
+its overlay and would not reclaim that host storage.
+
+`scripts/ferric-ci/prepare-image-runner.sh` refuses cleanup outside a
+GitHub-hosted Linux Actions runner and validates every directory as a bind
+mount before deleting anything. It preserves mount roots and does not follow
+SDK symlinks. The workspace, package outputs, build caches and the container's
+toolchain remain available. Its log reports capacity before and after cleanup.
+Run `bash scripts/ferric-ci/test-prepare-image-runner.sh` for disposable-directory
+regressions covering environment guards, missing bindings, hidden/nested files
+and symlink targets; the tests mock mount discovery without touching host SDKs.
+
 `.github/workflows/image.yml` generates feature settings, forces KPTI on,
 enables IOMMU `auto`, shadow-stack policy `auto`, registered buffers,
 `nvmed` grant DMA (`drivers.grant_dma`) and kernel tracing (with
