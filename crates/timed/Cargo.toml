@@ -9,6 +9,12 @@ description = "Monotonic nanosecond time and deadline arithmetic for the schedul
 
 [features]
 default = []
+# Owned timeout queues. Hardware clock/deadline arithmetic remains allocation-free.
+alloc = []
 
 # Host tests use std.
 [dev-dependencies]
+
+[[example]]
+name = "timeout_bench"
+required-features = ["alloc"]

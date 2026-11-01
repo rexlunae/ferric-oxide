@@ -21,6 +21,7 @@ impl Fixture {
             "native",
             "ferric-smoke",
             "ferric-fuzz",
+            "ferric-sched-bench",
             "ferric-hardware",
         ] {
             std::fs::copy(
@@ -177,21 +178,38 @@ fn assert_profile(profile: &str) {
 }
 
 fn assert_profile_packages(profile: &str, resolved: &redox_installer::Config) {
-    for package in [
-        "kernel",
-        "relibc",
-        "bootloader",
-        "redoxfs",
-        "base",
-        "ferric-xstate-test",
-        "ferric-aslr-test",
-        "ferric-guard-test",
-        "ferric-tlb-test",
-        "ferric-futex-test",
-        "ferric-syscall-fuzz",
-        "ferric-iommu-test",
-        "ferric-regbuf-test",
-    ] {
+    let packages: &[&str] = if profile == "ferric-sched-bench" {
+        &[
+            "kernel",
+            "relibc",
+            "bootloader",
+            "redoxfs",
+            "base",
+            "ferric-trace",
+            "ferric-trace-bench",
+            "ferric-ring-test",
+            "ferric-iobench",
+            "ferric-sched-bench",
+        ]
+    } else {
+        &[
+            "kernel",
+            "relibc",
+            "bootloader",
+            "redoxfs",
+            "base",
+            "ferric-xstate-test",
+            "ferric-aslr-test",
+            "ferric-guard-test",
+            "ferric-tlb-test",
+            "ferric-futex-test",
+            "ferric-time-test",
+            "ferric-syscall-fuzz",
+            "ferric-iommu-test",
+            "ferric-regbuf-test",
+        ]
+    };
+    for &package in packages {
         assert!(
             matches!(
                 resolved.packages.get(package),
@@ -222,6 +240,17 @@ fn assert_profile_scripts(profile: &str, resolved: &redox_installer::Config) {
         assert!(!file.append && !file.symlink && !file.directory);
         file.data.as_str()
     };
+    if profile == "ferric-sched-bench" {
+        assert!(
+            last_file("/usr/lib/init.d/30_console").contains("ion /usr/lib/ferric-sched-bench.ion")
+        );
+        let script = last_file("/usr/lib/ferric-sched-bench.ion");
+        assert!(script.contains("FERRIC_SCHED_BENCH_BEGIN"));
+        assert!(script.contains("ferric-trace tsc-mhz"));
+        assert!(script.contains("ferric-ring-test --scale"));
+        assert!(script.contains("shutdown"));
+        return;
+    }
     assert!(last_file("/usr/lib/init.d/30_console").contains("ion /usr/lib/ferric-smoke.ion"));
     let script = last_file("/usr/lib/ferric-smoke.ion");
     assert!(script.contains("echo FERRIC_SMOKE_BEGIN"));
@@ -254,8 +283,26 @@ fn fuzz_profile_keeps_saved_features_through_make_and_installer() {
 }
 
 #[test]
+fn scheduler_baseline_profile_reaches_make_and_installer() {
+    assert_profile("ferric-sched-bench");
+}
+
+#[test]
 fn ci_profiles_reject_unsupported_architectures_before_generation() {
-    for profile in ["ferric-smoke", "ferric-fuzz"] {
+    for (profile, message) in [
+        (
+            "ferric-smoke",
+            "Ferric smoke and fuzz configurations require x86_64",
+        ),
+        (
+            "ferric-fuzz",
+            "Ferric smoke and fuzz configurations require x86_64",
+        ),
+        (
+            "ferric-sched-bench",
+            "Ferric scheduler baseline configuration requires x86_64",
+        ),
+    ] {
         for arch in ["aarch64", "riscv64gc"] {
             let fixture = Fixture::new();
             let output = fixture.output(&[
@@ -264,10 +311,7 @@ fn ci_profiles_reject_unsupported_architectures_before_generation() {
                 &format!("image.config={profile}"),
             ]);
             assert!(!output.status.success());
-            assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("Ferric smoke and fuzz configurations require x86_64")
-            );
+            assert!(String::from_utf8_lossy(&output.stderr).contains(message));
             for command in ["check", "generate"] {
                 assert!(!fixture.output(&[command]).status.success());
             }

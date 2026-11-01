@@ -65,7 +65,7 @@ upstream URLs remain in use with increased retries. This also covers Cargo
 dependency resolution during feature generation; successful submodule checkout
 alone does not establish that Cargo can reach GitLab.
 
-`cargo test --locked -p ferric-config` includes smoke/fuzz profile regressions
+`cargo test --locked -p ferric-config` includes smoke/fuzz and scheduler-baseline profile regressions
 in `tools/ferric-config/tests/profiles.rs`. They exercise the public CLI and
 generated Makefile, then load the selected filesystem configuration through the
 installer's include resolver. They check inherited source packages, the effective
@@ -361,6 +361,23 @@ pass only shows the fix did not break joins.
 The edu driver is started through `pcid-spawner`, separately from the console
 test script. Its PCI matching configuration is in the IOMMU test recipe.
 Tests may skip absent optional features; do not interpret a skip as coverage.
+
+Image, profiler-image and CET-image builds use
+`.github/actions/prepare-image-runner` before restoring build caches or compiling
+packages. Hosted Ubuntu runners carry large SDKs that these container builds
+do not use. The jobs explicitly bind those host SDK directories under
+`/ferric-host-sdks`, then remove their contents to make room for source builds
+and image staging. Deleting the container's own SDK paths would only affect
+its overlay and would not reclaim that host storage.
+
+`scripts/ferric-ci/prepare-image-runner.sh` refuses cleanup outside a
+GitHub-hosted Linux Actions runner and validates every directory as a bind
+mount before deleting anything. It preserves mount roots and does not follow
+SDK symlinks. The workspace, package outputs, build caches and the container's
+toolchain remain available. Its log reports capacity before and after cleanup.
+Run `bash scripts/ferric-ci/test-prepare-image-runner.sh` for disposable-directory
+regressions covering environment guards, missing bindings, hidden/nested files
+and symlink targets; the tests mock mount discovery without touching host SDKs.
 
 `.github/workflows/image.yml` generates feature settings, forces KPTI on,
 enables IOMMU `auto`, shadow-stack policy `auto`, registered buffers,
@@ -871,6 +888,9 @@ and a merged rate over the same interval. The ring-test recipe's host tests
 exercise the same CQE validator used by the target workload, rejecting missing,
 duplicate, wrong-request, failed and short completions. The scheduler benchmark
 image/boot remains the check for measured wake latency and real completions.
+`bash scripts/ferric-ci/test-check-sched-bench-log.sh` checks that the baseline
+log validator accepts the actual trace-benchmark workload/state format and
+rejects missing measurement states, loss accounting or completion markers.
 
 ### Portable executor core
 
@@ -881,6 +901,59 @@ without depending on timing. `cargo miri test --locked -p ferric-exec-core --lib
 runs the same state/race checks. Host CI includes it with strict Clippy/Rustdoc.
 The crate is not linked into the kernel yet; these tests do not exercise actual
 interrupts, scheduler wait registration or timer hardware.
+
+### Shared timeout queue
+
+`cargo test --locked -p ferric-timed --features alloc` covers monotonic/realtime
+ordering and projection, forward/backward wall-clock changes, duplicate dates,
+earliest cancellation, tokens from another queue or an earlier queue lifetime,
+owner-wide cancellation, identifier exhaustion, dates beyond
+the hardware `u64` horizon, arithmetic saturation, concurrent consumers under
+one owner lock and exactly-once resource drops. A pending-set model checks mixed
+insert/cancel/expiry sequences across both clocks. Run the allocation-free
+arithmetic build separately with `cargo test --locked -p ferric-timed`.
+An integration test instruments the actual global allocator and verifies zero
+calls during due checks, expiry through the last entry, and cancellation with
+nonallocating payloads. A calibration free confirms the instrumentation is active.
+Host CI runs both configurations and Miri with `alloc`, and the queue must pass
+Clippy and warning-free Rustdoc with `--all-features`.
+
+For a reproducible queue-only before/after comparison, run:
+
+```sh
+cargo run --locked --release -p ferric-timed --features alloc --example timeout_bench
+```
+
+The example compares the former vector scan against ordered storage at 1, 64
+and 4096 pending timers. It reports registration and expiry cost per event and
+cost per pass with no due event. Ordered lookup also adds heap insertion/removal
+work, so report those costs alongside scan savings. These numbers do not measure
+kernel locks, event callbacks, hardware timers or scheduler latency.
+
+Kernel validation must build with `kernel.time.one_shot` enabled and disabled,
+then boot the corresponding image and exercise time-scheme events. Inspect
+`timeout_subscribers`, `timeout_next_monotonic_ns` and
+`timeout_latest_monotonic_ns` in `/scheme/sys/stat`. Dates are absolute monotonic
+nanoseconds or `none`. The latest-date diagnostic scans the registry; it is not
+used for rearming. These fields cover only time-scheme registrations and do not
+prove the scheduler has stopped its tick.
+
+The smoke image's `ferric-time-test` covers both clock domains, distinct owners,
+non-final descriptor closes, final-close cancellation, multi-record writes
+racing close, and due-timer event delivery through `/scheme/event/`. Distant
+sentinel deadlines let it check that all of an owner's timers disappear while
+ordinary driver and network timers remain live; it does not assume a globally
+empty queue. It prints `time-ownership`, `time-close-race` and `time-expiry` pass
+markers, required by image CI. The recipe also passes target Clippy/Rustdoc.
+This is regression coverage for
+[#362](https://github.com/rexlunae/ferric-oxide/issues/362); bounded IRQ execution
+and the full S9 teardown/failure matrix remain separate gates.
+
+The wider smoke suite currently assumes a read-only ext4 daemon in its
+`ext4-erofs` step. A build with `fs.ext4_write=true` can fail that assertion;
+[#364](https://github.com/rexlunae/ferric-oxide/issues/364) tracks the fixture
+mismatch. Preserve that result when reporting a run, even if the timer
+regressions pass.
 
 ### Delayed page-cache writeback notifications
 

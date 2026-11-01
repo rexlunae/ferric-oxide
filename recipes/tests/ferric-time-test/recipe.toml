@@ -1,0 +1,11 @@
+# Native time-scheme lifetime and expiry regressions for the smoke image.
+[source]
+path = "recipes/tests/ferric-time-test/files"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""

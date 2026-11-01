@@ -1,0 +1,8 @@
+name: Prepare image runner disk
+description: Free unused hosted SDK storage before compiling image packages.
+runs:
+  using: composite
+  steps:
+    - name: Free unused hosted SDK storage
+      shell: bash
+      run: bash "$GITHUB_WORKSPACE/scripts/ferric-ci/prepare-image-runner.sh"

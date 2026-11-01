@@ -43,6 +43,16 @@ These checks do not validate real page-table or TLB operations.
 An empty kernel wait condition can be destroyed without acquiring a lock or
 creating another clean lock token. This covers drained page-cache objects and
 queues closed during RedoxFS startup, including with `kernel.drop_panic` enabled.
+Explicit scheme-buffer release also cleans up after a copy-back fault and
+returns its errno without entering the unexpected-Drop diagnostic. The syscall
+fuzzer's fixed regressions pass a read-only mapped byte as read/write call
+output and require `EFAULT`, including with `kernel.drop_panic` enabled.
+Capture preparation retains ownership of head/tail buffers and records its
+mapped prefix until admission succeeds. A copy-in or mapping failure releases
+that partial capture after dropping the map lock. Fixed regressions fault both
+aligned and unaligned inputs, then require a successful write to confirm the
+borrowed syscall buffers can be reused.
+Image CI enables `kernel.drop_panic` to enforce these explicit-cleanup paths.
 The diagnostic still catches implicit destruction of a nonempty wait list;
 callers that hold a token use explicit notification/destruction paths. Host
 tests compile the actual ordered-lock and wait-condition modules and verify

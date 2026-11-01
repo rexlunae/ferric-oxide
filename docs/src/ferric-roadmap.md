@@ -105,6 +105,35 @@ baseline protocol ([#179], [#185]) whose numbers decide rollout.
 | S9 Validation | Deterministic interleaving, fault injection and teardown stress ([#184]) | S2–S8 |
 | S10 Decision | The P0–P6 factorial comparison and the keep/expand/retire decision ([#185]) | S1–S9 |
 
+### Completion priority and order
+
+**Complete the started Phase S migration as the next platform priority.**
+New Linux ABI implementation in Phase L follows this work; the graphics and
+compatibility designs remain recorded, and fixes needed to keep current builds
+and boots working can continue. A timer selftest or portable executor alone
+does not finish this phase.
+
+1. Refresh S1 baseline measurements using the corrected accounting and declare
+   the reference profile and budgets before candidate tuning. Preserve the
+   periodic baseline for comparison.
+2. Finish S2 clock/event integration and S6's validated topology model, with the
+   S4 preemption/IRQ audit. Build S3's shared earliest-deadline service and
+   measured-time EEVDF accounting on those interfaces. Validate tickless idle
+   before enabling event-driven busy scheduling and S7 placement.
+3. Bind S5's bounded async workers, wakeups and timers to that scheduler. Add
+   genuinely nonblocking scheme completion and cancellation ownership before
+   the optional async ring consumer. Preserve blocking callers and ring ABI
+   semantics throughout the migration.
+4. Complete the S8 admitted-reservation path and supported IPC propagation,
+   then S9 stress/failure coverage and S10's measured adoption decision.
+   Unsupported hardware or unmeasured timing bounds remain explicit limits.
+
+Land reviewable implementation increments with their feature controls,
+regressions, actual build/boot evidence and status-table updates. Keep each
+issue open until its acceptance criteria are met. Phase S completion is a
+requirement of the M2 workstation milestone; default changes still require
+the measured rollout decision.
+
 **Exit:** on the declared x86-64 profile, a tickless idle system generates zero
 scheduler timer IRQs and Pit broadcasts over a controlled 10-second
 no-deadline window; the waiting-ring workload shows at least 75% less
@@ -370,7 +399,7 @@ acceleration and bare-metal driver enablement; see the
 
 There are two release milestones:
 - **M1 "Server/VM usable":** Phases 0–4, Phase P (through P5), Phase B, Phase T and Phase V (hypervisor and enclaves), plus guest virtualization. An installable image runs real services in a VM with hardening and sandboxing on by default.
-- **M2 "Workstation usable":** M1 plus Phases 5–6 and Phase L's declared desktop compatibility profile. It installs on the reference laptop and desktop, gives the hardware-accelerated Smithay-based Wayland desktop with Mesa rendering, integrated Xwayland and tested Linux Wayland/X11 applications, with Wi-Fi, suspend and a browser, and builds itself (self-hosting).
+- **M2 "Workstation usable":** M1 plus completed Phase S, Phases 5–6 and Phase L's declared desktop compatibility profile. It installs on the reference laptop and desktop, gives the hardware-accelerated Smithay-based Wayland desktop with Mesa rendering, integrated Xwayland and tested Linux Wayland/X11 applications, with Wi-Fi, suspend and a browser, and builds itself (self-hosting).
 
 Both milestones need versioned releases with signed images, a signed package repository with an update channel, release notes and an upstream-sync policy.
 

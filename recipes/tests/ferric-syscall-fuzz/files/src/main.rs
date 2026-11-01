@@ -877,6 +877,47 @@ impl Fuzzer {
         if sys::is_err(mapped) {
             regressed(&format!("valid file-backed fmap failed: {mapped:#x}"));
         }
+        for bad in [0x1000, 0x1001] {
+            // SAFETY: the low address is deliberately unmapped, and the
+            // descriptor is ours. No Rust reference to that address is formed.
+            let result = unsafe { sys::call(sys::WRITE, [file, bad, 1, 0, 0, 0]) };
+            if result != (syscall::EFAULT as usize).wrapping_neg() {
+                regressed(&format!(
+                    "write from {bad:#x} returned {result:#x}, not EFAULT"
+                ));
+            }
+            // SAFETY: the one-byte input is inside this child's live buffer.
+            let written =
+                unsafe { sys::call(sys::WRITE, [file, self.buf.as_ptr() as usize, 1, 0, 0, 0]) };
+            if written != 1 {
+                regressed(&format!(
+                    "write after capture fault returned {written:#x}, not 1"
+                ));
+            }
+        }
+        // Capture can read this byte, but copying a read/write call's result
+        // back to a read-only page must fail normally. Explicit guard release
+        // used to take its unexpected-Drop panic path after that EFAULT.
+        // SAFETY: the descriptor and read-only mapping are ours. The syscall
+        // must refuse output to this page; no Rust mutable reference is created.
+        let result = unsafe {
+            sys::call(
+                sys::CALL,
+                [
+                    file,
+                    mapped + 1,
+                    1,
+                    (syscall::CallFlags::READ | syscall::CallFlags::WRITE).bits(),
+                    0,
+                    0,
+                ],
+            )
+        };
+        if result != (syscall::EFAULT as usize).wrapping_neg() {
+            regressed(&format!(
+                "scheme call with read-only output returned {result:#x}, not EFAULT"
+            ));
+        }
         // SAFETY: this is exactly the mapping returned by the preceding call.
         let unmapped = unsafe { sys::call(sys::FUNMAP, [mapped, PAGE_SIZE, 0, 0, 0, 0]) };
         if sys::is_err(unmapped) {

@@ -469,11 +469,11 @@ impl UserInner {
             )
         };
 
-        let mut tail = BorrowedHtBuf::tail_locked(token.downgrade())?;
-        let tail_frame = tail.frame();
-        if buf.len() > tail.buf().len() {
+        if buf.len() > PAGE_SIZE {
             return Err(Error::new(EINVAL));
         }
+        let mut tail = BorrowedHtBuf::tail_locked(token.downgrade())?;
+        let tail_frame = tail.frame();
         tail.buf_mut()[..buf.len()].copy_from_slice(buf);
 
         let is_pinned = true;
@@ -491,7 +491,14 @@ impl UserInner {
                             tail_frame, dst_page, flags, mapper, flusher, is_pinned,
                         )
                     },
-                )?
+                )
+        };
+        let dst_page = match dst_page {
+            Ok(page) => page,
+            Err(error) => {
+                tail.into_drop(token);
+                return Err(error);
+            }
         };
 
         let base = dst_page.start_address().data();
@@ -631,209 +638,204 @@ impl UserInner {
 
         let head_len = core::cmp::min(PAGE_SIZE - offset, user_buf.len());
 
-        let head_buf_opt = if !head_part_of_buf.is_empty() {
-            // FIXME: Signal context can probably recursively use head/tail.
-            let mut array = BorrowedHtBuf::head_locked(token.downgrade())?;
-            if READ {
-                array.buf_mut()[..offset].fill(0_u8);
-                array.buf_mut()[offset + head_len..].fill(0_u8);
-                let slice = &mut array.buf_mut()[offset..][..head_len];
+        // Keep acquired buffers and the mapped prefix outside the fallible
+        // preparation scope. Its map lock must be gone before explicit cleanup.
+        let mut head_buf_opt = None;
+        let mut tail_buf_opt = None;
+        let mut mapped_base = None;
+        let mut mapped_count = 0_usize;
+        let result = (|| -> Result<usize> {
+            if !head_part_of_buf.is_empty() {
+                // FIXME: Signal context can probably recursively use head/tail.
+                let array = head_buf_opt.insert(BorrowedHtBuf::head_locked(token.downgrade())?);
+                if READ {
+                    array.buf_mut()[..offset].fill(0_u8);
+                    array.buf_mut()[offset + head_len..].fill(0_u8);
+                    let slice = &mut array.buf_mut()[offset..][..head_len];
 
-                head_part_of_buf
-                    .reinterpret_unchecked::<true, false>()
-                    .copy_to_slice(slice)?;
-            } else {
-                array.buf_mut().fill(0_u8);
+                    head_part_of_buf
+                        .reinterpret_unchecked::<true, false>()
+                        .copy_to_slice(slice)?;
+                } else {
+                    array.buf_mut().fill(0_u8);
+                }
             }
-            Some(array)
-        } else {
-            None
-        };
 
-        let tail_buf_opt = if !tail_part_of_buf.is_empty() {
-            // FIXME: Signal context can probably recursively use head/tail.
-            let mut array = BorrowedHtBuf::tail_locked(token.downgrade())?;
+            if !tail_part_of_buf.is_empty() {
+                // FIXME: Signal context can probably recursively use head/tail.
+                let array = tail_buf_opt.insert(BorrowedHtBuf::tail_locked(token.downgrade())?);
 
-            if READ {
-                let (to_copy, to_zero) = array.buf_mut().split_at_mut(tail_size);
-                to_zero.fill(0_u8);
+                if READ {
+                    let (to_copy, to_zero) = array.buf_mut().split_at_mut(tail_size);
+                    to_zero.fill(0_u8);
 
-                // FIXME: remove reinterpret_unchecked
-                tail_part_of_buf
-                    .reinterpret_unchecked::<true, false>()
-                    .copy_to_slice(to_copy)?;
-            } else {
-                array.buf_mut().fill(0_u8);
+                    // FIXME: remove reinterpret_unchecked
+                    tail_part_of_buf
+                        .reinterpret_unchecked::<true, false>()
+                        .copy_to_slice(to_copy)?;
+                } else {
+                    array.buf_mut().fill(0_u8);
+                }
             }
-            Some(array)
-        } else {
-            None
-        };
 
-        let mut dst_space_guard = dst_space_lock.acquire_write(token.downgrade());
-        let (dst_space, _token_split) = dst_space_guard.token_split();
+            let mut dst_space_guard = dst_space_lock.acquire_write(token.downgrade());
+            let (dst_space, _token_split) = dst_space_guard.token_split();
 
-        let free_span = dst_space
-            .grants
-            .find_free(dst_space.mmap_min, page_count)
-            .ok_or(Error::new(ENOMEM))?;
-
-        let head = if let Some(array) = head_buf_opt {
-            let frame = array.frame();
-            dst_space.mmap(
-                &dst_space_lock,
-                Some(free_span.base),
-                ONE,
-                map_flags | MAP_FIXED_NOREPLACE,
-                None,
-                move |dst_page, page_flags, mapper, flusher| {
-                    let is_pinned = true;
-                    Grant::allocated_shared_one_page(
-                        frame, dst_page, page_flags, mapper, flusher, is_pinned,
-                    )
-                },
-            )?;
-
-            CopyInfo {
-                src: Some(array),
-                dst: WRITE.then_some(head_part_of_buf.reinterpret_unchecked()),
-            }
-        } else {
-            CopyInfo {
-                src: None,
-                dst: None,
-            }
-        };
-        let (first_middle_dst_page, first_middle_src_page) = if !head_part_of_buf.is_empty() {
-            (free_span.base.next(), src_page.next())
-        } else {
-            (free_span.base, src_page)
-        };
-
-        if let Some(middle_page_count) = NonZeroUsize::new(middle_page_count)
-            && !middle_bounce.is_empty()
-        {
-            // Ferric Oxide: the copy, pinned like a borrow.
-            let frames = middle_bounce.frames();
-            dst_space.mmap(
-                &dst_space_lock,
-                Some(first_middle_dst_page),
-                middle_page_count,
-                map_flags | MAP_FIXED_NOREPLACE,
-                None,
-                |dst_page, page_flags, mapper, flusher| {
-                    let is_pinned = true;
-                    Grant::allocated_shared(
-                        &frames, dst_page, page_flags, mapper, flusher, is_pinned,
-                    )
-                },
-            )?;
-            // `allocated_shared` maps fewer pages when the page tables run out part way. A
-            // partly mapped buffer must not reach the scheme: undo the head and what was
-            // mapped of the middle, and fail as the other mappings here do.
-            let mapped = dst_space
+            let free_span = dst_space
                 .grants
-                .contains(first_middle_dst_page)
-                .map_or(0, |(_, info)| info.page_count());
-            if mapped != middle_page_count.get() {
-                let done = first_middle_dst_page
-                    .offset_from(free_span.base)
-                    .saturating_add(mapped);
-                drop(dst_space_guard);
-                let notify =
-                    dst_space_lock.munmap(PageSpan::new(free_span.base, done), true, token)?;
-                handle_notify_files(notify, token);
-                return Err(Error::new(ENOMEM));
+                .find_free(dst_space.mmap_min, page_count)
+                .ok_or(Error::new(ENOMEM))?;
+            mapped_base = Some(free_span.base);
+
+            if let Some(array) = head_buf_opt.as_ref() {
+                let frame = array.frame();
+                dst_space.mmap(
+                    &dst_space_lock,
+                    Some(free_span.base),
+                    ONE,
+                    map_flags | MAP_FIXED_NOREPLACE,
+                    None,
+                    move |dst_page, page_flags, mapper, flusher| {
+                        let is_pinned = true;
+                        Grant::allocated_shared_one_page(
+                            frame, dst_page, page_flags, mapper, flusher, is_pinned,
+                        )
+                    },
+                )?;
+
+                mapped_count = mapped_count.saturating_add(1);
             }
-        } else if let Some(middle_page_count) = NonZeroUsize::new(middle_page_count) {
-            dst_space.mmap(
-                &dst_space_lock,
-                Some(first_middle_dst_page),
-                middle_page_count,
-                map_flags | MAP_FIXED_NOREPLACE,
-                None,
-                move |dst_page, _, mapper, flusher| {
-                    let eager = true;
+            let (first_middle_dst_page, first_middle_src_page) = if !head_part_of_buf.is_empty() {
+                (free_span.base.next(), src_page.next())
+            } else {
+                (free_span.base, src_page)
+            };
 
-                    // It doesn't make sense to allow a context, that has borrowed non-RAM physical
-                    // memory, to DIRECTLY do scheme calls onto that memory.
-                    //
-                    // (TODO: Maybe there are some niche use cases for that, possibly PCI transfer
-                    // BARs, but it doesn't make sense yet.)
-                    let allow_phys = false;
+            if let Some(middle_page_count) = NonZeroUsize::new(middle_page_count)
+                && !middle_bounce.is_empty()
+            {
+                // Ferric Oxide: the copy, pinned like a borrow.
+                let frames = middle_bounce.frames();
+                dst_space.mmap(
+                    &dst_space_lock,
+                    Some(first_middle_dst_page),
+                    middle_page_count,
+                    map_flags | MAP_FIXED_NOREPLACE,
+                    None,
+                    |dst_page, page_flags, mapper, flusher| {
+                        let is_pinned = true;
+                        Grant::allocated_shared(
+                            &frames, dst_page, page_flags, mapper, flusher, is_pinned,
+                        )
+                    },
+                )?;
+                // `allocated_shared` maps fewer pages when the page tables run out part way. A
+                // partly mapped buffer must not reach the scheme: undo the head and what was
+                // mapped of the middle, and fail as the other mappings here do.
+                let mapped = dst_space
+                    .grants
+                    .contains(first_middle_dst_page)
+                    .map_or(0, |(_, info)| info.page_count());
+                mapped_count = mapped_count.saturating_add(mapped);
+                if mapped != middle_page_count.get() {
+                    return Err(Error::new(ENOMEM));
+                }
+            } else if let Some(middle_page_count) = NonZeroUsize::new(middle_page_count) {
+                dst_space.mmap(
+                    &dst_space_lock,
+                    Some(first_middle_dst_page),
+                    middle_page_count,
+                    map_flags | MAP_FIXED_NOREPLACE,
+                    None,
+                    move |dst_page, _, mapper, flusher| {
+                        let eager = true;
 
-                    // Deny any attempts by the scheme, to unmap these temporary pages. The only way to
-                    // unmap them is to respond to the scheme socket.
-                    let is_pinned_userscheme_borrow = true;
+                        // It doesn't make sense to allow a context, that has borrowed non-RAM physical
+                        // memory, to DIRECTLY do scheme calls onto that memory.
+                        //
+                        // (TODO: Maybe there are some niche use cases for that, possibly PCI transfer
+                        // BARs, but it doesn't make sense yet.)
+                        let allow_phys = false;
 
-                    // TODO: Not a Lock ordering violation
-                    // we've checked Arc::ptr_eq(&dst_space_lock, &cur_space_lock) before,
-                    // but it's difficult to apply cur_space_lock.arquire_rewrite
-                    let mut token = unsafe { CleanLockToken::new() };
-                    let mut cur_space_guard =
-                        unsafe { cur_space_lock.acquire_rewrite(token.downgrade()) };
-                    Grant::borrow(
-                        Arc::clone(&cur_space_lock),
-                        &mut cur_space_guard,
-                        first_middle_src_page,
-                        dst_page,
-                        middle_page_count.get(),
-                        map_flags,
-                        mapper,
-                        flusher,
-                        eager,
-                        allow_phys,
-                        is_pinned_userscheme_borrow,
-                    )
-                },
-            )?;
-        }
+                        // Deny any attempts by the scheme, to unmap these temporary pages. The only way to
+                        // unmap them is to respond to the scheme socket.
+                        let is_pinned_userscheme_borrow = true;
 
-        let tail = if let Some(array) = tail_buf_opt {
-            let tail_dst_page = first_middle_dst_page.next_by(middle_page_count);
-            let frame = array.frame();
-
-            dst_space.mmap(
-                &dst_space_lock,
-                Some(tail_dst_page),
-                ONE,
-                map_flags | MAP_FIXED_NOREPLACE,
-                None,
-                move |dst_page, page_flags, mapper, flusher| {
-                    let is_pinned = true;
-                    Grant::allocated_shared_one_page(
-                        frame, dst_page, page_flags, mapper, flusher, is_pinned,
-                    )
-                },
-            )?;
-
-            CopyInfo {
-                src: Some(array),
-                dst: WRITE.then_some(tail_part_of_buf.reinterpret_unchecked()),
+                        // TODO: Not a Lock ordering violation
+                        // we've checked Arc::ptr_eq(&dst_space_lock, &cur_space_lock) before,
+                        // but it's difficult to apply cur_space_lock.arquire_rewrite
+                        let mut token = unsafe { CleanLockToken::new() };
+                        let mut cur_space_guard =
+                            unsafe { cur_space_lock.acquire_rewrite(token.downgrade()) };
+                        Grant::borrow(
+                            Arc::clone(&cur_space_lock),
+                            &mut cur_space_guard,
+                            first_middle_src_page,
+                            dst_page,
+                            middle_page_count.get(),
+                            map_flags,
+                            mapper,
+                            flusher,
+                            eager,
+                            allow_phys,
+                            is_pinned_userscheme_borrow,
+                        )
+                    },
+                )?;
+                mapped_count = mapped_count.saturating_add(middle_page_count.get());
             }
-        } else {
-            CopyInfo {
-                src: None,
-                dst: None,
+
+            if let Some(array) = tail_buf_opt.as_ref() {
+                let tail_dst_page = first_middle_dst_page.next_by(middle_page_count);
+                let frame = array.frame();
+
+                dst_space.mmap(
+                    &dst_space_lock,
+                    Some(tail_dst_page),
+                    ONE,
+                    map_flags | MAP_FIXED_NOREPLACE,
+                    None,
+                    move |dst_page, page_flags, mapper, flusher| {
+                        let is_pinned = true;
+                        Grant::allocated_shared_one_page(
+                            frame, dst_page, page_flags, mapper, flusher, is_pinned,
+                        )
+                    },
+                )?;
+
+                mapped_count = mapped_count.saturating_add(1);
             }
-        };
 
-        drop(dst_space_guard);
+            Ok(free_span.base.start_address().data() + offset)
+        })();
 
-        let base = free_span.base.start_address().data() + offset;
-        Ok(CaptureGuard {
+        let capture = CaptureGuard {
             destroyed: false,
-            base,
+            // A failed admission has no output to copy back. Release only its
+            // mapped prefix and acquired buffers, after dropping the map lock.
+            base: result.as_ref().copied().unwrap_or(DANGLING),
             len: user_buf.len(),
-            head,
-            tail,
-            middle: middle_bounce,
-            span: {
-                let (first_page, page_count, _offset) = page_range_containing(base, user_buf.len());
-                PageSpan::new(first_page, page_count)
+            head: CopyInfo {
+                src: head_buf_opt,
+                dst: (WRITE && !head_part_of_buf.is_empty())
+                    .then_some(head_part_of_buf.reinterpret_unchecked()),
             },
+            tail: CopyInfo {
+                src: tail_buf_opt,
+                dst: (WRITE && !tail_part_of_buf.is_empty())
+                    .then_some(tail_part_of_buf.reinterpret_unchecked()),
+            },
+            middle: middle_bounce,
+            span: PageSpan::new(mapped_base.unwrap_or(src_page), mapped_count),
             addrsp: Some(dst_space_lock),
-        })
+        };
+        match result {
+            Ok(_) => Ok(capture),
+            Err(error) => {
+                capture.release(token)?;
+                Err(error)
+            }
+        }
     }
 
     pub fn read(&self, buf: UserSliceWo, flags: u32, token: &mut CleanLockToken) -> Result<usize> {
@@ -1538,12 +1540,21 @@ impl<const READ: bool, const WRITE: bool> CaptureGuard<READ, WRITE> {
         self.middle.write_back()?;
         self.release_inner_drop(token)
     }
+    /// Copies back results and explicitly releases the captured resources.
+    ///
+    /// # Errors
+    /// Returns a copy-back or unmapping error after attempting resource cleanup.
+    /// A failed explicit release does not invoke the unexpected-Drop diagnostic.
     pub fn release(mut self, token: &mut CleanLockToken) -> Result<()> {
-        self.release_inner(token)?;
+        let result = self.release_inner(token);
+        // Copy-back can fault before release_inner reaches resource cleanup.
+        // Explicit release still owns cleanup on that error path; it must not
+        // invoke the unexpected-Drop diagnostic when returning the errno.
+        let cleanup = self.release_inner_drop(token);
 
         // Safe to ignore as we're already dropped all that need drop
         let _ = ManuallyDrop::new(self);
-        Ok(())
+        result.and(cleanup)
     }
 }
 impl<const READ: bool, const WRITE: bool> Drop for CaptureGuard<READ, WRITE> {

@@ -207,6 +207,38 @@ it held one would leave any context that logs on that CPU spinning forever.
 The periodic PIT path remains the scheduler's event source until the event-driven
 scheduler (#187) takes over.
 
+The time-scheme event registry now uses `ferric-timed`'s `alloc` timeout queues,
+ordered separately by absolute monotonic and realtime dates. Both clock domains
+are sampled from one monotonic reading and a captured realtime offset. Expiry
+removes each registration once under the registry lock; event delivery happens
+after releasing it. Earliest-wakeup lookup inspects the two queue heads and
+projects realtime dates into monotonic time on each query, preserving wall-clock
+adjustments and the time scheme's full `u128` date range. Binary heaps retain
+their capacity on expiry, so removing even the last entry does not allocate or
+free storage in the timer interrupt. Returned event payloads are plain IDs.
+Cancellation identities are distinct across queues and never recycle.
+
+Final close cancels all pending registrations belonging to the handle
+([#362](https://github.com/rexlunae/ferric-oxide/issues/362)). Registration
+revalidates the handle after usercopy and retains its map's read lock through
+admission (L1 handles, L2 timeout registry). Close holds that map exclusively
+through cancellation, preventing a late insertion after teardown. Expiry can
+claim a registration before close; file-description teardown unregisters event
+subscribers before entering scheme close. Event callbacks hold neither lock.
+Individual and owner-wide cancellation take O(n), retaining heap capacity.
+
+`/scheme/sys/stat` retains `timeout_subscribers` and adds
+`timeout_next_monotonic_ns`: the earliest projected nanosecond deadline, or
+`none` when no time-scheme event is pending. `timeout_latest_monotonic_ns`
+reports the other end of the pending range with an O(n) diagnostic scan. This
+lets resource tests identify distant test timers among live driver timers.
+These fields are a diagnostic snapshot of
+that registry, not the minimum of all context, scheduler and async deadlines.
+The ordered registry is one input to the planned shared deadline service;
+hardware rearm notifications, context-wait integration and the scheduler switch
+remain unfinished. The periodic path still dispatches time-scheme events, so
+this change does not establish tickless behavior or bounded IRQ execution.
+
 Address-space mappings, sharing and copy-on-write live under
 `crates/kernel/src/context/`; physical allocation and page tables are in
 `src/memory/` and the kernel's `rmm/`. Registered buffers and DMA retain frame

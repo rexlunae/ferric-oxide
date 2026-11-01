@@ -17,6 +17,8 @@ on:
       - "scripts/ferric-ci/boot-smoke.sh"
       - "scripts/ferric-ci/boot-cet.sh"
       - ".github/workflows/cet-image.yml"
+      - ".github/actions/prepare-image-runner/**"
+      - "scripts/ferric-ci/prepare-image-runner.sh"
       - ".github/actions/prepare-submodules/**"
       - ".github/actions/prepare-cargo-git/**"
 
@@ -33,6 +35,14 @@ jobs:
     timeout-minutes: 180
     container:
       image: docker.io/redoxos/redox-base-x86_64:latest
+      # These host SDKs are unused by the build container. Explicit mounts let
+      # preparation reclaim host disk blocks rather than create overlay whiteouts.
+      volumes:
+        - /usr/local/lib/android:/ferric-host-sdks/android
+        - /usr/share/dotnet:/ferric-host-sdks/dotnet
+        - /opt/ghc:/ferric-host-sdks/ghc
+        - /usr/share/swift:/ferric-host-sdks/swift
+        - /opt/hostedtoolcache:/ferric-host-sdks/toolcache
     env:
       PODMAN_BUILD: "0"
       SKIP_CHECK_TOOLS: "1"
@@ -42,6 +52,8 @@ jobs:
       CI: "1"
     steps:
       - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/prepare-image-runner
 
       - uses: ./.github/actions/prepare-submodules
 

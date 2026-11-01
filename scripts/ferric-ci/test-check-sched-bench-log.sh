@@ -46,7 +46,15 @@ log() {
     done
     echo "FERRIC_BENCH ring null-write-64 min_ns=1"
     echo "FERRIC_BENCH ring file-read-4k min_ns=1"
-    echo "FERRIC_BENCH trace-bench io off min_ns=1"
+    # The actual ferric-trace-bench protocol (files/src/redox.rs::report).
+    echo "FERRIC_BENCH io off min_ns=39835.2 median_ns=40324.8 rounds=200"
+    echo "FERRIC_BENCH io pairoff min_ns=39878.4 median_ns=40438.3 rounds=200"
+    echo "FERRIC_BENCH io on min_ns=41499.6 median_ns=42170.3 rounds=200"
+    echo "FERRIC_BENCH syscall off min_ns=328.2 median_ns=329.5 rounds=200"
+    echo "FERRIC_BENCH syscall pairoff min_ns=329.3 median_ns=331.2 rounds=200"
+    echo "FERRIC_BENCH syscall on min_ns=383.5 median_ns=388.7 rounds=200"
+    echo "FERRIC_BENCH lost records=73574"
+    echo "FERRIC_TEST_PASS trace-bench"
     echo "FERRIC_BENCH iobench-seq-read min_ns=1"
     echo "FERRIC_SCHED_BENCH_DONE"
     echo "FERRIC_SMOKE_OK"
@@ -68,6 +76,22 @@ log 1 | sed 's/$/\r/' > "$work/up.log"
 expect "1-vCPU baseline" 0 "$work/up.log" 1
 grep -qF "counts sched.tick cpu=all" "$work/output" || fail "1-vCPU baseline" "counts lines not in the notice"
 grep -qF "FERRIC_SCHED_BENCH_TSC tsc_mhz=2800.213" "$work/output" || fail "1-vCPU baseline" "TSC rate not in the notice"
+grep -qF "FERRIC_BENCH io off min_ns=39835.2" "$work/output" || fail "1-vCPU baseline" "trace benchmark not in the notice"
+
+# A pass marker alone cannot stand in for measurements, and measurements alone
+# cannot stand in for successful completion.
+for workload in io syscall; do
+    for state in off pairoff on; do
+        grep -v "FERRIC_BENCH $workload $state " "$work/smp.log" > "$work/no-trace-result.log"
+        expect "missing trace $workload $state" 1 "$work/no-trace-result.log" 4
+    done
+done
+grep -v 'FERRIC_TEST_PASS trace-bench' "$work/smp.log" > "$work/no-trace-pass.log"
+expect "trace benchmark without completion" 1 "$work/no-trace-pass.log" 4
+grep -v 'FERRIC_BENCH lost records=' "$work/smp.log" > "$work/no-lost.log"
+expect "trace benchmark without loss accounting" 1 "$work/no-lost.log" 4
+sed 's/FERRIC_BENCH io off /FERRIC_BENCH trace-bench io off /' "$work/smp.log" > "$work/wrong-label.log"
+expect "invented trace-bench prefix" 1 "$work/wrong-label.log" 4
 
 # A 4-vCPU boot still needs its IPIs.
 expect "4-vCPU log without IPIs" 1 "$work/up.log" 4
