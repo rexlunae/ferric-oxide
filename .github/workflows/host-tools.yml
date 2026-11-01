@@ -45,7 +45,9 @@ on:
       - "recipes/tests/ferric-netq-test/**"
       - "recipes/tests/ferric-xstate-test/**"
       - ".github/workflows/host-tools.yml"
+      - ".gitmodules"
       - ".github/actions/prepare-cargo-git/**"
+      - ".github/actions/prepare-submodules/**"
       - ".github/actions/prepare-image-runner/**"
 
 concurrency:
@@ -59,7 +61,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/prepare-cargo-git
+      - uses: ./.github/actions/prepare-submodules
       - uses: actions/cache@v4
         with:
           path: |

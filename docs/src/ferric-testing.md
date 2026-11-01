@@ -57,13 +57,14 @@ reading their payload, and check generated wire layouts against literal byte
 fixtures. CI also checks `ferric-fat-types` on the host and bare metal and verifies
 that fatd's default dependency graph excludes `ferric-exfat`.
 
-Host, kernel and image jobs use `.github/actions/prepare-cargo-git` before
-running Cargo. It enables Git's fetch client, caches pinned Git dependencies and
-rewrites the verified `pkgar` and `pkgutils` URLs to their GitHub mirrors, retaining
-the lockfiles' exact commit IDs. Other mirrors can lack current commits, so their
-upstream URLs remain in use with increased retries. This also covers Cargo
-dependency resolution during feature generation; successful submodule checkout
-alone does not establish that Cargo can reach GitLab.
+Host, kernel and image jobs use `.github/actions/prepare-cargo-git`, directly or
+through `.github/actions/prepare-submodules`, before running Cargo. It enables
+Git's fetch client and caches pinned Git dependencies from the
+[Ferric-maintained mirrors](ferric-build.md#dependency-sources), retaining the
+lockfiles' exact commit IDs. The submodule setup restores Git metadata and then
+materializes the pinned working trees. These are separate prerequisites: relibc's
+workspace resolution needs its `dlmalloc-rs` submodule, while Cargo also needs
+its registry and Git dependencies.
 
 `cargo test --locked -p ferric-config` includes smoke/fuzz and scheduler-baseline profile regressions
 in `tools/ferric-config/tests/profiles.rs`. They exercise the public CLI and
@@ -326,12 +327,15 @@ changed state fails, without retrying the probe. Existing preservation and
 cross-context leakage stress still run afterward.
 
 The host capability/layout checks compile the actual runtime module without the
-rest of the Redox-only runtime:
+rest of the Redox-only runtime. Cargo commands for the relibc workspace also
+require its pinned submodules, including `dlmalloc-rs` for workspace dependency
+resolution:
 
 ```sh
 rustc --edition=2024 --test -D warnings \
   crates/relibc/redox-rt/tests/vector_state.rs -o /tmp/ferric-vector-state-tests
 /tmp/ferric-vector-state-tests
+git submodule update --init --recursive
 cargo build --locked --manifest-path crates/relibc/Cargo.toml \
   -p redox-rt --target x86_64-unknown-redox
 cargo clippy --locked --manifest-path recipes/tests/ferric-xstate-test/files/Cargo.toml \
@@ -340,6 +344,9 @@ cargo clippy --locked --manifest-path recipes/tests/ferric-xstate-test/files/Car
 
 Host CI runs these checks, strict runtime/recipe Clippy and Rustdoc, and the
 recipe's host program (a capability skip when AVX-512 is unavailable).
+Its test job uses the same cached pinned-submodule setup as image builds,
+including materializing working trees after restoring Git metadata. That setup
+also prepares Cargo's Git dependencies.
 The native image test exercises the actual signal trampolines. A host execution
 of the recipe program uses the host's signal runtime, so it validates the probe
 rather than relibc. Running all of `redox-rt`'s unit tests as a Linux-target
