@@ -1047,6 +1047,8 @@ sentinel deadlines let it check that all of an owner's timers disappear while
 ordinary driver and network timers remain live; it does not assume a globally
 empty queue. It prints `time-ownership`, `time-close-race` and `time-expiry` pass
 markers, required by image CI. The recipe also passes target Clippy/Rustdoc.
+Recipe-only pull requests trigger these host-tools timer checks through the
+workflow's path filter.
 This is regression coverage for
 [#362](https://github.com/rexlunae/ferric-oxide/issues/362); bounded IRQ execution
 and the full S9 teardown/failure matrix remain separate gates.

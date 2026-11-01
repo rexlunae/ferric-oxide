@@ -75,10 +75,13 @@
 //!   `syscall.exit` records every call; `filter syscall.enter none` removes it, and filters on
 //!   unknown events or arguments are refused.
 //! - `trace-clock`: the `clock` file names the clock timestamps come from
-//!   (`ferric_trace::clock`), and two marker writes 200 ms apart have timestamps that agree
+//!   (`ferric_trace::clock`), and two marker writes at least 200 ms apart have timestamps that agree
 //!   with the wall time between them, within a factor of two, when the clock's tick length is
 //!   known (the KVM clock, the HPET); for the TSC only their order is checked, and the
-//!   frequency they imply is printed.
+//!   frequency they imply is printed. Bounded mapped-ring polling keeps both markers and
+//!   every controlled load write while generating more than twice the combined rings' capacity.
+//!   Each pass takes one peek per CPU, retains only matching counts/timestamps, then commits.
+//!   `FERRIC_TRACE_CLOCK` reports per-CPU head/tail/loss deltas and observed peak pending words.
 //! - `trace-cap`: a process that is not root cannot open the scheme by path, but can through
 //!   a capability (`cap/read`, `cap/control`) root handed it, with that capability's access
 //!   and no more, and cannot open `emit` by path or through `cap/read`; see `redox::cap`.
@@ -91,6 +94,9 @@
 //! `ferric-trace-test crash` runs the crash-dump test instead (`kernel.trace_crash`): on a
 //! crash-test kernel's first boot it panics the kernel on purpose (`trace-crash-armed`), and on
 //! the boot after it checks the dump that panic left (`trace-crash-read`); see `redox::crash`.
+
+#[cfg(any(target_os = "redox", test))]
+mod clock_capture;
 
 #[cfg(target_os = "redox")]
 mod redox;

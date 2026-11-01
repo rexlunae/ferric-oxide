@@ -171,7 +171,7 @@ fn collect(
     let limit = Instant::now() + TEARDOWN;
     loop {
         // The clone's facts, copied out: nothing may borrow `trace` past the drain below.
-        let (mut new_space, mut clone_at, mut duplicates, mut torn) = (None, None, false, false);
+        let (mut new_space, mut clone_at, mut duplicates) = (None, None, false);
         for clone in clones(&trace, space) {
             if new_space.is_none() {
                 new_space = clone.arg(1);
@@ -184,9 +184,10 @@ fn collect(
             return Err(check(STEP, "more than one mm.clone for one fork"));
         }
         if let (Some(new), Some(at)) = (new_space, clone_at) {
-            torn = trace.iter().flatten().any(|e| {
-                e.is(&MM_DESTROY) && e.arg(0) == Some(new) && e.timestamp >= at
-            });
+            let torn = trace
+                .iter()
+                .flatten()
+                .any(|e| e.is(&MM_DESTROY) && e.arg(0) == Some(new) && e.timestamp >= at);
             if torn {
                 return Ok(trace);
             }
@@ -312,7 +313,7 @@ pub(super) fn check_journal(cpus: &[u32]) -> Result<(), Failure> {
         // (`stats` counts the drops). Drain before the fork, keeping the mapping records,
         // so the `mm.clone` and `mm.clone_skip` the fork is about to write land in rings
         // with a whole ring of room until the next drain.
-        let mut trace = drain(STEP, cpus)?;
+        let trace = drain(STEP, cpus)?;
         let (contiguous, child) = fork_with_contiguous()?;
         let at = Addresses {
             first,

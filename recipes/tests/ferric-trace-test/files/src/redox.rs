@@ -6,9 +6,9 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 
+use crate::clock_capture::{CaptureError, CountsError};
 use ferric_trace::abi::{self, EventLine, StatsLine};
 use ferric_trace::abi::{CPU_MAP_BYTES, CpuCommand};
-use ferric_trace::clock::ClockLine;
 use ferric_trace::config::{BootConfig, INITFS_PATH};
 use ferric_trace::kernel::{
     CATALOG, MM_PAGE_FAULT, PageFaultFlags, PageFaultOutcome, SCHED_SWITCH, SCHEME_CANCEL,
@@ -22,6 +22,7 @@ use syscall::schemev2::Opcode;
 use syscall::{EACCES, EBADF, EFAULT, EINVAL, ENOENT, MapFlags, SYS_READ, SYS_WRITE, SYS_YIELD};
 
 mod cap;
+mod clock;
 mod crash;
 mod futex;
 mod journal;
@@ -60,6 +61,15 @@ struct Failure {
 /// What went wrong in a step.
 #[derive(Debug)]
 enum Why {
+    /// A bounded mapped capture failed validation.
+    Capture { cpu: u32, source: CaptureError },
+    /// The clock probe did not retain exactly its issued writes.
+    ClockCounts(CountsError),
+    /// The clock descriptor does not contain a valid clock line.
+    ClockLine {
+        line: String,
+        source: abi::LineError,
+    },
     /// A file of the scheme could not be used.
     Io { path: String, source: io::Error },
     /// A system call gave the wrong answer.
@@ -75,9 +85,24 @@ impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: ", self.step)?;
         match &self.why {
-            Why::Io { path, source } => write!(f, "{path}: {source}"),
+            Why::Io { path, .. } => f.write_str(path),
+            Why::Capture { cpu, .. } => write!(f, "cpu {cpu} capture"),
+            Why::ClockCounts(_) => f.write_str("clock write counts"),
+            Why::ClockLine { line, .. } => write!(f, "clock line {line:?}"),
             Why::Call { call, result } => write!(f, "{call} returned {result:?}"),
             Why::Check(what) => f.write_str(what),
+        }
+    }
+}
+
+impl std::error::Error for Failure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.why {
+            Why::Io { source, .. } => Some(source),
+            Why::Capture { source, .. } => Some(source),
+            Why::ClockCounts(source) => Some(source),
+            Why::ClockLine { source, .. } => Some(source),
+            _ => None,
         }
     }
 }
@@ -484,6 +509,34 @@ struct CpuMap {
 }
 
 impl CpuMap {
+    /// Opens and maps a CPU without repeating the separate mapping-permission probes.
+    fn open(step: &'static str, cpu: u32) -> Result<Self, Failure> {
+        let path = path(&format!("{}/{cpu}", abi::CPU_DIR));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(io_failure(step, &path))?;
+        let map = Mapping::ring(file.as_raw_fd() as usize).map_err(|source| Failure {
+            step,
+            why: Why::Call {
+                call: "mmap of a ring",
+                result: Err(source),
+            },
+        })?;
+        Ok(Self { cpu, file, map })
+    }
+
+    fn view(&self, step: &'static str) -> Result<View<&[std::sync::atomic::AtomicU64]>, Failure> {
+        View::new(self.map.words()).map_err(|source| Failure {
+            step,
+            why: Why::Capture {
+                cpu: self.cpu,
+                source: CaptureError::View(source),
+            },
+        })
+    }
+
     fn fd(&self) -> usize {
         // File descriptors are never negative.
         self.file.as_raw_fd() as usize
@@ -496,13 +549,8 @@ fn map_cpus(step: &'static str, cpus: &[u32]) -> Result<Vec<CpuMap>, Failure> {
     let read_shared = MapFlags::PROT_READ | MapFlags::MAP_SHARED;
     cpus.iter()
         .map(|&cpu| {
-            let path = path(&format!("{}/{cpu}", abi::CPU_DIR));
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .map_err(io_failure(step, &path))?;
-            let fd = file.as_raw_fd() as usize;
+            let ring = CpuMap::open(step, cpu)?;
+            let fd = ring.fd();
             let refused = |flags, size| Mapping::probe(fd, size, flags).map(|()| 0);
             expect_errno(
                 step,
@@ -528,24 +576,17 @@ fn map_cpus(step: &'static str, cpus: &[u32]) -> Result<Vec<CpuMap>, Failure> {
                 refused(MapFlags::PROT_READ | MapFlags::MAP_PRIVATE, CPU_MAP_BYTES),
                 EINVAL,
             )?;
-            let map = Mapping::ring(fd).map_err(|err| Failure {
-                step,
-                why: Why::Call {
-                    call: "mmap of a ring",
-                    result: Err(err),
-                },
-            })?;
             // SAFETY: changes only the protection of the mapping made above, which nothing
             // writes through; the kernel must refuse it anyway.
             let result = unsafe {
                 syscall::mprotect(
-                    map.addr(),
+                    ring.map.addr(),
                     CPU_MAP_BYTES,
                     MapFlags::PROT_READ | MapFlags::PROT_WRITE,
                 )
             };
             expect_errno(step, "mprotect of a ring to writable", result, EACCES)?;
-            Ok(CpuMap { cpu, file, map })
+            Ok(ring)
         })
         .collect()
 }
@@ -906,110 +947,8 @@ fn run() -> Result<(), Failure> {
     lifecycle::check_lifecycle(&cpus)?;
     proc::check_proc(&cpus)?;
     check_filter(&cpus)?;
-    check_clock(&cpus)?;
+    clock::check(&cpus)?;
     cap::check_cap()
-}
-
-/// The length of `trace-clock`'s first marker write to a closed descriptor; the second is one
-/// byte longer, so the two are told apart and their order checked.
-const CLOCK_MARK_LEN: usize = 1931;
-
-/// How long `trace-clock` sleeps between its two marker writes.
-const CLOCK_SLEEP: std::time::Duration = std::time::Duration::from_millis(200);
-
-/// `trace-clock`: the `clock` file names the clock timestamps come from, and two marker
-/// writes [`CLOCK_SLEEP`] apart have `syscall.enter` timestamps that agree with the wall
-/// time between them: the second later than the first, and within a factor of two of the
-/// wall time when the clock's tick length is known (the KVM clock, the HPET); for the TSC,
-/// whose frequency the kernel does not know, only the order is checked.
-/// The two writes may run on different CPUs, so this also compares clocks across CPUs.
-fn check_clock(cpus: &[u32]) -> Result<(), Failure> {
-    let step = "trace-clock";
-    let text = read_text(step, abi::CLOCK_PATH)?;
-    let line = ClockLine::parse(&text)
-        .map_err(|err| check(step, format!("clock line {text:?}: {err}")))?;
-    drain(step, cpus)?;
-    command(step, "enable syscall")?;
-    let marker = vec![0x5au8; CLOCK_MARK_LEN + 1];
-    let first = syscall::write(BAD_FD, &marker[..CLOCK_MARK_LEN]);
-    let start = std::time::Instant::now();
-    std::thread::sleep(CLOCK_SLEEP);
-    let wall = start.elapsed();
-    let second = syscall::write(BAD_FD, &marker);
-    command(step, "disable syscall")?;
-    for result in [first, second] {
-        if result.map_err(|e| e.errno) != Err(EBADF) {
-            return Err(Failure {
-                step,
-                why: Why::Call {
-                    call: "write to a closed fd",
-                    result,
-                },
-            });
-        }
-    }
-    let trace = drain(step, cpus)?;
-    // The timestamps of the writes of `len` bytes.
-    let marks = |len: usize| -> Vec<u64> {
-        trace
-            .iter()
-            .flatten()
-            .filter(|e| {
-                e.is(&SYSCALL_ENTER)
-                    && e.arg(0) == Some(SYS_WRITE as u64)
-                    && e.arg(1) == Some(BAD_FD as u64)
-                    && e.arg(3) == Some(len as u64)
-            })
-            .map(|e| e.timestamp)
-            .collect()
-    };
-    let (firsts, seconds) = (marks(CLOCK_MARK_LEN), marks(CLOCK_MARK_LEN + 1));
-    let ([before], [after]) = (&firsts[..], &seconds[..]) else {
-        return Err(check(
-            step,
-            format!(
-                "{} first and {} second marker writes recorded, not 1 of each",
-                firsts.len(),
-                seconds.len()
-            ),
-        ));
-    };
-    // The second write came 200 ms after the first, so a timestamp that is not later ran
-    // backward (or stood still) between the CPUs or reads.
-    let Some(ticks) = after.checked_sub(*before).filter(|&ticks| ticks > 0) else {
-        return Err(check(
-            step,
-            format!("the second marker's timestamp {after} is not after the first's {before}"),
-        ));
-    };
-    let wall_us = wall.as_secs_f64() * 1e6;
-    let detail = match line.ticks_per_us() {
-        Some(rate) => {
-            let traced_us = ticks as f64 / rate;
-            let ratio = traced_us / wall_us;
-            if !(0.5..=2.0).contains(&ratio) {
-                return Err(check(
-                    step,
-                    format!(
-                        "{}: {traced_us:.0} us between the markers' timestamps, {wall_us:.0} us of wall time",
-                        line.clock
-                    ),
-                ));
-            }
-            format!(
-                "{}, {} fs ticks: {traced_us:.0} us traced over {wall_us:.0} us",
-                line.clock,
-                line.period_fs.unwrap_or(0)
-            )
-        }
-        None => format!(
-            "{}: {ticks} ticks over {wall_us:.0} us, about {:.0} MHz",
-            line.clock,
-            ticks as f64 / wall_us
-        ),
-    };
-    println!("FERRIC_TEST_PASS trace-clock ({detail})");
-    Ok(())
 }
 
 /// Writes `text` to the event listing, which must fail with `errno`.
@@ -1133,7 +1072,13 @@ pub fn main() -> ExitCode {
     match steps() {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
-            println!("FERRIC_TEST_FAIL {failure}");
+            let mut line = format!("FERRIC_TEST_FAIL {failure}");
+            let mut source = std::error::Error::source(&failure);
+            while let Some(error) = source {
+                line.push_str(&format!(": {error}"));
+                source = error.source();
+            }
+            println!("{line}");
             ExitCode::FAILURE
         }
     }
