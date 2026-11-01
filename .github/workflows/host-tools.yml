@@ -42,6 +42,10 @@ on:
       - "recipes/tests/ferric-ring-test/**"
       - "recipes/tests/ferric-aslr-test/**"
       - "recipes/tests/ferric-ioport-test/**"
+      - "recipes/tests/ferric-owner-test/**"
+      - "userspace/base/ramfs/**"
+      - "userspace/base/scheme-utils/**"
+      - "userspace/base/ipcd/**"
       - "recipes/tests/ferric-netq-test/**"
       - "recipes/tests/ferric-time-test/**"
       - "recipes/tests/ferric-trace-test/**"
@@ -125,6 +129,12 @@ jobs:
             --all-targets --target x86_64-unknown-redox -- -D warnings
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps \
             --manifest-path recipes/tests/ferric-ioport-test/files/Cargo.toml --target x86_64-unknown-redox
+      - name: ramfs ownership test checks
+        run: |
+          manifest=recipes/tests/ferric-owner-test/files/Cargo.toml
+          cargo fmt --check --manifest-path "$manifest"
+          cargo clippy --locked --manifest-path "$manifest" --all-targets --target x86_64-unknown-redox -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --manifest-path "$manifest" --target x86_64-unknown-redox
       - name: Native timer regression checks
         run: |
           cargo fmt --check --manifest-path recipes/tests/ferric-time-test/files/Cargo.toml
@@ -517,7 +527,7 @@ jobs:
           key: userspace-base-${{ hashFiles('userspace/base/Cargo.lock') }}
           restore-keys: userspace-base-
       - name: Test
-        run: cargo test --locked -p executor -p driver-block -p netstack -p rtl8125d -p nvmed -p pcid
+        run: cargo test --locked -p executor -p driver-block -p netstack -p rtl8125d -p nvmed -p pcid -p ramfs -p scheme-utils
       - name: Compile NVMe timing with buffered and DMA paths
         run: |
           rustup target add x86_64-unknown-redox

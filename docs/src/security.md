@@ -48,6 +48,35 @@ port-I/O capabilities remain Phase 4 work. The
 [`ferric-ioport-test`](./ferric-testing.md#port-io-authorization) regression
 checks these request-time rules without executing port-I/O instructions.
 
+### Owner, group and mode changes
+
+A scheme decides who may change one of its files' owner, group or mode.
+`ramfs` and `ext4d` share one definition of the POSIX rules, with
+`_POSIX_CHOWN_RESTRICTED`, in `ferric_abi::id`:
+
+- only root or the file's owner may change its mode or group, and only root may
+  give a file to another owner;
+- the owner may set the group only to the file's current group or its own
+  effective group;
+- an unprivileged change of owner or group clears a regular file's set-user-ID
+  and set-group-ID bits, and an unprivileged `chmod` cannot make a regular file
+  set-group-ID for a group the caller is not in.
+
+The kernel checks `fchown` first: a caller other than root may name only its own
+effective IDs, or `-1` to keep one (`crates/kernel/src/scheme/chown.rs`). Schemes
+learn only the caller's effective user and group, not its supplementary groups,
+so a group check that a supplementary group would have satisfied is refused.
+
+How a scheme learns the caller depends on the call. The kernel sends the
+caller's effective IDs with `fchown` and the other direct scheme calls, but a
+`StdFsCall` (how relibc sends `fchmod`, `ftruncate` and `futimens`) carries only
+its pid, and its caller IDs read as root. A scheme that checks permissions on
+one asks procmgr for the pid's credentials through its
+`proc-creds-capability` handle (`scheme_utils::proc_credentials`), as `ramfs`
+does for `fchmod`. The
+[`ferric-owner-test`](./ferric-testing.md#ramfs-ownership-changes) regression
+checks `ramfs` as root and as user 1000.
+
 ## Hardware mitigations
 
 | Mitigation | Status | Option |
