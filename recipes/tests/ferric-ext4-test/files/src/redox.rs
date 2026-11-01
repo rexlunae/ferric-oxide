@@ -3,7 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -30,6 +30,10 @@ const JOURNAL_IMAGE_PATH: &str = "/tmp/ferric-ext4-journal.ext4";
 /// Its scheme.
 const JOURNAL_SCHEME: &str = "ferric-ext4-journal";
 const JOURNAL_ROOT: &str = "/scheme/ferric-ext4-journal";
+/// An independent image and mount for the compiled write capability.
+const WRITE_IMAGE_PATH: &str = "/tmp/ferric-ext4-write.ext4";
+const WRITE_SCHEME: &str = "ferric-ext4-write";
+const WRITE_ROOT: &str = "/scheme/ferric-ext4-write";
 /// `s_feature_incompat` in the volume superblock, and its `INCOMPAT_RECOVER` bit.
 const INCOMPAT_AT: u64 = 1024 + 0x60;
 const INCOMPAT_RECOVER: u32 = 0x4;
@@ -37,6 +41,8 @@ const INCOMPAT_RECOVER: u32 = 0x4;
 /// Why a step failed.
 #[derive(Debug, Error)]
 enum Failure {
+    #[error(transparent)]
+    RemoveImage(#[from] super::image::RemoveError),
     #[error("{what} failed")]
     Io {
         what: String,
@@ -57,19 +63,20 @@ enum Failure {
         #[source]
         source: io::Error,
     },
-    #[error("ext4d exited before mounting ({status})")]
+    #[error("ext4d exited unexpectedly ({status})")]
     Exited { status: std::process::ExitStatus },
     #[error("ext4d did not mount within {MOUNT_TIMEOUT:?}")]
     Timeout,
     #[error("the volume still needs recovery after ext4d mounted it")]
     NotRecovered,
-}
-
-/// How the journal step went.
-enum Journal {
-    Ran(Result<(), Failure>),
-    /// `ext4d --features` does not list `journal-replay`: fs.ext4_journal_replay is off.
-    NoReplay,
+    #[error(
+        "the read-only image changed at {offset:?}; size {actual_len}, expected {expected_len}"
+    )]
+    ImageChanged {
+        offset: Option<usize>,
+        actual_len: usize,
+        expected_len: usize,
+    },
 }
 
 fn io<T>(what: impl Into<String>, result: io::Result<T>) -> Result<T, Failure> {
@@ -114,6 +121,31 @@ fn mount(child: &mut Child, root: &str) -> Result<(), Failure> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Runs a check against a live mount, then terminates and reaps that daemon.
+fn mounted<T>(
+    args: &[&str],
+    root: &str,
+    check: impl FnOnce() -> Result<T, Failure>,
+) -> Result<T, Failure> {
+    let mut child = io(
+        "start ext4d",
+        Command::new(EXT4D).args(args).stdin(Stdio::null()).spawn(),
+    )?;
+    let result = mount(&mut child, root).and_then(|()| check());
+    let cleanup = (|| {
+        if let Some(status) = io("check ext4d before stopping it", child.try_wait())? {
+            return Err(Failure::Exited { status });
+        }
+        io("stop ext4d", child.kill())?;
+        let status = io("reap ext4d", child.wait())?;
+        if status.signal() != Some(libc::SIGKILL) {
+            return Err(Failure::Exited { status });
+        }
+        Ok(())
+    })();
+    result.and_then(|value| cleanup.map(|()| value))
 }
 
 fn names(dir: &str) -> Result<Vec<String>, Failure> {
@@ -286,8 +318,8 @@ fn read_only() -> Result<(), Failure> {
     same("new.txt exists", fs::metadata(at("new.txt")).is_ok(), false)
 }
 
-/// Whether `ext4d --features` lists `journal-replay`.
-fn has_replay() -> Result<bool, Failure> {
+/// Whether the daemon advertises a compiled capability.
+fn has_feature(feature: &str) -> Result<bool, Failure> {
     let output = io(
         "run ext4d --features",
         Command::new(EXT4D).arg("--features").output(),
@@ -299,46 +331,93 @@ fn has_replay() -> Result<bool, Failure> {
     )?;
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
-        .any(|line| line == "journal-replay"))
+        .any(|line| line == feature))
+}
+
+fn optional(
+    step: &str,
+    feature: &str,
+    flag: &str,
+    run: impl FnOnce() -> Result<(), Failure>,
+) -> bool {
+    match has_feature(feature) {
+        Ok(true) => report(step, run()),
+        Ok(false) => {
+            println!("FERRIC_TEST_SKIP ext4-{step}: ext4d has no {feature} ({flag} is off)");
+            true
+        }
+        Err(error) => report(step, Err(error)),
+    }
 }
 
 /// Replays and mounts a volume that needs recovery: hello.txt must read as the journal left
 /// it, and the image on disk must no longer need recovery. Any failure to do so, including
 /// ext4d exiting before it mounts, fails the step; it is skipped only when ext4d says it has
 /// no journal replay.
-fn journal() -> Journal {
-    match has_replay() {
-        Ok(true) => {}
-        Ok(false) => return Journal::NoReplay,
-        Err(err) => return Journal::Ran(Err(err)),
-    }
+fn journal() -> Result<(), Failure> {
     let mut image = Vec::new();
-    if let Err(source) = flate2::read::GzDecoder::new(JOURNAL_IMAGE).read_to_end(&mut image) {
-        return Journal::Ran(Err(Failure::Io {
-            what: "unpack the journal image".into(),
-            source,
-        }));
-    }
-    if let Err(err) = io(
+    io(
+        "unpack the journal image",
+        flate2::read::GzDecoder::new(JOURNAL_IMAGE).read_to_end(&mut image),
+    )?;
+    io(
         "write the journal image",
         fs::write(JOURNAL_IMAGE_PATH, image),
-    ) {
-        return Journal::Ran(Err(err));
+    )?;
+    let result = mounted(
+        &[JOURNAL_IMAGE_PATH, JOURNAL_SCHEME],
+        JOURNAL_ROOT,
+        replayed,
+    );
+    super::image::finish(Path::new(JOURNAL_IMAGE_PATH), result)
+}
+
+fn writable() -> Result<(), Failure> {
+    io(
+        "write the writable image",
+        fs::write(WRITE_IMAGE_PATH, IMAGE),
+    )?;
+    let result = mounted(&[WRITE_IMAGE_PATH, WRITE_SCHEME], WRITE_ROOT, || {
+        let hello = format!("{WRITE_ROOT}/hello.txt");
+        io("write hello.txt", fs::write(&hello, b"write enabled\n"))?;
+        same(
+            "written contents",
+            io("read written hello.txt", fs::read(&hello))?,
+            b"write enabled\n".to_vec(),
+        )?;
+        let file = io(
+            "open hello.txt for truncation",
+            OpenOptions::new().write(true).open(&hello),
+        )?;
+        io("truncate hello.txt", file.set_len(5))?;
+        drop(file);
+        same(
+            "truncated contents",
+            io("read truncated hello.txt", fs::read(&hello))?,
+            b"write".to_vec(),
+        )?;
+        let created = format!("{WRITE_ROOT}/created.txt");
+        io("create a regular file", fs::write(&created, b"created\n"))?;
+        same(
+            "created contents",
+            io("read created file", fs::read(&created))?,
+            b"created\n".to_vec(),
+        )
+    });
+    super::image::finish(Path::new(WRITE_IMAGE_PATH), result)
+}
+
+fn unchanged_image() -> Result<(), Failure> {
+    let bytes = io("read the read-only image", fs::read(IMAGE_PATH))?;
+    let offset = bytes.iter().zip(IMAGE).position(|(a, b)| a != b);
+    if bytes.len() != IMAGE.len() || offset.is_some() {
+        return Err(Failure::ImageChanged {
+            offset,
+            actual_len: bytes.len(),
+            expected_len: IMAGE.len(),
+        });
     }
-    let mut child = match io(
-        "start ext4d",
-        Command::new(EXT4D)
-            .args([JOURNAL_IMAGE_PATH, JOURNAL_SCHEME])
-            .stdin(Stdio::null())
-            .spawn(),
-    ) {
-        Ok(child) => child,
-        Err(err) => return Journal::Ran(Err(err)),
-    };
-    let result = mount(&mut child, JOURNAL_ROOT).and_then(|()| replayed());
-    let _ = child.kill();
-    let _ = child.wait();
-    Journal::Ran(result)
+    Ok(())
 }
 
 fn replayed() -> Result<(), Failure> {
@@ -381,6 +460,7 @@ fn report(step: &str, result: Result<(), Failure>) -> bool {
     }
 }
 
+/// Runs the mount-policy and enabled replay/write checks, reporting each outcome.
 pub fn main() -> ExitCode {
     if std::env::args().any(|arg| arg == "--access-check") {
         return if report("access", access_child()) {
@@ -396,43 +476,35 @@ pub fn main() -> ExitCode {
     if !report("image", io("write the image", fs::write(IMAGE_PATH, IMAGE))) {
         return ExitCode::FAILURE;
     }
-    let mut child = match Command::new(EXT4D)
-        .args([IMAGE_PATH, SCHEME])
-        .stdin(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(source) => {
-            report(
-                "mount",
-                Err(Failure::Io {
-                    what: "start ext4d".into(),
-                    source,
-                }),
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut ok = report("mount", mount(&mut child, ROOT));
-    if ok {
-        ok &= report("list", list());
+    let result = mounted(&["--read-only", IMAGE_PATH, SCHEME], ROOT, || {
+        println!("FERRIC_TEST_PASS ext4-mount");
+        let mut ok = report("list", list());
         ok &= report("read", read());
         ok &= report("stat", stat());
         ok &= report("erofs", read_only());
-    }
-    // ext4d serves until it is stopped; the test is done with it.
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_file(IMAGE_PATH);
-    match journal() {
-        Journal::Ran(result) => ok &= report("journal", result),
-        Journal::NoReplay => {
-            println!(
-                "FERRIC_TEST_SKIP ext4-journal: ext4d has no journal replay (fs.ext4_journal_replay is off)"
-            );
+        Ok(ok)
+    });
+    let mut ok = match result {
+        Ok(passed) => {
+            let unchanged = report("image-unchanged", unchanged_image());
+            if passed && unchanged {
+                report(
+                    "cleanup",
+                    super::image::finish(Path::new(IMAGE_PATH), Ok(())),
+                )
+            } else {
+                false
+            }
         }
-    }
-    let _ = fs::remove_file(JOURNAL_IMAGE_PATH);
+        Err(error) => report("mount", Err(error)),
+    };
+    ok &= optional(
+        "journal",
+        "journal-replay",
+        "fs.ext4_journal_replay",
+        journal,
+    );
+    ok &= optional("write", "write", "fs.ext4_write", writable);
     if ok {
         ExitCode::SUCCESS
     } else {

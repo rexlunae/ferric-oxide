@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{Crashing, SharedImage, e2fsck, inode_at, le16, load, load_raw, reseal};
+use common::{Crashing, SharedImage, e2fsck, inode_at, inode_number, le16, load, load_raw, reseal};
 use ext4d::Error;
 use ext4d::device::Window;
 use ext4d::fs::{Attributes, Fs, OpenMode};
@@ -274,18 +274,19 @@ fn a_quota_volume_takes_a_new_mode_but_not_a_new_owner() {
     let (mut fs, shared) = mount_writable(load("quota.ext4.gz"));
     let hello = open(&mut fs, "hello.txt");
     let untouched = shared.bytes();
+    let number = inode_number(&untouched, "/hello.txt");
     // mke2fs -d gives hello.txt the owner of the file it copied: 0 for the committed
     // image, the runner's user for CI's fresh ones.
     let a = fs.attributes(hello).expect("open");
     for (uid, gid) in [(Some(a.uid + 1), None), (None, Some(a.gid + 1))] {
         assert!(matches!(
             fs.set_owner(hello, uid, gid, 0, 0),
-            Err(Error::Write(WriteError::QuotaTracked { number: 12 }))
+            Err(Error::Write(WriteError::QuotaTracked { number: found })) if found == number
         ));
     }
     assert!(shared.bytes() == untouched);
     assert_eq!(
-        Error::Write(WriteError::QuotaTracked { number: 12 }).errno(),
+        Error::Write(WriteError::QuotaTracked { number }).errno(),
         95
     );
     // The same owner and group move no usage.
@@ -352,13 +353,15 @@ fn a_read_only_mount_refuses_both() {
 
 #[test]
 fn mode_bits_outside_the_permissions_are_refused() {
-    let mut window = Window::whole(load("journal-v3.replayed.ext4.gz")).expect("its length");
+    let image = load("journal-v3.replayed.ext4.gz");
+    let number = inode_number(&image, "/hello.txt");
+    let mut window = Window::whole(image).expect("its length");
     let mode = Mode {
         permissions: 0o10_000,
         changed: Timestamp::now(),
     };
     assert!(matches!(
-        write::change(&mut window, 12, &Change::Mode(mode)),
+        write::change(&mut window, number, &Change::Mode(mode)),
         Err(WriteError::InvalidPermissions { bits: 0o10_000 })
     ));
 }
@@ -366,6 +369,7 @@ fn mode_bits_outside_the_permissions_are_refused() {
 #[test]
 fn a_crash_at_any_write_leaves_the_mode_changed_or_not() {
     let before = load("journal-v3.replayed.ext4.gz");
+    let number = inode_number(&before, "/hello.txt");
     let mode = Mode {
         permissions: 0o4711,
         changed: Timestamp {
@@ -384,7 +388,7 @@ fn a_crash_at_any_write_leaves_the_mode_changed_or_not() {
             writes_left,
         })
         .expect("its length");
-        write::change(&mut window, 12, &Change::Mode(mode)).expect_err("the device stops");
+        write::change(&mut window, number, &Change::Mode(mode)).expect_err("the device stops");
         let crashed = window.into_inner().bytes;
         let expected = if writes_left < 5 {
             old

@@ -13,6 +13,8 @@
 
 mod common;
 
+use common::inode_number as number;
+
 use common::{Crashing, SharedImage, e2fsck, e2fsck_clean, inode_at, le16, le32, load};
 use ext4d::Error;
 use ext4d::device::Window;
@@ -60,11 +62,6 @@ fn free(image: &[u8]) -> Free {
         blocks: hi << 32 | u64::from(le32(sb, 0x0C)),
         inodes: le32(sb, 0x10),
     }
-}
-
-fn number(image: &[u8], path: &str) -> u32 {
-    let window = Window::whole(image.to_vec()).expect("its length");
-    lookup::inode_of(&window, path).expect("the path")
 }
 
 /// The whole of `path` as `ext4-view` reads it on a fresh mount of `image`.

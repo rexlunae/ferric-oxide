@@ -26,6 +26,8 @@
 # rec_len's 16 bits cannot hold: mke2fs stores it as 0xFFFF in the empty block debugfs's
 # expand_dir adds, and only the entry's inode, name and type are written over it here.
 set -eu
+# The tests expect 0644 files and 0755 directories, independent of the host's umask.
+umask 022
 out=${1:-$(dirname "$0")}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -59,10 +61,15 @@ E2FSPROGS_FAKE_TIME=1767225600 mke2fs -q -F -t ext4 -b 1024 \
     -E hash_seed=0a1b2c3d-4e5f-4607-8819-2a3b4c5d6e7f,root_owner=0:0 \
     -d "$root" "$out/basic.ext4" 4M
 
+# mke2fs -d inherits the host's source ownership, except for the root inode.
+set_owner() {
+    for field in "uid $3" "gid $4"; do
+        debugfs -w -R "set_inode_field $2 $field" "$1" >/dev/null 2>&1
+    done
+}
 # Fixed credentials allow owner/group/other checks on every host.
 for name in /dir/private.txt /dir/private-dir; do
-    debugfs -w -R "set_inode_field $name uid 1000" "$out/basic.ext4" >/dev/null 2>&1
-    debugfs -w -R "set_inode_field $name gid 100" "$out/basic.ext4" >/dev/null 2>&1
+    set_owner "$out/basic.ext4" "$name" 1000 100
 done
 
 root64=$work/root64
@@ -330,6 +337,8 @@ find "$aroot" -exec touch -h -d '2026-01-01 00:00:00 UTC' {} +
 img=$work/alloc.ext4
 E2FSPROGS_FAKE_TIME=1767225600 mke2fs -q -F -t ext4 -b 1024 \
     -U 6f0e1d2c-3b4a-4596-8a7b-6c5d4e3f2a70 -E root_owner=0:0 -d "$aroot" "$img" 4M
+# The create-permission test requires full/ to belong to root, not the fixture builder.
+set_owner "$img" /full 0 0
 E2FSPROGS_FAKE_TIME=1767225600 e2fsck -fn "$img" >/dev/null
 gzip -9 -n -c "$img" > "$out/alloc.ext4.gz"
 
@@ -338,6 +347,7 @@ gzip -9 -n -c "$img" > "$out/alloc.ext4.gz"
 img=$work/alloc-gdt.ext4
 E2FSPROGS_FAKE_TIME=1767225600 mke2fs -q -F -t ext4 -b 1024 -O ^metadata_csum,^64bit,uninit_bg \
     -U 6f0e1d2c-3b4a-4596-8a7b-6c5d4e3f2a80 -E root_owner=0:0 -d "$aroot" "$img" 4M
+set_owner "$img" /full 0 0
 E2FSPROGS_FAKE_TIME=1767225600 e2fsck -fn "$img" >/dev/null
 gzip -9 -n -c "$img" > "$out/alloc-gdt.ext4.gz"
 

@@ -3,7 +3,7 @@ name = "ferric-ext4-test"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "On-target test for ext4d, the read-only ext4 file system daemon"
+description = "On-target ext4d mount-policy, journal-replay and write tests"
 
 # Builds on its own, outside any workspace above it.
 [workspace]
@@ -12,6 +12,9 @@ description = "On-target test for ext4d, the read-only ext4 file system daemon"
 # Unpacks the gzipped journal fixture; the pure-Rust backend, so it cross-compiles.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 thiserror = "2.0.17"
+
+[dev-dependencies]
+tempfile = "3.27.0"
 
 [target.'cfg(target_os = "redox")'.dependencies]
 libc = "0.2"

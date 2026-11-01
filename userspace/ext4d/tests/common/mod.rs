@@ -36,6 +36,16 @@ pub fn load_raw(file: &str) -> Vec<u8> {
     std::fs::read(fixtures().join(file)).expect("the fixture image")
 }
 
+/// Finds a fixture path's inode; optional mkfs features can reserve additional inodes.
+///
+/// # Panics
+///
+/// Panics if the fixture cannot be opened or the path cannot be resolved.
+pub fn inode_number(image: &[u8], path: &str) -> u32 {
+    let window = ext4d::device::Window::whole(image.to_vec()).expect("its length");
+    ext4d::lookup::inode_of(&window, path).expect("the fixture path")
+}
+
 /// A volume that stops taking writes after a number of them, as a crash would.
 pub struct Crashing {
     /// The volume's bytes.
@@ -214,4 +224,37 @@ impl WriteAt for SharedImage {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// The fields of the volume superblock (at byte 1024) that e2fsck sets and the replay does
+/// not: `s_wtime` (0x30), `s_kbytes_written` (0x178) and, over those, `s_checksum` (0x3FC).
+fn without_e2fsck_bookkeeping(mut image: Vec<u8>) -> Vec<u8> {
+    for (at, len) in [(0x30, 4), (0x178, 8), (0x3FC, 4)] {
+        image[1024 + at..1024 + at + len].fill(0);
+    }
+    image
+}
+
+/// Compares replay output with e2fsck, excluding its documented bookkeeping fields.
+///
+/// # Panics
+///
+/// Panics if either image lacks a superblock, or their sizes or normalized blocks differ.
+pub fn assert_same_blocks(name: &str, ours: &[u8], theirs: &[u8]) {
+    assert_eq!(ours.len(), theirs.len(), "{name}: image size");
+    let ours = without_e2fsck_bookkeeping(ours.to_vec());
+    let theirs = without_e2fsck_bookkeeping(theirs.to_vec());
+    let differ: Vec<usize> = ours
+        .chunks(1024)
+        .zip(theirs.chunks(1024))
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        differ.is_empty(),
+        "{name}: {} KiB blocks differ from e2fsck replay; first blocks: {:?}",
+        differ.len(),
+        &differ[..differ.len().min(16)]
+    );
 }
