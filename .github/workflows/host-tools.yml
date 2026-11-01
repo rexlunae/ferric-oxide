@@ -43,6 +43,8 @@ on:
       - "recipes/tests/ferric-aslr-test/**"
       - "recipes/tests/ferric-ioport-test/**"
       - "recipes/tests/ferric-netq-test/**"
+      - "recipes/tests/ferric-time-test/**"
+      - "recipes/tests/ferric-trace-test/**"
       - "recipes/tests/ferric-xstate-test/**"
       - ".github/workflows/host-tools.yml"
       - ".gitmodules"

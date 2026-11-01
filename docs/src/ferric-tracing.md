@@ -1277,7 +1277,8 @@ runs host regressions using the production ring implementation: unconsumed
 first/second marker loss, concurrent bounded capture through multiple ring wraps,
 commit-generated refills, strict marker counts, corrupt and unknown events,
 argument-count mismatches and small buffers. The host-tools workflow also checks
-the recipe's formatting, strict host/Redox Clippy and Redox Rustdoc. Native smoke
+the recipe's formatting, strict host/Redox Clippy and Redox Rustdoc; its path
+filter includes the recipe so recipe-only pull requests run those checks. Native smoke
 runs exercise the same collector against the scheme; host tests do not prove
 native clock calibration or the Phase S adoption criteria.
 
