@@ -12,13 +12,14 @@
 
 mod common;
 
-use common::{Crashing, e2fsck, inode_at, le32, load, reseal};
+use common::{Crashing, e2fsck, inode_at, inode_number, le32, load, reseal};
 use ext4d::device::Window;
 use ext4d::fs::{Fs, OpenMode};
 use ext4d::journal::{self, JournalError, Outcome};
 use ext4d::write::{self, Times, Timestamp, WriteError};
+use simple_endian::{LittleEndian, read_native, write_native};
 
-/// The clean volumes with a journal and `hello.txt` as inode 12.
+/// The clean volumes with a journal and `hello.txt`.
 const NAMES: [&str; 5] = [
     "journal-v3",
     "journal-v2",
@@ -26,8 +27,6 @@ const NAMES: [&str; 5] = [
     "journal-ext3",
     "journal-4k",
 ];
-/// `hello.txt`, the first inode `mke2fs -d` makes.
-const HELLO: u32 = 12;
 
 const ACCESSED: Timestamp = Timestamp {
     seconds: 0x7000_0000,
@@ -98,7 +97,8 @@ fn differing(a: &[u8], b: &[u8]) -> Vec<usize> {
 fn sets_an_inodes_times_through_the_journal() {
     for name in NAMES {
         let before = clean(name);
-        let (result, after) = set_times(before.clone(), HELLO, &TIMES);
+        let hello = inode_number(&before, "/hello.txt");
+        let (result, after) = set_times(before.clone(), hello, &TIMES);
         result.unwrap_or_else(|err| panic!("{name}: {err:?}"));
         assert_eq!(times_of(after.clone(), "hello.txt"), NEW, "{name}");
         assert_eq!(
@@ -117,10 +117,11 @@ fn sets_an_inodes_times_through_the_journal() {
 fn only_the_inode_table_block_and_the_journal_change() {
     for name in NAMES {
         let before = clean(name);
-        let (result, after) = set_times(before.clone(), HELLO, &TIMES);
+        let hello = inode_number(&before, "/hello.txt");
+        let (result, after) = set_times(before.clone(), hello, &TIMES);
         result.expect("written");
         let block_size = 1024 << le32(&before, 1024 + 0x18);
-        let home = inode_at(&before, HELLO) / block_size;
+        let home = inode_at(&before, hello) / block_size;
         // The inode table block, and in the journal its superblock and the descriptor, copy
         // and commit block at the start of the log.
         let changed: Vec<usize> = differing(&before, &after)
@@ -143,13 +144,14 @@ fn only_the_inode_table_block_and_the_journal_change() {
 #[test]
 fn keeps_the_times_it_is_not_given() {
     let before = clean("journal-v3");
+    let hello = inode_number(&before, "/hello.txt");
     let (accessed, _) = times_of(before.clone(), "hello.txt");
     let times = Times {
         accessed: None,
         modified: Some(MODIFIED),
         changed: CHANGED,
     };
-    let (result, after) = set_times(before, HELLO, &times);
+    let (result, after) = set_times(before, hello, &times);
     result.expect("written");
     assert_eq!(times_of(after, "hello.txt"), (accessed, (0x7000_0001, 5)));
 }
@@ -157,12 +159,20 @@ fn keeps_the_times_it_is_not_given() {
 /// `journal-v3` as `tune2fs -O metadata_csum_seed -U` would leave it: the old UUID's
 /// checksum seed kept in `s_checksum_seed`, and a new UUID that no checksum uses.
 fn with_checksum_seed(mut image: Vec<u8>) -> Vec<u8> {
-    let sb = 1024;
-    let seed = ferric_jbd2::crc32c(&[&image[sb + 0x68..sb + 0x78]]);
-    image[sb + 0x270..sb + 0x274].copy_from_slice(&seed.to_le_bytes());
-    let incompat = le32(&image, sb + 0x60) | 0x2000;
-    image[sb + 0x60..sb + 0x64].copy_from_slice(&incompat.to_le_bytes());
-    image[sb + 0x68..sb + 0x78].copy_from_slice(&[0x42; 16]);
+    let sb = &mut image[1024..2048];
+    let incompat: u32 = read_native::<_, LittleEndian<u32>, _>(&mut &sb[0x60..])
+        .expect("the fixture's incompat flags");
+    let seed = if incompat & 0x2000 != 0 {
+        read_native::<_, LittleEndian<u32>, u32>(&mut &sb[0x270..])
+            .expect("the fixture's existing checksum seed")
+    } else {
+        ferric_jbd2::crc32c(&[&sb[0x68..0x78]])
+    };
+    write_native::<_, LittleEndian<u32>, _>(&mut &mut sb[0x270..], seed)
+        .expect("the fixture's checksum seed fits");
+    write_native::<_, LittleEndian<u32>, _>(&mut &mut sb[0x60..], incompat | 0x2000)
+        .expect("the fixture's incompat flags fit");
+    sb[0x68..0x78].fill(0x42);
     reseal(&mut image);
     image
 }
@@ -170,8 +180,9 @@ fn with_checksum_seed(mut image: Vec<u8>) -> Vec<u8> {
 #[test]
 fn writes_under_metadata_csum_seed() {
     let before = with_checksum_seed(clean("journal-v3"));
+    let hello = inode_number(&before, "/hello.txt");
     assert_eq!(hello_contents(before.clone()), b"journaled hello\n");
-    let (result, after) = set_times(before, HELLO, &TIMES);
+    let (result, after) = set_times(before, hello, &TIMES);
     result.expect("written");
     assert_eq!(times_of(after.clone(), "hello.txt"), NEW);
     let checked = e2fsck("csum-seed", after);
@@ -189,7 +200,9 @@ fn times_past_2038_use_the_epoch_bits() {
         modified: Some(late),
         changed: late,
     };
-    let (result, after) = set_times(clean("journal-v3"), HELLO, &times);
+    let before = clean("journal-v3");
+    let hello = inode_number(&before, "/hello.txt");
+    let (result, after) = set_times(before, hello, &times);
     result.expect("written");
     let expected = (late.seconds, late.nanoseconds);
     assert_eq!(times_of(after.clone(), "hello.txt"), (expected, expected));
@@ -201,6 +214,7 @@ fn times_past_2038_use_the_epoch_bits() {
 #[test]
 fn a_crash_at_any_write_leaves_the_change_made_or_not() {
     let before = clean("journal-v3");
+    let hello = inode_number(&before, "/hello.txt");
     let old = times_of(before.clone(), "hello.txt");
     // The superblock flag, the descriptor, copy and commit block, the journal superblock,
     // the block home, the journal superblock again, the flag again.
@@ -210,7 +224,7 @@ fn a_crash_at_any_write_leaves_the_change_made_or_not() {
             writes_left,
         })
         .expect("its length");
-        let err = write::set_times(&mut window, HELLO, &TIMES).expect_err("the device stops");
+        let err = write::set_times(&mut window, hello, &TIMES).expect_err("the device stops");
         assert!(
             matches!(err, WriteError::Journal(_) | WriteError::Transaction(_)),
             "{writes_left}: {err:?}"
@@ -235,7 +249,7 @@ fn a_crash_at_any_write_leaves_the_change_made_or_not() {
             "{writes_left}"
         );
         // Once replayed, the volume takes writes again.
-        let (result, again) = set_times(ours, HELLO, &TIMES);
+        let (result, again) = set_times(ours, hello, &TIMES);
         result.expect("written after the replay");
         assert_eq!(times_of(again, "hello.txt"), NEW, "{writes_left}");
     }
@@ -247,6 +261,7 @@ fn a_crash_at_any_write_leaves_the_change_made_or_not() {
 #[test]
 fn an_unreplayed_change_time_is_read_through_the_journal() {
     let before = clean("journal-v3");
+    let hello = inode_number(&before, "/hello.txt");
     // After five writes the transaction is committed and the journal points at it, but the
     // inode table block is not home yet.
     let mut window = Window::whole(Crashing {
@@ -254,14 +269,14 @@ fn an_unreplayed_change_time_is_read_through_the_journal() {
         writes_left: 5,
     })
     .expect("its length");
-    write::set_times(&mut window, HELLO, &TIMES).expect_err("the device stops");
+    write::set_times(&mut window, hello, &TIMES).expect_err("the device stops");
     let crashed = window.into_inner().bytes;
     assert!(
         journal::needs_replay(&Window::whole(crashed.clone()).expect("its length"))
             .expect("readable")
     );
     // The device still holds the old inode.
-    let at = inode_at(&crashed, HELLO);
+    let at = inode_at(&crashed, hello);
     assert_eq!(crashed[at..at + 256], before[at..at + 256]);
 
     let mut fs = Fs::new(Window::whole(crashed).expect("its length")).expect("an ext4 volume");
@@ -278,13 +293,14 @@ fn an_unreplayed_change_time_is_read_through_the_journal() {
 #[test]
 fn a_volume_that_needs_recovery_is_replayed_first() {
     let image = load("journal-v3.ext4.gz");
-    let (result, after) = set_times(image.clone(), HELLO, &TIMES);
+    let hello = inode_number(&image, "/hello.txt");
+    let (result, after) = set_times(image.clone(), hello, &TIMES);
     assert!(matches!(result, Err(WriteError::NeedsReplay)), "{result:?}");
     assert_eq!(after, image, "nothing was written");
     let mut window = Window::whole(image).expect("its length");
     let outcome = journal::replay(&mut window).expect("replayed");
     assert!(matches!(outcome, Outcome::Replayed { .. }));
-    let (result, after) = set_times(window.into_inner(), HELLO, &TIMES);
+    let (result, after) = set_times(window.into_inner(), hello, &TIMES);
     result.expect("written");
     assert_eq!(times_of(after.clone(), "hello.txt"), NEW);
     assert_eq!(hello_contents(after), b"journaled hello\n");
@@ -303,10 +319,11 @@ fn refused(image: Vec<u8>, inode: u32, times: &Times) -> WriteError {
 #[test]
 fn free_and_out_of_range_inodes_are_refused() {
     let image = clean("journal-v3");
+    let hello = inode_number(&image, "/hello.txt");
     let inodes = le32(&image, 1024);
     assert!(matches!(
-        refused(image.clone(), HELLO + 1, &TIMES),
-        WriteError::FreeInode { number: 13 }
+        refused(image.clone(), hello + 1, &TIMES),
+        WriteError::FreeInode { number } if number == hello + 1
     ));
     for number in [0, inodes + 1] {
         let err = refused(image.clone(), number, &TIMES);
@@ -320,17 +337,20 @@ fn free_and_out_of_range_inodes_are_refused() {
 #[test]
 fn a_damaged_inode_is_not_rewritten() {
     let mut image = clean("journal-v3");
+    let hello = inode_number(&image, "/hello.txt");
     // Flip a bit in its i_size.
-    let inode_at = inode_at(&image, HELLO);
+    let inode_at = inode_at(&image, hello);
     image[inode_at + 0x4] ^= 1;
     assert!(matches!(
-        refused(image, HELLO, &TIMES),
-        WriteError::InodeChecksum { number: 12, .. }
+        refused(image, hello, &TIMES),
+        WriteError::InodeChecksum { number, .. } if number == hello
     ));
 }
 
 #[test]
 fn times_that_do_not_fit_are_refused() {
+    let image = clean("journal-v3");
+    let hello = inode_number(&image, "/hello.txt");
     for seconds in [1 << 34, i64::from(i32::MIN) - 1] {
         let times = Times {
             accessed: Some(Timestamp {
@@ -341,8 +361,8 @@ fn times_that_do_not_fit_are_refused() {
             changed: CHANGED,
         };
         assert!(matches!(
-            refused(clean("journal-v3"), HELLO, &times),
-            WriteError::TimeOutOfRange { number: 12, .. }
+            refused(image.clone(), hello, &times),
+            WriteError::TimeOutOfRange { number, .. } if number == hello
         ));
     }
 }
@@ -351,12 +371,13 @@ fn times_that_do_not_fit_are_refused() {
 fn volumes_this_cannot_write_are_refused() {
     // RO_COMPAT_READONLY: the volume asks not to be written.
     let mut readonly = clean("journal-v3");
+    let hello = inode_number(&readonly, "/hello.txt");
     let at = 1024 + 0x64;
     let ro_compat = le32(&readonly, at) | 0x1000;
     readonly[at..at + 4].copy_from_slice(&ro_compat.to_le_bytes());
     reseal(&mut readonly);
     assert!(matches!(
-        refused(readonly, HELLO, &TIMES),
+        refused(readonly, hello, &TIMES),
         WriteError::UnsupportedFeature {
             field: "ro_compat",
             flags: 0x1000
@@ -369,7 +390,7 @@ fn volumes_this_cannot_write_are_refused() {
     mmp[at..at + 4].copy_from_slice(&incompat.to_le_bytes());
     reseal(&mut mmp);
     assert!(matches!(
-        refused(mmp, HELLO, &TIMES),
+        refused(mmp, hello, &TIMES),
         WriteError::UnsupportedFeature {
             field: "incompat",
             flags: 0x100
@@ -382,7 +403,7 @@ fn volumes_this_cannot_write_are_refused() {
     meta_bg[at..at + 4].copy_from_slice(&incompat.to_le_bytes());
     reseal(&mut meta_bg);
     assert!(matches!(
-        refused(meta_bg, HELLO, &TIMES),
+        refused(meta_bg, hello, &TIMES),
         WriteError::UnsupportedFeature {
             field: "incompat",
             flags: 0x10
@@ -395,7 +416,7 @@ fn volumes_this_cannot_write_are_refused() {
     unjournaled[at..at + 4].copy_from_slice(&compat.to_le_bytes());
     reseal(&mut unjournaled);
     assert!(matches!(
-        refused(unjournaled, HELLO, &TIMES),
+        refused(unjournaled, hello, &TIMES),
         WriteError::NoJournal
     ));
 }

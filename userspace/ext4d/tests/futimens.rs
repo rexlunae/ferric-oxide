@@ -17,8 +17,7 @@ use ext4d::fs::{Fs, OpenMode, ReadOnlyReason, TimeChange};
 use ext4d::lookup::{self, LookupError, ROOT_INODE};
 use ext4d::write::{self, Times, Timestamp, WriteError};
 
-/// The clean volumes with a journal, with `hello.txt` as inode 12 (as `tests/write.rs`
-/// relies on): extent-mapped directories, and indirect-mapped ones on ext3.
+/// Clean volumes with extent-mapped directories, and indirect-mapped ones on ext3.
 const JOURNALED: [&str; 5] = [
     "journal-v3",
     "journal-v2",
@@ -156,10 +155,18 @@ fn every_entry_of_a_hashed_directory_is_found() {
 #[test]
 fn lookups_work_on_every_journal_kind_and_block_map() {
     for name in JOURNALED {
-        let window = volume(load(&format!("{name}.replayed.ext4.gz")));
+        let mut window = volume(load(&format!("{name}.replayed.ext4.gz")));
+        let number = lookup::inode_of(&window, "/hello.txt").expect(name);
+        let stamp = at(0x7000_0010);
+        let times = Times {
+            accessed: Some(stamp),
+            modified: Some(stamp),
+            changed: stamp,
+        };
+        write::set_times(&mut window, number, &times).expect(name);
         assert_eq!(
-            lookup::inode_of(&window, "/hello.txt").expect(name),
-            12,
+            times_at(window.into_inner(), "/hello.txt"),
+            ((stamp.seconds, 0), (stamp.seconds, 0)),
             "{name}"
         );
     }

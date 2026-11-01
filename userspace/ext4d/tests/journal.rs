@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{Crashing, le32, load, reseal};
+use common::{Crashing, assert_same_blocks, le32, load, reseal};
 use ext4d::device::Window;
 use ext4d::fs::{Fs, OpenMode};
 use ext4d::journal::{self, JournalError, Outcome};
@@ -29,32 +29,6 @@ fn replay(bytes: Vec<u8>) -> (Result<Outcome, JournalError>, Vec<u8>) {
     let mut window = Window::whole(bytes).expect("its length");
     let outcome = journal::replay(&mut window);
     (outcome, window.into_inner())
-}
-
-/// The fields of the volume superblock (at byte 1024) that e2fsck sets and the replay does
-/// not: `s_wtime` (0x30), `s_kbytes_written` (0x178) and, over those, `s_checksum` (0x3FC).
-fn without_e2fsck_bookkeeping(mut image: Vec<u8>) -> Vec<u8> {
-    for (at, len) in [(0x30, 4), (0x178, 8), (0x3FC, 4)] {
-        image[1024 + at..1024 + at + len].fill(0);
-    }
-    image
-}
-
-fn assert_same_blocks(name: &str, ours: &[u8], theirs: &[u8]) {
-    assert_eq!(ours.len(), theirs.len(), "{name}: image size");
-    let ours = without_e2fsck_bookkeeping(ours.to_vec());
-    let theirs = without_e2fsck_bookkeeping(theirs.to_vec());
-    let differ: Vec<usize> = ours
-        .chunks(1024)
-        .zip(theirs.chunks(1024))
-        .enumerate()
-        .filter(|(_, (a, b))| a != b)
-        .map(|(i, _)| i)
-        .collect();
-    assert!(
-        differ.is_empty(),
-        "{name}: KiB blocks {differ:?} differ from e2fsck's replay"
-    );
 }
 
 fn hello(image: Vec<u8>) -> Vec<u8> {
