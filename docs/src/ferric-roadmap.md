@@ -19,6 +19,7 @@ done; the [dependency summary](#dependency-summary) shows how they connect.
 3. **Independent of upstream.** The connection to Redox is historical: nothing syncs from Redox, and a Redox change is ported by hand when it is wanted (decided 26 October 2026). Internal names stay, because the Rust targets, tools and imported code depend on them. Optional work still goes behind feature flags.
 4. **Measure everything.** No performance claim lands without a benchmark in CI.
 5. **Userland is WebAssembly by default (goal).** User programs ship as **wasm32**, with **wasm64** reserved for programs that need more than 4 GiB of address space. Both are validated and compiled natively per CPU by a kernel-trusted compiler, with native code as an explicit exception list. This is gated on benchmarks (Phase W).
+6. **Standard application interfaces over a shared Rust base.** Use Wayland and X11 compatibility for graphics, and add a native Linux userspace ABI for unmodified same-architecture programs (agreed 31 October 2026). Linux syscall handling and compatible filesystem views must share Rust mechanisms with relibc and Ferric's base services. The Linux ABI, WebAssembly and microVM execution paths have distinct contracts and validation; see [Phase L](#phase-l-linux-userspace-compatibility).
 
 ## Phase 0: Foundation
 
@@ -165,6 +166,48 @@ The aim is driver-in-kernel performance (no address-space switch, no IPC) withou
 
 **Exit:** with IOMMU enforcement on, fio 4K random read at QD32 on NVMe reaches at least 80% of Linux io_uring on the same disk, and a driver crash or rogue DMA can't corrupt the kernel or other processes (tested by fault injection).
 
+## Phase L: Linux userspace compatibility
+
+**Direction agreed 31 October 2026:** run unmodified, same-architecture Linux
+programs as Ferric-managed processes, through Linux syscall handling and
+Linux-compatible filesystem and device interfaces where supported. Start with
+an explicit x86_64 profile. This is planned work: there is no Linux binary
+runtime or compatibility configuration option today.
+
+**Architecture:** the Linux ABI adapter must use Ferric's Rust base services
+and share runtime/platform mechanisms with relibc. Keep Linux-specific layouts,
+flags, errors and behavior at the ABI boundary, with explicit target-process
+context for memory, descriptors, credentials and signals. Provide consistent
+Linux-facing `/proc`, selected `/sys` and `/dev` views over real native and
+compatibility state. The [Linux compatibility chapter](./ferric-linux-compat.md)
+defines the scope, reuse boundaries, clean-room references and validation.
+Replacing glibc or musl with relibc is not a prerequisite for this path.
+
+**Dependencies:** begin the ABI definitions and shared-runtime work after
+Phase 0, alongside Phases 1–4. Execution needs kernel syscall routing and
+process/address-space mechanisms, relibc/runtime integration and native
+services; authority and sharing must follow Phases 2 and 4. Phase T supplies
+observability. Graphical compatibility also depends on the relevant Phase 6
+interfaces. Phase V is a complementary execution option, not a dependency of
+the native Linux ABI.
+
+| Step | Delivers |
+| --- | --- |
+| **L1 Contract and shared Rust foundation** | A named compatibility profile, initial reference applications and performance budgets; published ABI references, host-tested layouts/conversions and reusable relibc/runtime mechanisms with explicit process context |
+| **L2 Executable and syscall support** | Linux ELF startup and syscall routing, process/thread lifecycle, memory, signals, futexes, polling and sockets; unmodified static and dynamically linked CLI programs with their required interpreters and libraries |
+| **L3 Filesystem and device views** | Profile-defined `/proc`, `/sys` and `/dev` behavior, namespace and permission enforcement, and consistent process IDs, descriptors and mappings across syscalls and filesystem views |
+| **L4 Desktop integration** | Linux Wayland and X11 clients sharing the native desktop through the compositor and Xwayland, including descriptor/shared-memory transport and the device interfaces required for accelerated clients |
+| **L5 Compatibility evidence** | Cross-tested behavior against Linux, application results, failure/teardown and authority tests, and measured syscall, I/O and graphics overhead against native paths |
+
+**Exit:** the declared profile runs unmodified static and dynamically linked
+CLI programs plus Wayland and X11 applications as Ferric-managed processes,
+using the shared Rust implementation. Publish its supported interfaces,
+libraries, limitations and comparative test/performance results. The desktop
+profile is part of M2; first reference applications and numeric budgets are
+chosen in L1. Unsupported functionality must return the appropriate error,
+and a VM run does not count as a native ABI test. Kernel-driver source
+compatibility remains a separate Phase 5/6 decision.
+
 ## Phase V: Hardware virtualization and enclaves
 
 **Why it comes this early:** the project wants isolated enclaves for bringing over C/C++ code written for operating systems with different security models. Instead of porting everything to relibc and the capability model first, the code can run unmodified inside a lightweight VM, and the VM gets exactly the capabilities the host chooses to give it. That makes the hypervisor a porting tool, not just a server feature, so it now comes right after the I/O groundwork. It runs in parallel with Phase 3 and ahead of the hardware and graphics work.
@@ -185,6 +228,12 @@ The aim is driver-in-kernel performance (no address-space switch, no IPC) withou
 - **Confidential computing (later, optional):** AMD SEV-SNP and Intel TDX for enclaves whose memory even the host can't read.
 
 **Exit:** a stock C/C++ program built for Linux runs in an enclave that boots in under 200 ms. It reaches only the files and sockets in its manifest, and moves data through virtio-fs and virtio-net within 1.5x of native Linux throughput. A Linux guest runs with hardware acceleration. A VMM crash leaves the host and other enclaves intact.
+
+Phase V complements [Phase L](#phase-l-linux-userspace-compatibility): a guest
+provides its own operating-system interfaces, while the native ABI shares
+Ferric's Rust base and relibc mechanisms. Driver domains are also distinct
+from a LinuxKPI-style driver runtime. Neither hosting option is implemented;
+their intended boundaries are described in [Virtualization](./ferric-virt.md#compatibility-boundaries-planned).
 
 ## Phase 3: Storage and filesystem performance
 
@@ -222,14 +271,26 @@ The goal is for Ferric Oxide to share disks with Linux and run on servers that w
 - **ACPI:** a complete AML interpreter with no hardcoded values, S3 and s2idle suspend, CPU frequency and C-states (amd-pstate/intel_pstate equivalents), battery and thermal support. Without power management, laptops aren't usable.
 - **Storage and networking at scale:** multi-queue NVMe, Intel `ice`/`ixgbe`, Realtek 2.5G and multi-queue virtio-net.
 - **USB:** complete xHCI, USB 3 hubs, mass storage, audio class and UVC.
-- **Wi-Fi and Bluetooth:** this is the largest effort. Decide early between native Rust drivers (start with Intel AX2xx/BE2xx, the most common chips on modern laptops) and a **LinuxKPI-style compatibility layer**, which is how FreeBSD runs Linux's `iwlwifi` and DRM drivers. The compatibility layer is faster to ship but brings in C and GPL code. Its licensing has to be decided first, because the fork is MIT.
+- **Wi-Fi and Bluetooth:** decide early between native Rust drivers (start with
+  Intel AX2xx/BE2xx), a **LinuxKPI-style driver runtime**, and Phase V driver
+  domains. A compatibility runtime targets selected driver sources and
+  documented API versions, adapting allocation, locking, work queues, timers,
+  firmware, interrupts and DMA to Ferric services while preserving execution
+  semantics. Evaluate its dependency and licensing surface with a concrete
+  driver; it is not automatically faster to ship. Reuse must meet the existing
+  MIT-compatible licensing and clean-room rules. Linux application ABI
+  compatibility in Phase L does not implement this driver runtime.
 - I2C-HID touchpads, plus HDA and SOF audio on modern laptops.
 
 **Exit:** both reference machines install, suspend and resume, run on battery with sane power draw, and connect to Wi-Fi.
 
 ## Phase 6: Graphics and desktop
 
-**Direction adopted 26 October 2026:** use Wayland, Smithay, Mesa and Xwayland.
+**Direction adopted 26 October 2026, refined 31 October:** use Wayland,
+Smithay, Mesa and Xwayland, with a small native compositor for graphical boot
+and a minimal desktop. Prioritize existing protocols and toolkits,
+Rust-oriented interfaces, license-compatible driver reuse and few early-boot
+dependencies. See the [native graphics design](./graphics-windowing.md#planned-native-graphics-stack).
 Graphics build bring-up is in progress; the prerequisites in Phases 2 and 5
 still apply to the accelerated stack. Existing experimental recipes are
 groundwork, not evidence of a working accelerated desktop.
@@ -242,25 +303,41 @@ groundwork, not evidence of a working accelerated desktop.
   optional desktop choice; supporting it does not select it as the default.
   The current `wayland` image configuration builds COSMIC components and a
   nested session; see [its build instructions and limits](./graphics-windowing.md#cosmic-build-configuration).
+- **Graphical boot:** aim for one small compositor tool/codebase for initfs
+  boot UI, recovery, a greeter and a minimal session, using the firmware
+  framebuffer and a Pixman software renderer initially. Keep early boot
+  independent of Mesa/LLVM, desktop D-Bus, Xwayland and the Linux ABI runtime.
+  Define ownership transfers from the UEFI bootloader to userspace, to an
+  accelerated driver and between sessions. A full COSMIC session uses its own
+  compositor with explicit display/input handoff and reusable Ferric backend
+  integration. Drivers remain isolated services.
 - **Rendering:** use [Mesa](https://docs.mesa3d.org/) for EGL, OpenGL/OpenGL ES
   and Vulkan. Software rendering remains useful for bring-up and diagnostics,
   but does not satisfy the hardware-acceleration milestones.
 - **VMs first:** bring up virtio-gpu with VirGL for OpenGL, then Venus for
   Vulkan, on a supported QEMU/KVM host. Verify that rendering uses the host GPU.
 - **Bare metal:** provide a DRM/KMS-compatible user-space interface and the
-  native GPU driver support Mesa needs, starting with one supported GPU at a
+  GPU driver services Mesa needs, starting with one supported GPU at a
   time. Modesetting, GPU memory management, command submission, buffer sharing
   and synchronization are part of this work; porting the compositor alone does
   not enable acceleration. Keep drivers isolated and license-compatible.
+  Native Rust drivers, compatibility-hosted drivers and driver VMs should
+  expose common native display, buffer and synchronization contracts. A
+  LinuxKPI-style runtime is a separate, versioned source-compatibility option
+  that must preserve driver execution and recovery semantics; its feasibility
+  and licensing need a concrete driver evaluation.
 - **Shared buffers:** use GPU driver fds as capabilities, with cross-process
   buffer sharing built on the Phase 2 grant mechanisms. Add the graphics-specific
   buffer formats, ownership and synchronization fences needed by Mesa and the
   compositor; the existing grants are not a complete dma-buf implementation.
-- **Application compatibility:** support native Wayland toolkit applications
-  and [Xwayland](https://wayland.freedesktop.org/docs/book/Xwayland.html) for
-  legacy X11 clients. Applications and toolkits still need target ports or a
-  separate execution environment; display-protocol support is not Linux binary
-  compatibility.
+- **Application compatibility:** require native Wayland and integrated rootless
+  [Xwayland](https://wayland.freedesktop.org/docs/book/Xwayland.html) for X11
+  clients, with on-demand Xwayland startup in enabled profiles. Validate focus,
+  keyboard/pointer input, clipboard, drag-and-drop, resizing and fullscreen
+  behavior. Target ports provide the current application path; the planned
+  Phase L ABI will support unmodified Linux clients through shared Rust/relibc
+  mechanisms. Its descriptor, shared-memory and graphics-device interfaces
+  need separate validation from display-protocol support.
 
 **Orbital is deprecated.** It is not planned to be brought up to a working or
 supported state; existing code and recipes may remain temporarily as legacy
@@ -268,10 +345,18 @@ artifacts, but are not a compatibility commitment. New graphics investment
 goes into the stack above. Removing Orbital or changing image defaults is a
 separate future change.
 
-**Exit:** a Smithay-based Wayland session with hardware-accelerated composition
-and Vulkan on both reference machines, native Wayland toolkit applications and
-X11 clients through Xwayland, and a 4K desktop running at the display's refresh
-rate. Verify GPU use separately from software fallback.
+Useful license-compatible Orbital platform or drawing code may be reused in
+the new minimal layer; preserving its custom protocol is not a requirement.
+
+**Exit:** a small native Smithay-based session with reliable input, graphical
+boot/recovery/greeter handoffs, measured idle CPU use and input/display latency;
+hardware-accelerated composition and Vulkan on both reference machines;
+native Wayland and integrated X11 clients; and a 4K desktop running at the
+display's refresh rate. Verify GPU use separately from software fallback.
+Phase L adds the declared Linux binary desktop profile. The first bring-up
+step is responsive native framebuffer presentation, followed by virtio-gpu
+acceleration and bare-metal driver enablement; see the
+[validation sequence](./graphics-windowing.md#bring-up-and-completion-criteria).
 
 ## Phase 7: Server
 
@@ -285,7 +370,7 @@ rate. Verify GPU use separately from software fallback.
 
 There are two release milestones:
 - **M1 "Server/VM usable":** Phases 0–4, Phase P (through P5), Phase B, Phase T and Phase V (hypervisor and enclaves), plus guest virtualization. An installable image runs real services in a VM with hardening and sandboxing on by default.
-- **M2 "Workstation usable":** M1 plus Phases 5–6. It installs on the reference laptop and desktop, gives the hardware-accelerated Smithay-based Wayland desktop with Mesa rendering and Xwayland compatibility described in Phase 6, with Wi-Fi, suspend and a browser, and builds itself (self-hosting).
+- **M2 "Workstation usable":** M1 plus Phases 5–6 and Phase L's declared desktop compatibility profile. It installs on the reference laptop and desktop, gives the hardware-accelerated Smithay-based Wayland desktop with Mesa rendering, integrated Xwayland and tested Linux Wayland/X11 applications, with Wi-Fi, suspend and a browser, and builds itself (self-hosting).
 
 Both milestones need versioned releases with signed images, a signed package repository with an update channel, release notes and an upstream-sync policy.
 
@@ -338,6 +423,10 @@ Compiled native code is kept in a system-wide, persistent cache that sits beside
 - **I/O (Phase 2):** a wasm instance sees one linear memory, so Phase 2.2 grants must map into a window of that memory. Pages are pinned and IOMMU-mapped for DMA, and the multi-memory feature can give each instance a separate "I/O memory." Rings live in shared memory imported by the instance. The IOMMU work (2.1) is still required, because wasm isolation doesn't constrain devices.
 - **CPU baseline:** the kernel and native exceptions stay on v3 with an optional v4 build. Wasm code gets per-CPU specialization automatically.
 - **Config system:** per-package native vs. wasm builds, isolated vs. colocated mode, JIT tiers, and in-kernel JIT vs. compiler service all become toggles.
+- **Linux compatibility (Phase L):** unmodified Linux binaries retain a native
+  execution profile and their Linux ABI. Reuse shared Rust service/runtime
+  mechanisms with relibc where semantics agree; converting those binaries to
+  wasm is not a prerequisite for Linux compatibility.
 
 ### Steps
 
@@ -364,6 +453,8 @@ Phase 0 ─┬─ Phase P (packages: P1–P3 part of Phase 0 exit, P4 after W2/W
          └─ Phase 5 (hardware) ─ Phase 6 (graphics) ─────────────────────────────┘
             (driver domains from Phase V are an option here)
          Phase 7 (server) builds on Phase V ── M1/M2
+         Phase 1/2/4 mechanisms ─ Phase L (Linux ABI, shared Rust/relibc base) ─ M2 desktop profile
+         Phase 6 ─ L4 (Linux Wayland/X11 and GPU interface integration)
          Phase 2.2 grants ─ Phase W (wasm32/wasm64 userland, W1–W5) ── default for M2 if the gate passes
 ```
 
@@ -372,12 +463,13 @@ Phase 0 ─┬─ Phase P (packages: P1–P3 part of Phase 0 exit, P4 after W2/W
 These are still open. Proposals belong in an issue; the maintainer makes the
 call, and the answer is recorded here.
 
-1. **Native vs. compatibility-layer vs. driver-domain drivers** for Wi-Fi and GPU (Phases 5 and 6). Driver domains (Linux drivers in a Phase V VM) are a third option. This is mostly a licensing and time trade-off.
+1. **Native vs. compatibility-hosted vs. driver-domain drivers** for each Wi-Fi and GPU family (Phases 5 and 6). Evaluate a concrete driver's API version, required subsystem services, execution semantics, dependencies, licensing and maintenance cost. All options should expose common native device-service contracts. Phase L's userspace ABI is a separate requirement.
 2. **Whether PKS-only hardware is an acceptable requirement** for the colocated driver tier, or whether AMD machines get language isolation alone.
 3. **The default root filesystem:** RedoxFS (native, copy-on-write) or ext4/XFS on LVM and LUKS. The current proposal keeps RedoxFS as the default and gives the Linux filesystems full support.
 4. **Where the wasm compiler lives:** in ring 0, or as an unprivileged service with a small in-kernel verifier. The current proposal is the verifier design, with an in-kernel JIT as a toggle.
 5. **Whether colocated (single address space) mode is a goal** or only an experiment, given Spectre between apps that share an address space.
 6. **Packaging (Phase P):** the working defaults listed under Phase P stand until the maintainer decides otherwise.
+7. **The first Linux compatibility profile (Phase L):** choose reference static/dynamic CLI and Wayland/X11 applications, supported interface versions, required libraries and numeric performance budgets in L1. The shared Rust/relibc foundation and syscall/filesystem scope are agreed; this choice defines the initial tested subset.
 
 ## Keeping this chapter current
 

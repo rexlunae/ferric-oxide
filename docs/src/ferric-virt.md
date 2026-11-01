@@ -11,6 +11,22 @@ instructions, `/scheme/kernel.vm` does not exist, and there is no
 All three crates are `no_std`, `forbid(unsafe_code)` and `deny(missing_docs)`,
 and are written from the vendors' manuals only (no hypervisor source was used).
 
+## Compatibility boundaries (planned)
+
+MicroVMs complement the planned [native Linux userspace ABI](./ferric-linux-compat.md).
+That ABI will serve Linux syscalls and filesystem views through Ferric's Rust
+base services and mechanisms shared with relibc. It does not require a Linux
+guest; a program running in a guest validates the VM path instead.
+
+The roadmap also leaves open Linux driver domains: an isolated guest owns a
+device through IOMMU-controlled access and exports a native device service to
+Ferric. This is a separate option from a LinuxKPI-style runtime that adapts
+selected driver sources to Ferric's execution and resource interfaces. Native
+drivers and either hosting option should expose common device-service
+contracts. Both hosting options remain unimplemented and subject to the
+project's licensing policy; see [Phase V](./ferric-roadmap.md#phase-v-hardware-virtualization-and-enclaves)
+and [Phase 5](./ferric-roadmap.md#phase-5-hardware-for-real-machines).
+
 ## `ferric-vmx` (`crates/vmx`)
 
 Intel VMX as plain data, from the *Intel SDM* Volume 3C (the VMX chapters and
