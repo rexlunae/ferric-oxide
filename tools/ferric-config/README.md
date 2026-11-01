@@ -14,13 +14,14 @@ profile. Choose `build.toolchain = "recipe"` for the inherited compiler path;
 Podman and other architectures select it by default. See the build chapter
 for the target ABI libraries and current native limitations.
 
-There are three files:
+Configuration inputs and generated state:
 
 | File | Tracked | What it is |
 | --- | --- | --- |
 | `features.toml` | yes | The catalog: every menu and option, its type, default, dependencies, help text, and how it reaches the build. |
 | `ferric.toml` | no (like `.config`) | Your choices. Only options you set are listed; everything else follows the defaults in the catalog. |
-| `build/ferric/` | no | Generated from the two above: `config.mk`, `filesystem.toml`, `kernel-config.toml`, `state.toml`. |
+| `build/ferric/` | no | Generated settings: `config.mk`, `filesystem.toml`, `kernel-config.toml` and `trace.toml`. `--out` changes this directory. |
+| `build/ferric-rebuild-state.toml` | no | Applied per-recipe fingerprints shared by every output directory in this build root. |
 
 Without a `ferric.toml` nothing changes and the build behaves like upstream
 Redox.
@@ -174,7 +175,7 @@ generated `config.mk` retains its target guard as a defensive check.
 The cookbook rebuilds a recipe when its source or `recipe.toml` is newer than
 its last build, and knows nothing about environment variables. So when you
 change an option, `generate` compares per-recipe fingerprints with the
-previous run (`build/ferric/state.toml`) and touches the `recipe.toml` of each
+shared baseline (`build/ferric-rebuild-state.toml`) and touches the `recipe.toml` of each
 recipe the option names in `rebuild` (only the timestamp changes). Options
 with `rebuild = ["*"]`, such as the processor baseline, mark every recipe, so
 the next `make` rebuilds everything that is in the image. Kernel options only
@@ -184,6 +185,14 @@ pending rebuilds; a later ordinary generation marks them stale. Use a fresh
 `--out` directory for previews that should also leave generated build settings
 unchanged. After `--no-touch` in the normal output directory, run
 `make config-generate` before building to apply pending rebuilds.
+
+Changing `--out` (or Make's `FERRIC_OUT`) changes where settings are written,
+but does not isolate recipe artifacts. All outputs in one build root use the
+same rebuild baseline, so switching A → B → A marks affected recipes stale
+on each profile change. Legacy `<out>/state.toml` files are ignored; the first
+generation after upgrading marks every configured rebuild scope stale rather
+than trusting an independent history. Separate output directories do not make
+concurrent builds with shared recipe artifacts safe; use separate checkouts.
 
 If opening a selected recipe or updating its timestamp fails, generation reports
 the recipe path and filesystem error without recording new fingerprints. Fix

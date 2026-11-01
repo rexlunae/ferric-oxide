@@ -81,6 +81,13 @@ are disabled by default. The Make/CLI regressions reject the retired `kernel.pti
 setting before writing build files and keep the supported `kernel.cpu.kpti`
 policy inactive when selecting ARM64.
 
+The generator tests also switch A → B → A across relative and absolute output
+directories sharing one recipe tree. They check targeted and global invalidation,
+legacy-state migration, previews that preserve pending rebuilds, and filesystem
+failures that retain typed sources and the applied baseline. The Make tests use
+the real configuration fragments and a cached feature-stamped artifact to
+verify that returning to a previously generated profile actually rebuilds it.
+
 Use `cargo clippy --all-targets -- -D warnings` and `cargo doc --no-deps`
 in changed workspaces as required by `AGENTS.md`, accounting for the documented
 imported-code exception. For feature-gated APIs, include the relevant feature
