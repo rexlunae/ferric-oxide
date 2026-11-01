@@ -22,11 +22,15 @@
 //!
 //! Without `/usr/bin/ext4d` (fs.ext4 off) it prints `FERRIC_TEST_SKIP ext4`. The images are
 //! `basic.ext4` and `journal-v3.ext4.gz` from `userspace/ext4d/tests/fixtures/`, whose
-//! script lists their contents.
+//! script lists their contents. Failed checks or daemon teardown leave the backing
+//! images in `/tmp` for diagnosis; only successful checks and teardown remove them.
 
 #![forbid(unsafe_code)]
 
 use std::process::ExitCode;
+
+#[cfg(any(target_os = "redox", test))]
+mod image;
 
 #[cfg(target_os = "redox")]
 mod redox;

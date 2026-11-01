@@ -1057,7 +1057,13 @@ backing image is unchanged after the daemon stops. The independent `ext4-write`
 step uses the daemon's default policy and checks writing, truncation and regular
 file creation when `ext4d --features` advertises `write`; only an absent compiled
 capability skips that step. The journal fixture keeps the default policy and
-still requires on-disk replay when enabled. These distinguish mount policy from
+still requires on-disk replay when enabled. Failed checks or daemon teardown
+retain their backing images (`/tmp/ferric-ext4-test.ext4`,
+`/tmp/ferric-ext4-journal.ext4` and `/tmp/ferric-ext4-write.ext4`) for diagnosis;
+only successful checks and teardown remove them, and removal errors fail the
+step. The recipe's host tests cover retained images and original errors after
+simulated check/stop/reap failures, successful removal and typed removal errors.
+These distinguish mount policy from
 build capability and cover the mismatch in
 [#364](https://github.com/rexlunae/ferric-oxide/issues/364). Host tests of the
 daemon's actual startup cover all three feature combinations on committed and

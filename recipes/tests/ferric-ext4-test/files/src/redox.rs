@@ -41,6 +41,8 @@ const INCOMPAT_RECOVER: u32 = 0x4;
 /// Why a step failed.
 #[derive(Debug, Error)]
 enum Failure {
+    #[error(transparent)]
+    RemoveImage(#[from] super::image::RemoveError),
     #[error("{what} failed")]
     Io {
         what: String,
@@ -367,10 +369,7 @@ fn journal() -> Result<(), Failure> {
         JOURNAL_ROOT,
         replayed,
     );
-    result.and(io(
-        "remove journal image",
-        fs::remove_file(JOURNAL_IMAGE_PATH),
-    ))
+    super::image::finish(Path::new(JOURNAL_IMAGE_PATH), result)
 }
 
 fn writable() -> Result<(), Failure> {
@@ -405,10 +404,7 @@ fn writable() -> Result<(), Failure> {
             b"created\n".to_vec(),
         )
     });
-    result.and(io(
-        "remove writable image",
-        fs::remove_file(WRITE_IMAGE_PATH),
-    ))
+    super::image::finish(Path::new(WRITE_IMAGE_PATH), result)
 }
 
 fn unchanged_image() -> Result<(), Failure> {
@@ -489,14 +485,19 @@ pub fn main() -> ExitCode {
         Ok(ok)
     });
     let mut ok = match result {
-        Ok(passed) => passed,
+        Ok(passed) => {
+            let unchanged = report("image-unchanged", unchanged_image());
+            if passed && unchanged {
+                report(
+                    "cleanup",
+                    super::image::finish(Path::new(IMAGE_PATH), Ok(())),
+                )
+            } else {
+                false
+            }
+        }
         Err(error) => report("mount", Err(error)),
     };
-    ok &= report("image-unchanged", unchanged_image());
-    ok &= report(
-        "cleanup",
-        io("remove read-only image", fs::remove_file(IMAGE_PATH)),
-    );
     ok &= optional(
         "journal",
         "journal-replay",
