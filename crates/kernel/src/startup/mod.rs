@@ -280,7 +280,7 @@ fn run_userspace(token: &mut CleanLockToken) -> ! {
     loop {
         unsafe {
             interrupt::disable();
-            match context::switch(token) {
+            match context::switch(context::ScheduleReason::Reconsider, token) {
                 SwitchResult::Switched => {
                     interrupt::enable_and_nop();
                 }

@@ -77,7 +77,7 @@ fn try_stop_context<T>(
 
     // Wait until stopped
     while running {
-        context::switch(token);
+        context::switch(context::ScheduleReason::Reconsider, token);
 
         running = context_ref.read(token.token()).running;
     }

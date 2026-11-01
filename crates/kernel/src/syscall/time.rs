@@ -54,7 +54,7 @@ pub fn nanosleep(
 
     // TODO: The previous wakeup reason was most likely signals, but is there any other possible
     // reason?
-    context::switch(token);
+    context::switch(context::ScheduleReason::Block, token);
 
     let was_interrupted = context::current()
         .write(token.token())
@@ -81,7 +81,7 @@ pub fn nanosleep(
 }
 
 pub fn sched_yield(token: &mut CleanLockToken) -> Result<()> {
-    context::switch(token);
+    context::switch(context::ScheduleReason::Yield, token);
     // TODO: Do this check in userspace
     context::signal::signal_handler(token);
     Ok(())

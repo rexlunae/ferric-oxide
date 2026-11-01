@@ -130,7 +130,7 @@ impl WaitCondition {
             // SAFETY: guard and the context/wait-list guards have been dropped;
             // the caller's token is borrowed for this wait, and no locks remain.
             let token = unsafe { &mut CleanLockToken::new() };
-            context::switch(token);
+            context::switch(context::ScheduleReason::Block, token);
             // ... and in order for it to be possible to switch back, the context Arc and thus
             // current_context_ptr must continue to be alive (meaningful to check against).
         }

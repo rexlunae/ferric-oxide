@@ -215,7 +215,7 @@ pub fn futex(
                 target_physaddr
             };
 
-            context::switch(token);
+            context::switch(context::ScheduleReason::Block, token);
 
             let result = finish_wait(target_physaddr, timeout_opt.is_some(), token);
             crate::trace::trace_event!(

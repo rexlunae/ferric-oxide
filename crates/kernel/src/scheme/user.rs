@@ -305,7 +305,7 @@ impl UserInner {
                 // scheduled.
                 context::switch::direct_switch_to(handler_context, token);
             } else {
-                context::switch(token);
+                context::switch(context::ScheduleReason::Block, token);
             }
 
             {

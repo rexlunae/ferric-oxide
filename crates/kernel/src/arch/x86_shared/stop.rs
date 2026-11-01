@@ -82,7 +82,7 @@ fn userspace_acpi_shutdown(token: &mut CleanLockToken) {
         // TODO: Switch directly to whichever process is handling the kstop pipe. We would add an
         // event flag like EVENT_DIRECT, which has already been suggested for IRQs.
         // TODO: Waitpid with timeout? Because, what if the ACPI driver would crash?
-        let _ = context::switch(token);
+        let _ = context::switch(context::ScheduleReason::Reconsider, token);
 
         let current = time::monotonic(token);
         if current - initial > time::NANOS_PER_SEC {
