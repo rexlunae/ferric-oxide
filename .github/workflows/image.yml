@@ -129,7 +129,9 @@ jobs:
           # TSC clock and per-CPU one-shot timers (kernel.time.one_shot, off by default) are
           # on, so every boot runs their selftest on each CPU and its local APIC mode.
           # Probe LPSS after memory setup even when QEMU has no matching UART.
-          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\nserial_debug = true\nlpss_debug = true\niommu = "auto"\nregbuf = true\nrings = true\npage_cache = true\npage_cache_writeback = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\ntrace_crash = true\nlog_persist = true\nirq_percpu = true\nsys_proc = true\ntlb_stats = true\n[kernel.time]\none_shot = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\nnet_bypass = true\nrtl8125 = true\n[fs]\next4 = true\next4_journal_replay = true\nluks = true\nlvm = true\nunlock_at_boot = true\nfat = true\nexfat = true\n' > "$out/ferric.toml"
+          # Bad-buffer regressions must return errno with explicit capture cleanup;
+          # drop_panic catches accidental destructor cleanup on those error paths.
+          printf '[kernel.cpu]\nkpti = "always"\nshstk = "auto"\n[kernel]\nserial_debug = true\nlpss_debug = true\ndrop_panic = true\niommu = "auto"\nregbuf = true\nrings = true\npage_cache = true\npage_cache_writeback = true\ntrace = true\ntrace_boot = "sched"\ntrace_initfs_enable = ["scheme.cancel"]\ntrace_crash = true\nlog_persist = true\nirq_percpu = true\nsys_proc = true\ntlb_stats = true\n[kernel.time]\none_shot = true\n[drivers]\ngrant_dma = true\nnvme_percore = true\nnet_bypass = true\nrtl8125 = true\n[fs]\next4 = true\next4_journal_replay = true\nluks = true\nlvm = true\nunlock_at_boot = true\nfat = true\nexfat = true\n' > "$out/ferric.toml"
           "$HOME/.cargo/bin/cargo" run --quiet --release --manifest-path tools/ferric-config/Cargo.toml -- \
             --config "$out/ferric.toml" --out "$out" generate
           # Pass the recipe-facing settings (kernel, relibc, initfs, ext4d and fatd features,
@@ -535,6 +537,13 @@ jobs:
             echo "::error::a cold boot found a previous boot's log"
             exit 1
           fi
+
+      - name: Check timer ownership and expiry
+        if: env.CONFIG_NAME == 'ferric-smoke'
+        run: |
+          for step in ownership close-race expiry; do
+            grep -aF "FERRIC_TEST_PASS time-$step" "$LOG"
+          done
 
       # The image has kernel.rings on, so ferric-ring-test must run every step, not skip.
       - name: Check rings
