@@ -39,7 +39,12 @@ not yet the scheduler event source. These intervals are not dispatch bounds:
 kernel interrupt masking and preemption remain part of the Phase S audit.
 
 `FairClock` charges each non-idle interval against the runnable population that
-preceded incoming wakes and blocked-owner removal. A stolen context contributes
+preceded incoming wakes and blocked-owner removal. The clock owns a separate
+monotonic observation timestamp under the run-queue lock. Local weight changes
+and remote steals settle the preceding population first; both queues observe one
+migration timestamp before weight moves. This never resets the running owner's
+separate elapsed execution charge. Idle queues do not charge virtual service,
+even if contended work remains queued. A stolen context contributes
 to the destination's active weight even when it is selected immediately, without
 being inserted into that CPU's runnable tree. Live priority changes still use
 legacy queue-weight bookkeeping; coordinated reweight events remain part of

@@ -32,7 +32,7 @@ use core::{
     time::Duration,
 };
 pub use ferric_sched_core::ScheduleReason;
-use ferric_sched_core::VirtualTime;
+use ferric_sched_core::{CpuActivity, VirtualTime};
 use smallvec::SmallVec;
 use spin::mutex::SpinMutex;
 use syscall::PtraceFlags;
@@ -320,8 +320,8 @@ fn schedule(
     }
     */
 
-    // Charge the population that owned this interval before admitting wakes or
-    // removing blocked owners. A borrowed handler consumes its client's slice.
+    // Task execution keeps its own interval: a remote steal may have settled
+    // the shared CPU clock in the middle without charging this owner yet.
     let elapsed = Duration::from_nanos(
         u64::try_from(schedule_time.saturating_sub(percpu.switch_internals.schedule_time.get()))
             .unwrap_or(u64::MAX),
@@ -329,10 +329,9 @@ fn schedule(
     let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
     let was_idle = percpu.stats.add_time(elapsed_ms) == CpuState::Idle as u8;
     percpu.switch_internals.schedule_time.set(schedule_time);
-    if !was_idle {
+    {
         let mut run_queue = percpu.switch_internals.run_queue.lock();
-        let total_weight = run_queue.total_weight;
-        run_queue.clock.account(elapsed, total_weight);
+        run_queue.clock.settle(crate::time::monotonic(token));
     }
 
     // Ferric Oxide: contexts woken here whose affinity excludes this CPU, with the CPU to hand
@@ -448,17 +447,20 @@ fn schedule(
                 }
 
                 let weight = guard.scheduling_weight();
+                let admission_time = crate::time::monotonic(token);
+                run_queue.clock.settle(admission_time);
                 guard.fair.activate(run_queue.clock.time(), weight);
                 let new_vtime = guard.fair.runtime();
                 let weight = weight.get();
 
                 if !guard.is_active {
                     guard.is_active = true;
-                    run_queue.total_weight += weight;
+                    let total_weight = run_queue.clock.total_weight().saturating_add(weight);
+                    run_queue.clock.set_weight(admission_time, total_weight);
                     percpu
                         .switch_internals
                         .total_weight
-                        .store(run_queue.total_weight, Ordering::Relaxed);
+                        .store(total_weight, Ordering::Relaxed);
                 }
 
                 if let Some(old_key) = guard.queue_key.take() {
@@ -521,6 +523,7 @@ fn schedule(
         was_idle,
         &mut prev_context_guard,
         &mut forward,
+        token,
     );
     forward_contexts(&mut forward, token);
     let Some((mut next_sched_context, next_address_space)) = next else {
@@ -599,8 +602,10 @@ fn select_next_context(
     was_idle: bool,
     prev_context_guard: &mut ArcRwLockWriteGuard<L4, Context>,
     forward: &mut SmallVec<[(LogicalCpuId, WeakContextRef); 4]>,
+    token: &mut CleanLockToken,
 ) -> Option<(ArcContextLockWriteGuard, Option<AddrSpaceSwitchReadGuard>)> {
     let mut contexts_data = percpu.switch_internals.run_queue.lock();
+    contexts_data.clock.settle(crate::time::monotonic(token));
     let idle_context = percpu.switch_internals.idle_context();
 
     // Lock the previous context.
@@ -624,7 +629,10 @@ fn select_next_context(
         if prev_context_guard.is_active {
             prev_context_guard.is_active = false;
             let weight = prev_context_guard.scheduling_weight().get();
-            contexts_data.total_weight = contexts_data.total_weight.saturating_sub(weight);
+            let total_weight = contexts_data.clock.total_weight().saturating_sub(weight);
+            contexts_data
+                .clock
+                .set_weight(crate::time::monotonic(token), total_weight);
         }
         prev_context_guard.fair.deactivate();
 
@@ -796,11 +804,17 @@ fn select_next_context(
         }
     }
 
-    contexts_data.total_weight = contexts_data.total_weight.saturating_sub(weight_change);
+    let total_weight = contexts_data
+        .clock
+        .total_weight()
+        .saturating_sub(weight_change);
+    contexts_data
+        .clock
+        .set_weight(crate::time::monotonic(token), total_weight);
     percpu
         .switch_internals
         .total_weight
-        .store(contexts_data.total_weight, Ordering::Relaxed);
+        .store(total_weight, Ordering::Relaxed);
 
     for old_key in contexts_to_remove {
         contexts_data.queue.remove(&old_key);
@@ -812,7 +826,9 @@ fn select_next_context(
 
     // No eligible context was found
     if !(prev_is_eligible || eligible_best.is_some()) && ineligible_min_vtime != VirtualTime::MAX {
-        contexts_data.clock.advance_to(ineligible_min_vtime); // Advance V
+        contexts_data
+            .clock
+            .advance_to(crate::time::monotonic(token), ineligible_min_vtime);
 
         let prev_is_earliest =
             prev_runnable && prev_context_guard.fair.runtime() <= ineligible_min_vtime;
@@ -943,6 +959,12 @@ fn select_next_context(
                     continue;
                 }
 
+                // Both locked queues observe the same migration instant. Read
+                // it after locking: either CPU may have settled since this
+                // scheduling pass originally sampled its owner's interval.
+                let migration_time = crate::time::monotonic(token);
+                target_queue.clock.settle(migration_time);
+                contexts_data.clock.settle(migration_time);
                 for WorkStealingCandidate {
                     key,
                     weight,
@@ -952,7 +974,8 @@ fn select_next_context(
                 } in stolen.drain(..)
                 {
                     target_queue.queue.remove(&key);
-                    target_queue.total_weight = target_queue.total_weight.saturating_sub(weight);
+                    let source_weight = target_queue.clock.total_weight().saturating_sub(weight);
+                    target_queue.clock.set_weight(migration_time, source_weight);
                     guard.queue_key = None;
 
                     let current_weight = guard.scheduling_weight();
@@ -964,7 +987,11 @@ fn select_next_context(
 
                     // The stolen owner is active on this CPU even when chosen
                     // immediately rather than inserted into its runnable tree.
-                    contexts_data.total_weight = contexts_data.total_weight.saturating_add(weight);
+                    let destination_weight =
+                        contexts_data.clock.total_weight().saturating_add(weight);
+                    contexts_data
+                        .clock
+                        .set_weight(migration_time, destination_weight);
                     if final_winner.is_none() && !prev_runnable {
                         final_winner = Some((guard, addr_space));
                     } else {
@@ -988,7 +1015,7 @@ fn select_next_context(
                 percpu
                     .switch_internals
                     .total_weight
-                    .store(contexts_data.total_weight, Ordering::Relaxed);
+                    .store(contexts_data.clock.total_weight(), Ordering::Relaxed);
                 percpu
                     .switch_internals
                     .queue_len
@@ -1001,7 +1028,7 @@ fn select_next_context(
                 target_percpu
                     .switch_internals
                     .total_weight
-                    .store(target_queue.total_weight, Ordering::Relaxed);
+                    .store(target_queue.clock.total_weight(), Ordering::Relaxed);
                 target_percpu
                     .switch_internals
                     .stealable
@@ -1013,6 +1040,9 @@ fn select_next_context(
     }
 
     if final_winner.is_some() || prev_runnable {
+        contexts_data
+            .clock
+            .set_activity(crate::time::monotonic(token), CpuActivity::Running);
         if let Some((chosen_guard, addr_space)) = final_winner {
             if prev_runnable {
                 let (vd, rem_slice, ctxt_id, vtime) = (
@@ -1069,6 +1099,9 @@ fn select_next_context(
             None
         }
     } else {
+        contexts_data
+            .clock
+            .set_activity(crate::time::monotonic(token), CpuActivity::Idle);
         // Ferric Oxide: a context leaving for another CPU gives way to the idle context too.
         let prev_is_dead = !is_idle && (!prev_context_guard.status.is_runnable() || prev_elsewhere);
 
@@ -1602,12 +1635,14 @@ mod tests {
         let tasks = setup_contexts(4);
         let prev_context_0 = new_context();
         // for simplicity this is used for current context and not used in any queue
-        let mut prev_guard_0 = unsafe {
+        // SAFETY: Mock CPU setup holds no ordered locks; the test keeps the
+        // context and its guard alive while using the initial clean token.
+        let (mut token, mut prev_guard_0) = unsafe {
             cpu0.switch_internals
                 .set_current_context(Arc::clone(&prev_context_0));
             cpu1.switch_internals
                 .set_current_context(Arc::clone(&prev_context_0));
-            prev_context_0.write_arc()
+            (CleanLockToken::new(), prev_context_0.write_arc())
         };
         // force switch to other context
         prev_guard_0.status = Status::Blocked;
@@ -1647,6 +1682,7 @@ mod tests {
             false,
             &mut prev_guard_0,
             &mut SmallVec::new(),
+            &mut token,
         );
 
         // CPU 0 should be idling and NOT steal from CPU 1
@@ -1678,6 +1714,7 @@ mod tests {
             false,
             &mut prev_guard_0,
             &mut SmallVec::new(),
+            &mut token,
         );
 
         // CPU 0 should steal 2 tasks, 1 is pushed to its own queue
@@ -1699,6 +1736,7 @@ mod tests {
             false,
             &mut prev_guard_0,
             &mut SmallVec::new(),
+            &mut token,
         );
 
         // CPU 1 should not steal task yet, but it has something to do
@@ -1737,6 +1775,7 @@ mod tests {
             false,
             &mut prev_guard_0,
             &mut SmallVec::new(),
+            &mut token,
         );
 
         // CPU 1 should steal 1 task from CPU 0 used as the chosen one

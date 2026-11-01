@@ -2,6 +2,15 @@
 
 use super::*;
 
+extern crate std;
+
+fn running_clock(total_weight: u64) -> FairClock {
+    let mut clock = FairClock::new();
+    clock.set_weight(0, total_weight);
+    clock.set_activity(0, CpuActivity::Running);
+    clock
+}
+
 fn normal() -> Weight {
     Weight::for_priority(20).unwrap()
 }
@@ -123,24 +132,25 @@ fn reweighting_discards_only_the_old_fraction() {
 
 #[test]
 fn cpu_clock_uses_preceding_population_and_never_charges_idle() {
-    let mut clock = FairClock::new();
-    clock.account(Duration::from_millis(2), 2 * normal().get());
+    let mut clock = running_clock(2 * normal().get());
+    clock.settle(2_000_000);
     assert_eq!(clock.time(), VirtualTime::new(1_000_000));
-    clock.account(Duration::ZERO, normal().get());
-    clock.account(Duration::from_secs(100), 0);
+    clock.set_activity(2_000_000, CpuActivity::Idle);
+    clock.set_weight(2_000_000, normal().get());
+    clock.settle(100_000_000_000);
     assert_eq!(clock.time(), VirtualTime::new(1_000_000));
-    clock.advance_to(VirtualTime::new(4_000_000));
-    clock.advance_to(VirtualTime::ZERO);
+    clock.advance_to(100_000_000_000, VirtualTime::new(4_000_000));
+    clock.advance_to(100_000_000_000, VirtualTime::ZERO);
     assert_eq!(clock.time(), VirtualTime::new(4_000_000));
 }
 
 #[test]
 fn cpu_clock_partitioning_preserves_fractional_progress() {
-    let mut whole = FairClock::new();
+    let mut whole = running_clock(88_761);
     let mut split = whole;
-    whole.account(Duration::from_nanos(100_000), 88_761);
-    for _ in 0..100_000 {
-        split.account(Duration::from_nanos(1), 88_761);
+    whole.settle(100_000);
+    for now in 1..=100_000 {
+        split.settle(now);
     }
     assert_eq!(split.time(), whole.time());
 }
@@ -172,10 +182,90 @@ fn wide_virtual_time_does_not_truncate_during_migration_or_overflow() {
     task.account(Duration::MAX, normal(), ScheduleReason::Yield);
     assert_eq!(task.runtime(), VirtualTime::MAX);
     assert_eq!(task.deadline(), VirtualTime::MAX);
-    let mut clock = FairClock::new();
-    clock.advance_to(VirtualTime::MAX);
-    clock.account(Duration::MAX, 1);
+    let mut clock = running_clock(1);
+    clock.advance_to(0, VirtualTime::MAX);
+    clock.settle(u128::MAX);
     assert_eq!(clock.time(), VirtualTime::MAX);
+}
+
+#[test]
+fn remote_steal_settles_the_old_population_without_resetting_owner_execution() {
+    use std::sync::{Arc, Mutex};
+
+    for (before, after, expected) in [(2048, 1024, 9_000_000), (3072, 2048, 5_000_000)] {
+        let clock = Arc::new(Mutex::new(running_clock(before)));
+        let remote = Arc::clone(&clock);
+        std::thread::spawn(move || remote.lock().unwrap().set_weight(6_000_000, after))
+            .join()
+            .unwrap();
+
+        let mut clock = clock.lock().unwrap();
+        // A local scheduler may have sampled its owner's time before waiting
+        // for the lock. That older sample must not rewind the remote boundary.
+        clock.settle(5_000_000);
+        clock.settle(12_000_000);
+        assert_eq!(clock.time(), VirtualTime::new(expected));
+        assert_eq!(clock.total_weight(), after);
+
+        let mut owner = active(normal());
+        owner.account(Duration::from_millis(12), normal(), ScheduleReason::Preempt);
+        assert_eq!(owner.runtime(), VirtualTime::new(12_000_000));
+        assert_eq!(owner.remaining(), BASE_SLICE - Duration::from_millis(12));
+    }
+}
+
+#[test]
+fn migration_uses_both_clocks_at_the_population_change_timestamp() {
+    let mut source = running_clock(3 * normal().get());
+    let mut destination = running_clock(normal().get());
+    let mut task = active(normal());
+    task.account(Duration::from_millis(3), normal(), ScheduleReason::Preempt);
+    let remaining = task.remaining();
+
+    source.set_weight(6_000_000, 2 * normal().get());
+    destination.set_weight(6_000_000, 2 * normal().get());
+    task.migrate(source.time(), destination.time(), normal());
+    assert_eq!(source.time(), VirtualTime::new(2_000_000));
+    assert_eq!(destination.time(), VirtualTime::new(6_000_000));
+    assert_eq!(task.runtime(), VirtualTime::new(7_000_000));
+    assert_eq!(task.remaining(), remaining);
+
+    source.settle(12_000_000);
+    destination.settle(12_000_000);
+    assert_eq!(source.time(), VirtualTime::new(5_000_000));
+    assert_eq!(destination.time(), VirtualTime::new(9_000_000));
+}
+
+#[test]
+fn idle_population_changes_and_zero_weight_never_charge_idle_service() {
+    let mut clock = FairClock::new();
+    clock.set_weight(0, normal().get());
+    clock.set_weight(10_000_000, 0);
+    clock.set_activity(20_000_000, CpuActivity::Running);
+    clock.settle(30_000_000);
+    assert_eq!(clock.time(), VirtualTime::ZERO);
+    clock.set_weight(30_000_000, normal().get());
+    clock.settle(35_000_000);
+    assert_eq!(clock.time(), VirtualTime::new(5_000_000));
+    clock.set_activity(35_000_000, CpuActivity::Idle);
+    clock.settle(100_000_000);
+    assert_eq!(clock.time(), VirtualTime::new(5_000_000));
+}
+
+#[test]
+fn full_width_clock_intervals_divide_before_saturating() {
+    let mut normal_clock = running_clock(normal().get());
+    normal_clock.settle(u128::MAX);
+    assert_eq!(normal_clock.time(), VirtualTime::MAX);
+    normal_clock.settle(0);
+    assert_eq!(normal_clock.time(), VirtualTime::MAX);
+
+    let mut high_weight = running_clock(2048);
+    high_weight.settle(u128::MAX);
+    assert_eq!(high_weight.time(), VirtualTime::new(u128::MAX / 2));
+    let mut low_weight = running_clock(1);
+    low_weight.settle(u128::MAX);
+    assert_eq!(low_weight.time(), VirtualTime::MAX);
 }
 
 #[test]
@@ -192,6 +282,8 @@ fn borrowed_scheme_service_is_charged_to_the_same_owner() {
 
 #[test]
 fn competing_tasks_receive_weighted_service_with_irregular_events() {
+    // This independent selection model checks the accounting primitive. It
+    // does not exercise kernel run queues, physical handoffs or migration.
     let weights = [
         normal(),
         Weight::for_priority(25).unwrap(),
@@ -199,12 +291,13 @@ fn competing_tasks_receive_weighted_service_with_irregular_events() {
     ];
     let mut tasks = weights.map(active);
     let mut service = [0u128; 3];
-    let mut clock = FairClock::new();
     let total_weight = weights.iter().map(|weight| weight.get()).sum();
+    let mut clock = running_clock(total_weight);
+    let mut now = 0;
     for event in 0..20_000u64 {
         let eligible = tasks.iter().any(|task| task.runtime() <= clock.time());
         if !eligible {
-            clock.advance_to(tasks.iter().map(FairState::runtime).min().unwrap());
+            clock.advance_to(now, tasks.iter().map(FairState::runtime).min().unwrap());
         }
         let next = (0..tasks.len())
             .filter(|&i| tasks[i].runtime() <= clock.time())
@@ -218,7 +311,8 @@ fn competing_tasks_receive_weighted_service_with_irregular_events() {
             .unwrap();
         let elapsed = Duration::from_nanos(100_000 + event * 7919 % 1_000_000);
         service[next] += elapsed.as_nanos();
-        clock.account(elapsed, total_weight);
+        now += elapsed.as_nanos();
+        clock.settle(now);
         tasks[next].account(elapsed, weights[next], ScheduleReason::Preempt);
     }
     let total: u128 = service.iter().sum();

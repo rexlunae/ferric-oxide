@@ -1,5 +1,5 @@
 {
-  "clippy::arithmetic_side_effects": 339,
+  "clippy::arithmetic_side_effects": 338,
   "clippy::assertions_on_constants": 5,
   "clippy::indexing_slicing": 157,
   "clippy::missing_safety_doc": 29,

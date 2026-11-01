@@ -109,7 +109,6 @@ pub struct RunContextData {
     queue: BTreeMap<ContextQueueKey, ContextQueueValue>,
     timers: BTreeSet<(u128, WeakContextRef)>, // (wake, context)
     clock: FairClock,
-    total_weight: u64,
 }
 
 impl RunContextData {
@@ -118,7 +117,6 @@ impl RunContextData {
             queue: BTreeMap::new(),
             timers: BTreeSet::new(),
             clock: FairClock::new(),
-            total_weight: 0,
         }
     }
     pub fn is_stealable(&self) -> bool {

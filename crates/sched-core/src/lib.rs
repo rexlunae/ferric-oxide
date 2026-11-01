@@ -135,13 +135,57 @@ impl Divider {
         self.remainder = numerator % denominator;
         numerator / denominator
     }
+
+    fn charge_nanos(&mut self, elapsed: u128, denominator: NonZeroU64) -> u128 {
+        if let Ok(nanos) = u64::try_from(elapsed) {
+            return self.charge(Duration::from_nanos(nanos), denominator);
+        }
+        let divisor = u128::from(denominator.get());
+        let whole = elapsed / divisor;
+        // The remainder is below a u64 divisor. Scale only that remainder so
+        // even a full-width timestamp delta never overflows before division.
+        let remainder = (elapsed % divisor) as u64;
+        whole
+            .saturating_mul(NORMAL_WEIGHT)
+            .saturating_add(self.charge(Duration::from_nanos(remainder), denominator))
+    }
 }
 
-/// Per-CPU virtual clock, charged before changing the runnable population.
+/// Whether a CPU is executing a timeslice owner or its idle context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CpuActivity {
+    /// User, kernel or borrowed scheme execution consumes CPU service.
+    Running,
+    /// Idle time does not advance the virtual clock, even with queued work.
+    Idle,
+}
+
+/// Per-CPU virtual clock with serialized population-change observations.
+///
+/// Keep this clock under the run-queue lock, including remote steals. Every
+/// weight/activity change first settles the old population at its monotonic
+/// timestamp. This observation timeline is independent of the running task's
+/// elapsed execution interval; settling it must not reset that task's charge.
+///
+/// # Examples
+///
+/// ```
+/// use ferric_sched_core::{CpuActivity, FairClock, VirtualTime};
+///
+/// let mut clock = FairClock::new();
+/// clock.set_weight(0, 2048);
+/// clock.set_activity(0, CpuActivity::Running);
+/// clock.set_weight(6_000_000, 1024); // a remote steal settles the first interval
+/// clock.settle(12_000_000);
+/// assert_eq!(clock.time(), VirtualTime::new(9_000_000));
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct FairClock {
     time: VirtualTime,
     divider: Divider,
+    observed_at: u128,
+    total_weight: u64,
+    activity: CpuActivity,
 }
 
 impl Default for FairClock {
@@ -151,11 +195,14 @@ impl Default for FairClock {
 }
 
 impl FairClock {
-    /// Creates a virtual clock at the origin.
+    /// Creates an idle, empty virtual clock at monotonic nanosecond zero.
     pub const fn new() -> Self {
         Self {
             time: VirtualTime::ZERO,
             divider: Divider::new(),
+            observed_at: 0,
+            total_weight: 0,
+            activity: CpuActivity::Idle,
         }
     }
 
@@ -164,23 +211,52 @@ impl FairClock {
         self.time
     }
 
-    /// Accounts elapsed non-idle execution at the preceding runnable weight.
+    /// Returns the current aggregate runnable weight.
+    pub const fn total_weight(&self) -> u64 {
+        self.total_weight
+    }
+
+    /// Settles execution through monotonic timestamp `now_nanos`.
     ///
-    /// A zero runnable weight means no service was charged. Idle callers must
-    /// pass zero elapsed time, even if runnable work arrived during idleness.
-    pub fn account(&mut self, elapsed: Duration, total_weight: u64) {
-        if let Some(weight) = NonZeroU64::new(total_weight) {
+    /// Read the timestamp while holding the run-queue lock. An older observation
+    /// never rewinds the timeline or charges the same interval twice. Idle or
+    /// zero-weight intervals advance only the observation timestamp.
+    pub fn settle(&mut self, now_nanos: u128) {
+        let elapsed = now_nanos.saturating_sub(self.observed_at);
+        self.observed_at = self.observed_at.max(now_nanos);
+        if self.activity == CpuActivity::Running
+            && let Some(weight) = NonZeroU64::new(self.total_weight)
+        {
             self.time.0 = self
                 .time
                 .0
-                .saturating_add(self.divider.charge(elapsed, weight));
+                .saturating_add(self.divider.charge_nanos(elapsed, weight));
         }
+    }
+
+    /// Settles the preceding population, then replaces its aggregate weight.
+    ///
+    /// Use for local admission/removal and remote work stealing under the same
+    /// lock as [`Self::settle`]. `now_nanos` is monotonic time in nanoseconds.
+    pub fn set_weight(&mut self, now_nanos: u128, total_weight: u64) {
+        self.settle(now_nanos);
+        self.total_weight = total_weight;
+    }
+
+    /// Settles the preceding interval, then records an idle/owner transition.
+    ///
+    /// A nonempty but contended idle queue still uses [`CpuActivity::Idle`].
+    pub fn set_activity(&mut self, now_nanos: u128, activity: CpuActivity) {
+        self.settle(now_nanos);
+        self.activity = activity;
     }
 
     /// Advances to the first eligible virtual time when no task is eligible.
     ///
-    /// Never moves backward. Fractional time from before the jump is discarded.
-    pub fn advance_to(&mut self, time: VirtualTime) {
+    /// Settles through `now_nanos` first and never moves backward. Fractional
+    /// virtual time from before a jump is discarded.
+    pub fn advance_to(&mut self, now_nanos: u128, time: VirtualTime) {
+        self.settle(now_nanos);
         if time > self.time {
             self.time = time;
             self.divider.remainder = 0;

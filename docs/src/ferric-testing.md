@@ -981,6 +981,13 @@ interrupts, scheduler wait registration or timer hardware.
 explicit yields, short readiness events, slice exhaustion/overrun, blocking,
 fractional progress, CPU-clock population changes, wide virtual time and
 signed-lag migration. An irregular-event model checks weighted competing tasks.
+Timestamped-population regressions cover a remote steal midway through an owner's
+interval, a local observation sampled before that steal, both migration clocks,
+idle/zero-weight intervals and full-width timestamps. They exercise the production
+`FairClock` used by the kernel; the competing-task model still selects independently
+of the kernel's run queue, direct handoffs and migration. Native fairness and
+coordinated live priority reweighting remain
+[#187](https://github.com/rexlunae/ferric-oxide/issues/187) integration work.
 `cargo miri test --locked -p ferric-sched-core` runs the same host logic. Host CI
 includes strict Clippy/Rustdoc. For arithmetic cost against the preceding
 accounting, run `cargo run --locked --release -p ferric-sched-core --example

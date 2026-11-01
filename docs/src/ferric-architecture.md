@@ -133,6 +133,9 @@ measured-time accounting: real remaining slices, weighted `u128` virtual time,
 fractional progress and explicit switch reasons. Only `sched_yield` forfeits
 unused service; short wake or blocking intervals do not. CPU virtual time is
 charged using the preceding runnable population; migration preserves virtual lag.
+Clock observations and weight changes share the run-queue lock. A remote steal
+settles both queues at its migration timestamp without resetting the running
+owner's independent execution interval.
 It also supports direct context switches for scheme requests.
 [Scheduling](scheduling.md) describes it and
 the planned tickless, asynchronous and real-time work.
