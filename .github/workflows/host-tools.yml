@@ -43,6 +43,7 @@ on:
       - "recipes/tests/ferric-aslr-test/**"
       - "recipes/tests/ferric-ioport-test/**"
       - "recipes/tests/ferric-netq-test/**"
+      - "recipes/tests/ferric-xstate-test/**"
       - ".github/workflows/host-tools.yml"
       - ".github/actions/prepare-cargo-git/**"
       - ".github/actions/prepare-image-runner/**"
@@ -132,6 +133,21 @@ jobs:
           manifest=recipes/tests/ferric-netq-test/files/Cargo.toml
           cargo fmt --check --manifest-path "$manifest"
           cargo test --locked --manifest-path "$manifest"
+          cargo clippy --locked --manifest-path "$manifest" --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path "$manifest" --all-targets --target x86_64-unknown-redox -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --manifest-path "$manifest" --target x86_64-unknown-redox
+      - name: Signal vector state checks
+        run: |
+          rustc --edition=2024 --test -D warnings crates/relibc/redox-rt/tests/vector_state.rs -o "$RUNNER_TEMP/vector-state-tests"
+          "$RUNNER_TEMP/vector-state-tests"
+          cargo fmt --manifest-path crates/relibc/Cargo.toml -p redox-rt -p relibc --check
+          cargo build --locked --manifest-path crates/relibc/Cargo.toml -p redox-rt --target x86_64-unknown-redox
+          cargo clippy --locked --manifest-path crates/relibc/Cargo.toml -p redox-rt --all-targets --target x86_64-unknown-redox --no-deps -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --manifest-path crates/relibc/Cargo.toml -p redox-rt --target x86_64-unknown-redox
+          manifest=recipes/tests/ferric-xstate-test/files/Cargo.toml
+          cargo fmt --check --manifest-path "$manifest"
+          cargo test --locked --manifest-path "$manifest"
+          cargo run --locked --release --manifest-path "$manifest"
           cargo clippy --locked --manifest-path "$manifest" --all-targets -- -D warnings
           cargo clippy --locked --manifest-path "$manifest" --all-targets --target x86_64-unknown-redox -- -D warnings
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --manifest-path "$manifest" --target x86_64-unknown-redox

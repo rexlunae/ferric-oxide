@@ -60,6 +60,26 @@ invalid alignments and oversized layouts return typed errors. Kernel context
 creation maps allocation failures to `ENOMEM`. The buffer holds initialized bytes
 rather than arbitrary zeroed Rust types, so it needs no unsafe zero-validity trait.
 
+On x86-64, relibc also preserves vector state across standard and realtime signals
+and resumable exceptions. The public `ucontext` keeps its existing x87/XMM/YMM
+layout. A private 1,600-byte spill saves the upper halves of zmm0-zmm15,
+zmm16-zmm31 and k0-k7; it is restored after the YMM loads, whose VEX encoding
+clears the upper ZMM halves. Realtime dequeue uses a per-thread scratch area
+before a handler stack has been selected. Ordinary handlers use private stack
+space below the public context, including on an alternate signal stack.
+Every thread reserves the additional 1,600 bytes of TLS scratch. The extra
+1,600 stack bytes are reserved only when AVX-512 state is enabled.
+
+The runtime checks CPUID and XCR0 before using AVX or AVX-512 instructions.
+AVX512F processors use 16-bit mask moves; AVX512BW processors preserve all 64
+mask bits. The shared spill instructions follow the Intel instruction reference,
+and exception entry also preserves YMM state. On x86-64 Redox the minimum
+alternate stack (`MINSIGSTKSZ`) is now 8 KiB and the recommended `SIGSTKSZ` is
+16 KiB, to accommodate the private spill and runtime frames. Applications with
+fixed smaller alternate stacks must enlarge them. The extra ZMM/mask state is
+preserved privately and is not exposed for editing through the legacy context.
+[Signal-state validation](ferric-testing.md#x86-64-signal-state) covers each path.
+
 The boot-time `rmm::BumpAllocator` requires an unsafe constructor: its caller
 must transfer exclusive ownership of disjoint, aligned, writable mapped areas.
 It rejects zero or overflowing frame requests

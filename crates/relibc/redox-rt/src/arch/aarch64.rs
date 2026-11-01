@@ -536,8 +536,8 @@ pub unsafe fn arch_pre(stack: &mut SigStack, os: &mut SigArea) -> PosixStackt {
 }
 /// map to `si_signo` and `si_code`.
 pub(crate) fn map_err_code(_excp: &syscall::Exception) -> (i32, i32) {
-    use redox_protocols::flag::*;
-    (SIGABRT, 0 /* todo */)
+    use redox_protocols::protocol::SIGABRT;
+    (SIGABRT as i32, 0 /* todo */)
 }
 pub fn arch_ret_to_sig(stack: &mut SigStack, control: &Sigcontrol) {
     let orig_pc = core::mem::replace(

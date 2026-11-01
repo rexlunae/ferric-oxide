@@ -421,7 +421,7 @@ pub struct Resugid<T> {
     pub sgid: T,
 }
 
-/// Sets [res][ug]id, fields that are None will be unchanged.
+/// Sets `[res][ug]id`; fields that are `None` remain unchanged.
 pub fn posix_setresugid(ids: &Resugid<Option<u32>>, pid: Option<usize>) -> Result<()> {
     // TODO: not sure how "tmp" an IPC call is?
     let _sig_guard = tmp_disable_signals();

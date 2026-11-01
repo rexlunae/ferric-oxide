@@ -2,6 +2,8 @@
 //!
 //! Fork copies its cloned stack handoff above the child's Rust call stack before
 //! invoking helpers, and keeps FPU control words separate from saved registers.
+//! Signal entry shares vector spills across standard, realtime and exception
+//! paths, with additional AVX-512 state private to the runtime.
 
 use core::{
     cell::SyncUnsafeCell,
@@ -26,6 +28,13 @@ use crate::{
 use redox_protocols::protocol::{ProcCall, RtSigInfo};
 
 use super::ForkScratchpad;
+
+mod vector_asm;
+mod vector_state;
+use vector_asm::{
+    call_with_avx512, restore_avx512, restore_ymm, save_avx512, save_ymm, vector_memory,
+};
+use vector_state::{AVX512_ENABLED, AVX512_WIDE_MASKS, Avx512Regs};
 
 // Setup a stack starting from the very end of the address space, and then growing downwards.
 pub const STACK_TOP: usize = 1 << 47;
@@ -57,15 +66,20 @@ pub struct SigArea {
 }
 #[repr(C, align(32))]
 #[derive(Debug)]
+/// Per-thread vector scratch used before realtime signal dequeue has a stack.
 pub struct YmmRegs {
+    /// The architectural legacy FXSAVE area.
     pub fxsave: [u8; 512],
+    /// YMM upper halves in reverse register order, matching the legacy context.
     pub upper: [u128; 16],
+    avx512: Avx512Regs,
 }
 impl Default for YmmRegs {
     fn default() -> Self {
         Self {
             fxsave: [0; 512],
             upper: [0; 16],
+            avx512: Avx512Regs::default(),
         }
     }
 }
@@ -294,23 +308,9 @@ asmfunction!(__relibc_internal_sigentry: ["
     je 14f
 
     // Prefer vextractf128 over vextracti128 since the former only requires AVX version 1.
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 15 * 16], ymm0, 1
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 14 * 16], ymm1, 1
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 13 * 16], ymm2, 1
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 12 * 16], ymm3, 1
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 11 * 16], ymm4, 1
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 10 * 16], ymm5, 1
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 9 * 16], ymm6, 1
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 8 * 16], ymm7, 1
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 7 * 16], ymm8, 1
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 6 * 16], ymm9, 1
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 5 * 16], ymm10, 1
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 4 * 16], ymm11, 1
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 3 * 16], ymm12, 1
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 2 * 16], ymm13, 1
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 16], ymm14, 1
-    vextractf128 [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf}], ymm15, 1
+", save_ymm!("rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf}"), "
 14:
+", save_avx512!("rsi+{sa_tmp_avx512}-{sa_tmp_rt_inf}"), "
 
     mov [rsi+{sa_tmp_rcx}-{sa_tmp_rt_inf}], rcx
     mov [rsi+{sa_tmp_r11}-{sa_tmp_rt_inf}], r11
@@ -323,23 +323,9 @@ asmfunction!(__relibc_internal_sigentry: ["
     cmp byte ptr [rip + {supports_avx}], 0
     je 15f
 
-    vinsertf128 ymm0,  ymm0,  [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 15 * 16], 1
-    vinsertf128 ymm1,  ymm1,  [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 14 * 16], 1
-    vinsertf128 ymm2,  ymm2,  [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 13 * 16], 1
-    vinsertf128 ymm3,  ymm3,  [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 12 * 16], 1
-    vinsertf128 ymm4,  ymm4,  [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 11 * 16], 1
-    vinsertf128 ymm5,  ymm5,  [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 10 * 16], 1
-    vinsertf128 ymm6,  ymm6,  [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 9 * 16], 1
-    vinsertf128 ymm7,  ymm7,  [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 8 * 16], 1
-    vinsertf128 ymm8,  ymm8,  [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 7 * 16], 1
-    vinsertf128 ymm9,  ymm9,  [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 6 * 16], 1
-    vinsertf128 ymm10, ymm10, [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 5 * 16], 1
-    vinsertf128 ymm11, ymm11, [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 4 * 16], 1
-    vinsertf128 ymm12, ymm12, [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 3 * 16], 1
-    vinsertf128 ymm13, ymm13, [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 2 * 16], 1
-    vinsertf128 ymm14, ymm14, [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf} + 16], 1
-    vinsertf128 ymm15, ymm15, [rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf}], 1
+", restore_ymm!("rsi+{sa_tmp_ymm_hi}-{sa_tmp_rt_inf}"), "
 15:
+", restore_avx512!("rsi+{sa_tmp_avx512}-{sa_tmp_rt_inf}"), "
 
     test eax, eax
     jnz 1b // assumes error can only be EAGAIN
@@ -416,28 +402,13 @@ asmfunction!(__relibc_internal_sigentry: ["
     je 5f
 
     // Prefer vextractf128 over vextracti128 since the former only requires AVX version 1.
-    vextractf128 [rsp + 15 * 16], ymm0, 1
-    vextractf128 [rsp + 14 * 16], ymm1, 1
-    vextractf128 [rsp + 13 * 16], ymm2, 1
-    vextractf128 [rsp + 12 * 16], ymm3, 1
-    vextractf128 [rsp + 11 * 16], ymm4, 1
-    vextractf128 [rsp + 10 * 16], ymm5, 1
-    vextractf128 [rsp + 9 * 16], ymm6, 1
-    vextractf128 [rsp + 8 * 16], ymm7, 1
-    vextractf128 [rsp + 7 * 16], ymm8, 1
-    vextractf128 [rsp + 6 * 16], ymm9, 1
-    vextractf128 [rsp + 5 * 16], ymm10, 1
-    vextractf128 [rsp + 4 * 16], ymm11, 1
-    vextractf128 [rsp + 3 * 16], ymm12, 1
-    vextractf128 [rsp + 2 * 16], ymm13, 1
-    vextractf128 [rsp + 16], ymm14, 1
-    vextractf128 [rsp], ymm15, 1
+", save_ymm!("rsp"), "
 5:
     mov [rsp - 4], eax
     sub rsp, 64 // alloc space for ucontext fields
 
     mov rdi, rsp
-    call {inner}
+", call_with_avx512!("{inner}"), "
 
     add rsp, 64
 
@@ -446,23 +417,9 @@ asmfunction!(__relibc_internal_sigentry: ["
     cmp byte ptr [rip + {supports_avx}], 0
     je 6f
 
-    vinsertf128 ymm0, ymm0, [rsp + 15 * 16], 1
-    vinsertf128 ymm1, ymm1, [rsp + 14 * 16], 1
-    vinsertf128 ymm2, ymm2, [rsp + 13 * 16], 1
-    vinsertf128 ymm3, ymm3, [rsp + 12 * 16], 1
-    vinsertf128 ymm4, ymm4, [rsp + 11 * 16], 1
-    vinsertf128 ymm5, ymm5, [rsp + 10 * 16], 1
-    vinsertf128 ymm6, ymm6, [rsp + 9 * 16], 1
-    vinsertf128 ymm7, ymm7, [rsp + 8 * 16], 1
-    vinsertf128 ymm8, ymm8, [rsp + 7 * 16], 1
-    vinsertf128 ymm9, ymm9, [rsp + 6 * 16], 1
-    vinsertf128 ymm10, ymm10, [rsp + 5 * 16], 1
-    vinsertf128 ymm11, ymm11, [rsp + 4 * 16], 1
-    vinsertf128 ymm12, ymm12, [rsp + 3 * 16], 1
-    vinsertf128 ymm13, ymm13, [rsp + 2 * 16], 1
-    vinsertf128 ymm14, ymm14, [rsp + 16], 1
-    vinsertf128 ymm15, ymm15, [rsp], 1
+", restore_ymm!("rsp"), "
 6:
+", restore_avx512!("rsp - 64 - {avx512_bytes}"), "
     add rsp, (29 + 16) * 16
 
     pop r15
@@ -554,6 +511,14 @@ __relibc_internal_sigentry_crit_third:
     pctl_off_sender_infos = const offset_of!(SigProcControl, sender_infos),
     pctl = sym PROC_CONTROL_STRUCT,
     supports_avx = sym SUPPORTS_AVX,
+    supports_avx512 = sym SUPPORTS_AVX512,
+    avx512_enabled = const AVX512_ENABLED,
+    avx512_wide_masks = const AVX512_WIDE_MASKS,
+    avx512_bytes = const size_of::<Avx512Regs>(),
+    avx512_hi256 = const offset_of!(Avx512Regs, hi256),
+    avx512_hi16 = const offset_of!(Avx512Regs, hi16),
+    avx512_masks = const offset_of!(Avx512Regs, masks),
+    sa_tmp_avx512 = const (offset_of!(SigArea, ymm_regs) + offset_of!(YmmRegs, avx512)),
     REDZONE_SIZE = const 128,
     STACK_ALIGN = const 16,
     SA_ONSTACK_BIT = const 58, // (1 << 58) >> 32 = 0x0400_0000
@@ -613,19 +578,24 @@ asmfunction!(__relibc_internal_excpentry: ["
     push r14
     push r15
     sub rsp, (29 + 16) * 16 // fxsave region minus available bytes
-    fxsave64 [rsp + 16  * 16]
-
+    fxsave64 [rsp + 16 * 16]
+    cmp byte ptr [rip + {supports_avx}], 0
+    je 5f
+", save_ymm!("rsp"), "
 5:
     sub rsp, 64 // alloc space for ucontext fields
 
     mov rdi, rsp
-    call {inner_excp}
+", call_with_avx512!("{inner_excp}"), "
 
     add rsp, 64
 
     fxrstor64 [rsp + 16 * 16]
-
+    cmp byte ptr [rip + {supports_avx}], 0
+    je 6f
+", restore_ymm!("rsp"), "
 6:
+", restore_avx512!("rsp - 64 - {avx512_bytes}"), "
     add rsp, (29 + 16) * 16
 
     pop r15
@@ -661,6 +631,14 @@ __relibc_internal_excpentry_crit_second:
     jmp qword ptr fs:[{tcb_sa_off} + {sa_tmp_rip}]
 "] <= [
     inner_excp = sym inner_excp_c,
+    supports_avx = sym SUPPORTS_AVX,
+    supports_avx512 = sym SUPPORTS_AVX512,
+    avx512_enabled = const AVX512_ENABLED,
+    avx512_wide_masks = const AVX512_WIDE_MASKS,
+    avx512_bytes = const size_of::<Avx512Regs>(),
+    avx512_hi256 = const offset_of!(Avx512Regs, hi256),
+    avx512_hi16 = const offset_of!(Avx512Regs, hi16),
+    avx512_masks = const offset_of!(Avx512Regs, masks),
     bitset = sym GLOBAL_EXCP_STACK_BITSET,
     sa_tmp_rip = const offset_of!(SigArea, tmp_rip),
     sa_tmp_rsp = const offset_of!(SigArea, tmp_rsp),
@@ -727,7 +705,24 @@ pub fn arch_ret_to_sig(stack: &mut SigStack, control: &Sigcontrol) {
     control.saved_archdep_reg.set(stack.regs.rflags);
 }
 
+/// AVX/YMM state is usable during signal entry.
 pub(crate) static SUPPORTS_AVX: AtomicU8 = AtomicU8::new(0);
+/// AVX-512 signal spill capabilities, published before installing the entry point.
+pub(crate) static SUPPORTS_AVX512: AtomicU8 = AtomicU8::new(0);
+
+/// Initializes vector spill capabilities from CPUID and the OS-enabled XCR0 mask.
+pub(crate) fn init_vector_support(leaf1_ecx: u32) {
+    let xcr0 = if leaf1_ecx & (1 << 27) != 0 {
+        // SAFETY: CPUID.OSXSAVE says XGETBV is enabled; XCR0 is a valid index.
+        unsafe { core::arch::x86_64::_xgetbv(0) }
+    } else {
+        0
+    };
+    let leaf7 = core::arch::x86_64::__cpuid_count(7, 0);
+    let support = vector_state::support(leaf1_ecx, leaf7.ebx, xcr0);
+    SUPPORTS_AVX.store(u8::from(support.avx), Ordering::Relaxed);
+    SUPPORTS_AVX512.store(support.avx512, Ordering::Relaxed);
+}
 
 // __relibc will be prepended to the name, so no_mangle is fine
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -754,15 +749,15 @@ pub unsafe fn manually_enter_trampoline() {
 
 /// map to `si_signo` and `si_code`.
 pub(crate) fn map_err_code(excp: &syscall::Exception) -> (i32, i32) {
-    use redox_protocols::flag::*;
+    use redox_protocols::protocol::{SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
     match excp.kind {
-        0  /* divide_by_zero */  => (SIGFPE, 1 /* todo */),
-        3  /* breakpoint */  => (SIGTRAP, 1 /* TRAP_BRKPT */),
-        6  /* invalid_opcode */  => (SIGILL, 1 /* todo */),
-        14  /* page */  => (SIGSEGV, if excp.code & 1 == 0 { 1 /* SEGV_MAPERR */ } else { 2 /* SEGV_ACCERR */ }),
-        17  /* alignment_check */  => (SIGBUS, 1 /* BUS_ADRALN */),
-        18  /* machine_check */  => (SIGBUS, 3 /* BUS_OBJERR */),
-        _  => (SIGABRT, 0 /* todo */),
+        0  /* divide_by_zero */  => (SIGFPE as i32, 1 /* todo */),
+        3  /* breakpoint */  => (SIGTRAP as i32, 1 /* TRAP_BRKPT */),
+        6  /* invalid_opcode */  => (SIGILL as i32, 1 /* todo */),
+        14  /* page */  => (SIGSEGV as i32, if excp.code & 1 == 0 { 1 /* SEGV_MAPERR */ } else { 2 /* SEGV_ACCERR */ }),
+        17  /* alignment_check */  => (SIGBUS as i32, 1 /* BUS_ADRALN */),
+        18  /* machine_check */  => (SIGBUS as i32, 3 /* BUS_OBJERR */),
+        _  => (SIGABRT as i32, 0 /* todo */),
     }
 }
 

@@ -312,6 +312,41 @@ RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
   -Z json-target-spec
 ```
 
+### x86-64 signal state
+
+`ferric-xstate-test` runs only when CPUID and XCR0 permit AVX-512. The controlled
+signal probe loads every ZMM register and mask, then publishes an assembly
+handshake. A sender delivers SIGUSR1 or an application realtime signal (44);
+only the handler releases the held-register loop. An alternate-stack case also
+checks that the handler actually ran in its registered allocation. A synchronous
+UD2 case resumes by advancing RIP through the existing public context. Handlers
+clobber representatives of every additional AVX-512 state component. BW-capable
+CPUs use full 64-bit mask canaries; F-only CPUs use 16 bits. Missing delivery or
+changed state fails, without retrying the probe. Existing preservation and
+cross-context leakage stress still run afterward.
+
+The host capability/layout checks compile the actual runtime module without the
+rest of the Redox-only runtime:
+
+```sh
+rustc --edition=2024 --test -D warnings \
+  crates/relibc/redox-rt/tests/vector_state.rs -o /tmp/ferric-vector-state-tests
+/tmp/ferric-vector-state-tests
+cargo build --locked --manifest-path crates/relibc/Cargo.toml \
+  -p redox-rt --target x86_64-unknown-redox
+cargo clippy --locked --manifest-path recipes/tests/ferric-xstate-test/files/Cargo.toml \
+  --all-targets --target x86_64-unknown-redox -- -D warnings
+```
+
+Host CI runs these checks, strict runtime/recipe Clippy and Rustdoc, and the
+recipe's host program (a capability skip when AVX-512 is unavailable).
+The native image test exercises the actual signal trampolines. A host execution
+of the recipe program uses the host's signal runtime, so it validates the probe
+rather than relibc. Running all of `redox-rt`'s unit tests as a Linux-target
+package is not supported: its process code uses Redox-only auxiliary-vector
+constants. The direct harness keeps the new capability/layout tests runnable
+without changing that target boundary.
+
 ## Image tests
 
 `config/ferric-smoke.toml` includes the minimal image and forces local source
@@ -335,7 +370,7 @@ See [the network queue test](ferric-io.md#kernel-bypass-network-queues) for manu
 
 | Recipe under `recipes/tests/` | What it exercises |
 | --- | --- |
-| `ferric-xstate-test` | SIMD/extended register-state preservation across execution |
+| `ferric-xstate-test` | Every ZMM register and k0-k7 across preemption and controlled standard/realtime signals, alternate-stack delivery and a resumable invalid-opcode exception; full 64-bit masks on AVX512BW; syscall-return leakage probes |
 | `ferric-aslr-test` | Sparse 32 GiB virtual reservation after exec, and address variation between executions |
 | `ferric-guard-test` | Thread/main-stack guard faults and accessible stack controls |
 | `ferric-tlb-test` | Mapping/protection changes and TLB invalidation across CPUs |
