@@ -4,6 +4,32 @@ These mechanisms are integrated into the x86-64 kernel, loader and runtime.
 Defaults here refer to a build configured through `ferric.toml`, not a direct
 kernel Cargo build or a top-level build without that file.
 
+## Kernel heap
+
+The kernel global heap uses `ferric-heap` (`crates/heap`) around the crates.io
+`rlsf` TLSF implementation, under its MIT license option. Segregated free lists
+replace the former address-ordered first-fit scan, whose lock hold time grew with
+fragmentation. A single global spinlock still serializes heap operations.
+
+The initial region and subsequent contiguous growth are mapped in one-MiB
+increments. The adapter tracks mapped and incorporated lengths separately,
+including unused trailing bytes when it appends a region, so allocations can span
+mapping boundaries. Ownership transfer requires exclusive permanently mapped
+storage with provenance for the combined region. Freeing requires the exact
+original allocation layout. Reinitialization and noncontiguous growth are rejected
+without changing live allocations. Heap memory is not unmapped or returned to the
+physical allocator.
+
+TLSF bounds local allocation/deallocation bookkeeping, **not** global lock wait,
+heap growth, physical-page allocation or TLB shootdown time. Hard IRQ paths must
+still avoid allocations and destructors that might enter the allocator: an
+interrupt cannot acquire a lock held by code it preempted. The remaining Phase S
+preemption and latency audit includes these costs.
+
+[Validation](ferric-testing.md#kernel-heap-regions) describes host ownership/growth
+regressions, Miri, the fragmentation comparison and native checks. This adapter
+adds no allocator choice or fallback and changes no feature defaults.
+
 ## CPU state and feature policy
 
 `kernel.cpu.*` options generally choose `always`, `auto` or `never`. The

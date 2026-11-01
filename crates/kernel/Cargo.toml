@@ -21,6 +21,7 @@ ferric-aligned-buffer = { path = "../aligned-buffer" }
 ferric-devicetree = { path = "../devicetree" }
 ferric-amdvi = { path = "../amdvi" }
 ferric-cet = { path = "../cet" }
+ferric-heap = { path = "../heap" }
 ferric-hwrand = { path = "../hwrand", optional = true }
 ferric-iommu = { path = "../iommu", features = ["alloc"] }
 ferric-irq = { path = "../irq", optional = true }
@@ -33,7 +34,6 @@ ferric-timed = { path = "../timed", features = ["alloc"] }
 ferric-trace = { path = "../trace", features = ["alloc"], optional = true }
 ferric-vtd = { path = "../vtd" }
 hashbrown = { version = "0.14.3", default-features = false, features = ["ahash", "inline-more"] }
-linked_list_allocator = "0.9.0"
 redox_syscall = { path = "syscall" }
 rmm = { path = "rmm", default-features = false }
 slab = { version = "0.4", default-features = false }

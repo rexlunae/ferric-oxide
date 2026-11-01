@@ -892,6 +892,26 @@ image/boot remains the check for measured wake latency and real completions.
 log validator accepts the actual trace-benchmark workload/state format and
 rejects missing measurement states, loss accounting or completion markers.
 
+### Kernel heap regions
+
+`cargo test --locked -p ferric-heap` exercises exact layouts/alignment, initialized
+live contents, rejected growth/reinitialization, unaligned and tiny extensions,
+cross-increment coalescing, separated small free holes and synchronized threads.
+`cargo miri test --locked -p ferric-heap` checks the same pointer-ownership paths.
+Host CI includes the crate's tests, Miri and strict Clippy/Rustdoc.
+
+Run `cargo run --locked --release -p ferric-heap --example fragmentation_bench`
+for a backend-only comparison with the former first-fit allocator. Both backends
+keep small holes separated by live barriers before a large free tail. Report cost
+at each hole count, including setup/host conditions. This measures neither SMP
+lock waiting nor the mapping/physical-allocation paths; constant bookkeeping is
+not a bound for a complete kernel allocation.
+
+Native changes require full image builds and SMP/uniprocessor boots, including
+page-cache fill/close, fault/fuzzer teardown and installed-package verification.
+A timeout must preserve its CPU/context samples and be investigated; a passing
+host allocator test does not establish native progress or IRQ safety.
+
 ### Portable executor core
 
 `cargo test --locked -p ferric-exec-core` covers worker sleep/notify publication
