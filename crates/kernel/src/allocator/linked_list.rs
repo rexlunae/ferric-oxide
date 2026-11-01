@@ -20,6 +20,11 @@ pub struct Allocator;
 impl Allocator {
     /// Claims the mapped initial heap, once during boot.
     ///
+    /// # Panics
+    /// Panics if `offset` is zero, the heap was already initialized, the
+    /// region's end address overflows, or it cannot hold TLSF metadata and
+    /// payload.
+    ///
     /// # Safety
     /// The nonzero, page-aligned range must be exclusively writable and remain
     /// mapped for the kernel lifetime. No allocation may predate initialization.
