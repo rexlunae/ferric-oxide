@@ -1577,6 +1577,10 @@ volumes with a feature the writer does not know (mmp, meta_bg, readonly and
 others), or with no journal, are served read-only, and ext4d says why, as are
 volumes whose device cannot be opened for writing.
 
+Pass --read-only to ext4d to restrict a particular mount to reading, even with
+write and journal-replay support built in. Its device stays read-only and any
+committed journal is overlaid in memory rather than replayed onto the device.
+
 The writer is checked against e2fsprogs: e2fsck replays and checks what it
 leaves, including volumes crashed part-way through a change. Off, ext4d writes
 only to replay a journal. Source: crates/jbd2 (writer) and

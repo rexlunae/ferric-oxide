@@ -353,11 +353,12 @@ jobs:
         run: |
           mke2fs -V
           mkdir -p "$RUNNER_TEMP/ext4"
-          tests/fixtures/make-fixtures.sh "$RUNNER_TEMP/ext4"
-          EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --test basic --test unreplayed
-          EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --features journal-replay --test journal
+          # The generator must produce the expected modes under a group-writable umask.
+          (umask 0002; tests/fixtures/make-fixtures.sh "$RUNNER_TEMP/ext4")
+          EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --bin ext4d --test basic --test unreplayed
+          EXT4D_FIXTURES="$RUNNER_TEMP/ext4" cargo test --locked --features journal-replay --bin ext4d --test journal
           EXT4D_FIXTURES="$RUNNER_TEMP/ext4" EXT4D_E2FSCK="$(command -v e2fsck || echo /usr/sbin/e2fsck)" \
-            cargo test --locked --features write --test write --test futimens --test chmod_chown --test write_data --test alloc
+            cargo test --locked --features write --bin ext4d --test write --test futimens --test chmod_chown --test write_data --test alloc
       - name: Clippy and docs
         run: |
           rustup target add x86_64-unknown-redox

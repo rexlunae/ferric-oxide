@@ -1287,13 +1287,19 @@ context is a different context.
 ext4 volume read-only as a scheme, the way RedoxFS serves its own:
 
 ```text
-ext4d [--offset BYTES] [--length BYTES] DEVICE SCHEME
+ext4d [--read-only] [--offset BYTES] [--length BYTES] DEVICE SCHEME
 ```
 
 `DEVICE` is a disk, a partition or an image file; `--offset` and `--length` pick
 the volume's bytes out of a whole disk. The volume appears at `/scheme/SCHEME`.
 The daemon registers the scheme, enters the null namespace (it already holds the
 device) and serves in the foreground until it is stopped.
+
+`--read-only` forces this mount to keep the device open only for reading, even
+when `fs.ext4_write` and `fs.ext4_journal_replay` are compiled in. A volume that
+needs recovery is served through the committed journal's in-memory overlay;
+the daemon does not replay that journal onto the device. Without the flag,
+the configured replay/write capabilities keep their existing behavior.
 
 - **Reading** is done by the `ext4-view` crate (MIT or Apache-2.0): extents,
   hashed (htree) directories, metadata checksums, 64-bit block numbers and the
@@ -1434,6 +1440,10 @@ opens the device for writing and serves the volume read-write (those calls) when
 and says why; a device that does not open for writing (no write permission, a
 read-only medium) is also served read-only, with the reason logged
 (`Fs::mount_preferring_write`).
+
+An explicit `--read-only` mount uses the read-only filesystem implementation
+instead, so every modifying operation returns `EROFS`. The compiled writer
+remains available to other mounts of the same daemon binary.
 
 - **`ferric-jbd2`**'s `Writer` logs a `Transaction` (the new contents of each
   changed block) into an empty journal from `s_first`: descriptor blocks with

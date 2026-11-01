@@ -53,6 +53,7 @@ simple_endian = { workspace = true }
 
 [dev-dependencies]
 flate2 = "1"
+tempfile = "3.27.0"
 
 [target.'cfg(target_os = "redox")'.dependencies]
 # The readiness handshake with ferric-unlock (fs.unlock_at_boot).

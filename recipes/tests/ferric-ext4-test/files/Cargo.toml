@@ -3,7 +3,7 @@ name = "ferric-ext4-test"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "On-target test for ext4d, the read-only ext4 file system daemon"
+description = "On-target ext4d mount-policy, journal-replay and write tests"
 
 # Builds on its own, outside any workspace above it.
 [workspace]

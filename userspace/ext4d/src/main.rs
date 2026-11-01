@@ -1,7 +1,7 @@
-//! `ext4d`: serves an ext4 volume, read-only, as a scheme.
+//! `ext4d`: serves an ext4 volume as a scheme, with an explicit read-only policy.
 //!
 //! ```text
-//! ext4d [--offset BYTES] [--length BYTES] DEVICE SCHEME
+//! ext4d [--read-only] [--offset BYTES] [--length BYTES] DEVICE SCHEME
 //! ext4d --features
 //! ```
 //!
@@ -16,10 +16,14 @@
 //! journal of a volume that was not cleanly unmounted, opening the device for writing only
 //! for that. Without it the device is only ever opened for reading. `write` (features.toml
 //! `fs.ext4_write`) opens the device for writing and serves the volume read-write when the
-//! library can write to it (`ext4d::write::check_writable`), so far for `futimens` only;
+//! library can write to it (`ext4d::write::check_writable`), for its supported journaled changes;
 //! when it cannot, or the device does not open for writing, it says why and serves the
 //! volume read-only (`ext4d::fs::Fs::mount_preferring_write`). `ext4d --features`
 //! prints the optional features it was built with, one per line, so tests can tell.
+//!
+//! `--read-only` keeps the device open only for reading, even when `write` and
+//! `journal-replay` are built in. A volume needing recovery is read through its
+//! committed journal overlay; its journal is not replayed onto the device.
 
 #![forbid(unsafe_code)]
 
@@ -51,28 +55,41 @@ fn main() -> ExitCode {
     }
 }
 
-#[cfg(target_os = "redox")]
+#[cfg(any(target_os = "redox", test))]
 mod daemon {
+    //! CLI/device startup is host-testable; registration and serving require Redox.
+
     use std::fs::File;
+    use std::path::PathBuf;
+    #[cfg(target_os = "redox")]
     use std::process::ExitCode;
 
     use ext4d::device::{Window, WindowError};
     #[cfg(feature = "journal-replay")]
     use ext4d::journal::{self, JournalError, Outcome};
+    #[cfg(target_os = "redox")]
     use ext4d::scheme::{Mount, ServeError};
     use thiserror::Error;
 
+    /// Whether this mount follows the compiled capabilities or forbids writes.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum MountPolicy {
+        Configured,
+        ReadOnly,
+    }
+
     /// The command line.
     struct Args {
-        device: String,
+        device: PathBuf,
         scheme: String,
         offset: u64,
         length: Option<u64>,
+        policy: MountPolicy,
     }
 
     #[derive(Debug, Error)]
     enum DaemonError {
-        #[error("usage: ext4d [--offset BYTES] [--length BYTES] DEVICE SCHEME")]
+        #[error("usage: ext4d [--read-only] [--offset BYTES] [--length BYTES] DEVICE SCHEME")]
         Usage,
         #[error("{flag} needs a number of bytes, not {value:?}")]
         Number {
@@ -81,9 +98,9 @@ mod daemon {
             #[source]
             source: std::num::ParseIntError,
         },
-        #[error("cannot open the device {path}")]
+        #[error("cannot open the device {}", path.display())]
         Open {
-            path: String,
+            path: PathBuf,
             #[source]
             source: std::io::Error,
         },
@@ -94,16 +111,20 @@ mod daemon {
         Journal(#[from] JournalError),
         #[error("cannot mount the ext4 volume")]
         Mount(#[from] ext4d::Error),
+        #[cfg(target_os = "redox")]
         #[error("serving the scheme failed")]
         Serve(#[from] ServeError),
+        #[cfg(target_os = "redox")]
         #[error("cannot tell the starter the volume is mounted")]
         Notify(#[source] std::io::Error),
     }
 
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, DaemonError> {
         let (mut offset, mut length, mut rest) = (0, None, Vec::new());
+        let mut policy = MountPolicy::Configured;
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--read-only" => policy = MountPolicy::ReadOnly,
                 flag @ ("--offset" | "--length") => {
                     let value = args.next().ok_or(DaemonError::Usage)?;
                     let n = value.parse().map_err(|source| DaemonError::Number {
@@ -126,10 +147,11 @@ mod daemon {
         }
         let [device, scheme] = <[String; 2]>::try_from(rest).map_err(|_| DaemonError::Usage)?;
         Ok(Args {
-            device,
+            device: device.into(),
             scheme,
             offset,
             length,
+            policy,
         })
     }
 
@@ -162,23 +184,17 @@ mod daemon {
         {
             eprintln!(
                 "ext4d: {}: replayed {transactions} journal transactions ({blocks} blocks)",
-                args.device
+                args.device.display()
             );
             if journal_errno != 0 {
                 eprintln!(
                     "ext4d: {}: the journal was aborted (error {journal_errno}); check the \
                      volume with e2fsck",
-                    args.device
+                    args.device.display()
                 );
             }
         }
         Ok(())
-    }
-
-    /// Loads the volume: without `write`, read-only.
-    #[cfg(not(feature = "write"))]
-    fn mount(_args: &Args, window: Window<File>) -> Result<ext4d::fs::Fs, DaemonError> {
-        Ok(ext4d::fs::Fs::new(window)?)
     }
 
     /// Loads the volume: with `write`, for changes when the library can write to it and the
@@ -187,13 +203,17 @@ mod daemon {
     fn mount(args: &Args, window: Window<File>) -> Result<ext4d::fs::Fs, DaemonError> {
         let (fs, read_only) = ext4d::fs::Fs::mount_preferring_write(window, || open(args, true))?;
         if let Some(reason) = read_only {
-            eprint!("ext4d: {}: serving read-only: {reason}", args.device);
+            eprint!(
+                "ext4d: {}: serving read-only: {reason}",
+                args.device.display()
+            );
             print_sources(&reason);
         }
         Ok(fs)
     }
 
     /// Prints `err`'s sources after it, then ends the line.
+    #[cfg(any(target_os = "redox", feature = "write"))]
     fn print_sources(err: &dyn std::error::Error) {
         let mut source = err.source();
         while let Some(cause) = source {
@@ -203,22 +223,38 @@ mod daemon {
         eprintln!();
     }
 
+    /// Applies the mount policy before registering or serving any scheme.
+    fn load(args: &Args) -> Result<ext4d::fs::Fs, DaemonError> {
+        let window = open(args, false)?;
+        if args.policy == MountPolicy::ReadOnly {
+            return Ok(ext4d::fs::Fs::new(window)?);
+        }
+        #[cfg(feature = "journal-replay")]
+        replay(args, &window)?;
+        #[cfg(feature = "write")]
+        {
+            mount(args, window)
+        }
+        #[cfg(not(feature = "write"))]
+        {
+            Ok(ext4d::fs::Fs::new(window)?)
+        }
+    }
+
+    #[cfg(target_os = "redox")]
     fn run() -> Result<(), DaemonError> {
         let args = parse(std::env::args().skip(1))?;
-        let window = open(&args, false)?;
-        #[cfg(feature = "journal-replay")]
-        replay(&args, &window)?;
-        let fs = mount(&args, window)?;
+        let fs = load(&args)?;
         if fs.needs_recovery() {
             eprintln!(
                 "ext4d: {}: the volume needs journal recovery; serving it as the replay would \
                  leave it, with the journal's committed blocks read in memory over the volume \
                  (the disk is not changed; fs.ext4_journal_replay replays it onto the disk)",
-                args.device
+                args.device.display()
             );
         }
         let mode = if fs.is_writable() {
-            "read-write (times, mode, owner and in-place data only)"
+            "read-write"
         } else {
             "read-only"
         };
@@ -227,12 +263,15 @@ mod daemon {
         ferric_ready::notify().map_err(DaemonError::Notify)?;
         eprintln!(
             "ext4d: {} mounted {mode} at /scheme/{}",
-            args.device, args.scheme
+            args.device.display(),
+            args.scheme
         );
         mount.serve()?;
         Ok(())
     }
 
+    #[cfg(target_os = "redox")]
+    /// Runs the native scheme daemon, printing the full error chain on failure.
     pub fn main() -> ExitCode {
         match run() {
             Ok(()) => ExitCode::SUCCESS,
@@ -243,4 +282,7 @@ mod daemon {
             }
         }
     }
+
+    #[cfg(test)]
+    mod tests;
 }
