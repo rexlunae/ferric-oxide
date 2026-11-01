@@ -72,8 +72,16 @@ need "FERRIC_BURN_END seconds=10 spins=[1-9][0-9]*"
 # The benchmark phases report their usual lines with tracing on.
 need "FERRIC_BENCH ring null-write-64"
 need "FERRIC_BENCH ring file-read-4k"
-need "FERRIC_BENCH trace-bench"
+# ferric-trace-bench names each workload, rather than prefixing it with the
+# binary's name. Require every compiled-in state and its completion marker.
+for workload in io syscall; do
+    for state in off pairoff on; do
+        need "^FERRIC_BENCH $workload $state min_ns=[0-9]+(\\.[0-9]+)? median_ns=[0-9]+(\\.[0-9]+)? rounds=[1-9][0-9]*$"
+    done
+done
+need '^FERRIC_BENCH lost records=[0-9]+$'
+need '^FERRIC_TEST_PASS trace-bench$'
 need "FERRIC_BENCH iobench-"
 
-lines="$(grep -aoE "FERRIC_SCHED_BENCH_TSC .*|FERRIC_BENCH (ring-scale|iobench-|ring |trace-bench)|counts sched\.(tick|ipi_pit|ipi_wake|switch|context_create) cpu=all.*" <<< "$clean")"
+lines="$(grep -aoE "FERRIC_SCHED_BENCH_TSC .*|FERRIC_BENCH (ring-scale|iobench-|ring |io |syscall |lost ).*|counts sched\.(tick|ipi_pit|ipi_wake|switch|context_create) cpu=all.*" <<< "$clean")"
 echo "::notice title=sched-bench::$lines"

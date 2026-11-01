@@ -9,6 +9,13 @@ host tests must hold. It describes planned work: nothing here is running in
 the kernel yet, and no performance claim is made. The host-testable core
 ([#180], `crates/exec-core`) implements the state machine beside this page.
 
+Completing this migration is now the
+[next platform priority](./ferric-roadmap.md#completion-priority-and-order),
+ahead of new Linux ABI implementation. The time-scheme registry has an ordered,
+host-tested timeout queue and earliest-deadline diagnostics, but context waits,
+hardware rearming and executor timers are not yet joined by one deadline
+service. This groundwork does not link the executor into the kernel.
+
 ## Scope and goals
 
 Today, each ring starts a kernel context and runs its chains sequentially

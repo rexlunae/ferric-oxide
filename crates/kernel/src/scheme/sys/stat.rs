@@ -20,7 +20,12 @@ pub fn resource(token: &mut CleanLockToken) -> Result<Vec<u8>> {
     let (event_keys, event_subs) = get_event_stat(token);
     let (futex_keys, futex_subs) = get_futex_stat(token);
     let pipe_subs = crate::scheme::pipe::get_pipe_stat(token);
-    let timeout_subs = crate::context::timeout::get_timeout_stat(token);
+    let timeout = crate::context::timeout::stats(token);
+    let timeout_subs = timeout.count;
+    let timeout_next_monotonic_ns = match timeout.next_monotonic_ns {
+        Some(deadline) => alloc::format!("{deadline}"),
+        None => String::from("none"),
+    };
     let res = alloc::format!(
         "{}{}\n\
         boot_time: {start_time_sec}\n\
@@ -36,7 +41,8 @@ pub fn resource(token: &mut CleanLockToken) -> Result<Vec<u8>> {
         futex_subcribers: {futex_subs}\n\
         idling_cpu_count: {idling_cpu}\n\
         pipe_subcribers: {pipe_subs}\n\
-        timeout_subscribers: {timeout_subs}\n",
+        timeout_subscribers: {timeout_subs}\n\
+        timeout_next_monotonic_ns: {timeout_next_monotonic_ns}\n",
         get_cpu_stats(),
         get_irq_stats(),
         get_contexts_count(),

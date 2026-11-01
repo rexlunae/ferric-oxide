@@ -65,7 +65,7 @@ upstream URLs remain in use with increased retries. This also covers Cargo
 dependency resolution during feature generation; successful submodule checkout
 alone does not establish that Cargo can reach GitLab.
 
-`cargo test --locked -p ferric-config` includes smoke/fuzz profile regressions
+`cargo test --locked -p ferric-config` includes smoke/fuzz and scheduler-baseline profile regressions
 in `tools/ferric-config/tests/profiles.rs`. They exercise the public CLI and
 generated Makefile, then load the selected filesystem configuration through the
 installer's include resolver. They check inherited source packages, the effective
@@ -871,6 +871,9 @@ and a merged rate over the same interval. The ring-test recipe's host tests
 exercise the same CQE validator used by the target workload, rejecting missing,
 duplicate, wrong-request, failed and short completions. The scheduler benchmark
 image/boot remains the check for measured wake latency and real completions.
+`bash scripts/ferric-ci/test-check-sched-bench-log.sh` checks that the baseline
+log validator accepts the actual trace-benchmark workload/state format and
+rejects missing measurement states, loss accounting or completion markers.
 
 ### Portable executor core
 
@@ -881,6 +884,39 @@ without depending on timing. `cargo miri test --locked -p ferric-exec-core --lib
 runs the same state/race checks. Host CI includes it with strict Clippy/Rustdoc.
 The crate is not linked into the kernel yet; these tests do not exercise actual
 interrupts, scheduler wait registration or timer hardware.
+
+### Shared timeout queue
+
+`cargo test --locked -p ferric-timed --features alloc` covers monotonic/realtime
+ordering and projection, forward/backward wall-clock changes, duplicate dates,
+earliest cancellation, stale identities, identifier exhaustion, dates beyond
+the hardware `u64` horizon, arithmetic saturation, concurrent consumers under
+one owner lock and exactly-once resource drops. A pending-set model checks mixed
+insert/cancel/expiry sequences across both clocks. Run the allocation-free
+arithmetic build separately with `cargo test --locked -p ferric-timed`.
+Host CI runs both configurations and Miri with `alloc`, and the queue must pass
+Clippy and warning-free Rustdoc with `--all-features`.
+
+For a reproducible queue-only before/after comparison, run:
+
+```sh
+cargo run --locked --release -p ferric-timed --features alloc --example timeout_bench
+```
+
+The example compares the former vector scan against ordered storage at 1, 64
+and 4096 pending timers. It reports registration and expiry cost per event and
+cost per pass with no due event. Ordered lookup also adds tree insertion/removal
+work, so report those costs alongside scan savings. These numbers do not measure
+kernel locks, event callbacks, hardware timers or scheduler latency.
+
+Kernel validation must build with `kernel.time.one_shot` enabled and disabled,
+then boot the corresponding image and exercise time-scheme events. Inspect
+`timeout_subscribers` and `timeout_next_monotonic_ns` in `/scheme/sys/stat`:
+the latter is an absolute monotonic nanosecond date or `none`. It covers only
+time-scheme registrations. It does not prove the scheduler has stopped its tick.
+The final-close lifetime regression remains
+[#362](https://github.com/rexlunae/ferric-oxide/issues/362); do not claim it fixed
+until registration/close/expiry races and target resource-baseline checks pass.
 
 ### Delayed page-cache writeback notifications
 

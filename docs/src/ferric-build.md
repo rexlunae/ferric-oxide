@@ -373,6 +373,11 @@ choices select image contents while preserving saved CPU/kernel policy and
 image overrides. CI's forced test features remain separate. See
 [Reproducing a boot](ferric-testing.md#reproducing-a-boot) for the commands.
 
+`image.config = "ferric-sched-bench"` selects the existing x86-64 scheduler
+baseline image. Enable `kernel.trace`, `kernel.trace_sched` and `kernel.rings`
+for its measurement workload; image selection preserves the chosen feature
+policy. See the [scheduler baseline checks](ferric-testing.md#scheduler-baseline-accounting).
+
 1. `mk/ferric.mk` regenerates configuration when the user file, catalog or
    configuration tool sources change; Make includes the result and restarts.
 2. `FERRIC_TARGET_RUSTFLAGS` and `FERRIC_TARGET_CPPFLAGS` reach target recipe

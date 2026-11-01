@@ -195,7 +195,7 @@ impl KernelScheme for TimeScheme {
                         handle.clock,
                         time,
                         token,
-                    );
+                    )?;
                 }
                 _ => return Err(Error::new(EINVAL)),
             };

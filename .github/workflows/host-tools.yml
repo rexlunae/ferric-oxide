@@ -95,13 +95,19 @@ jobs:
       - name: Test
         run: |
           cargo test --locked --workspace
+          cargo test --locked -p ferric-timed --features alloc
           cargo test --locked --manifest-path recipes/tests/ferric-ring-test/files/Cargo.toml
           cargo test --locked --manifest-path recipes/tests/ferric-aslr-test/files/Cargo.toml
           cargo test --locked --manifest-path recipes/tests/ferric-blkgrant-test/files/Cargo.toml
-      - name: Device-tree memory safety
+      - name: Shared core memory safety
         run: |
           rustup component add miri
           cargo miri test --locked -p ferric-exec-core -p ferric-devicetree
+          cargo miri test --locked -p ferric-timed --features alloc
+      - name: Timeout queue feature checks
+        run: |
+          cargo clippy --locked --no-deps --all-targets -p ferric-timed --features alloc -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ferric-timed --features alloc
       - name: Port-I/O authorization test checks
         run: |
           rustup target add x86_64-unknown-redox

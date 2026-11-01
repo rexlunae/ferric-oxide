@@ -28,6 +28,8 @@
 //! - [`monotonic`] publishes the clock across CPUs without regressing
 //!   ([`monotonic::Watermark`]) and hands the KVM clock over to a fallback for
 //!   good once it steps backward ([`monotonic::Handover`]).
+//! - With `alloc`, `timeout` keeps absolute monotonic/realtime registrations,
+//!   cancellation identities and their earliest monotonic wakeup projection.
 //!
 //! The shared deadline service (#187) and the async executor binding (#181)
 //! build their earliest-deadline queues on the same types.
@@ -43,6 +45,9 @@
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
 #[cfg(test)]
 extern crate std;
 
@@ -51,6 +56,8 @@ pub mod monotonic;
 pub mod oneshot;
 pub mod rate;
 pub mod selftest;
+#[cfg(feature = "alloc")]
+pub mod timeout;
 
 use core::cmp::Ordering;
 use core::fmt;

@@ -145,6 +145,10 @@ image overrides. They do not force CI's optional kernel test features. Other
 architectures are rejected because the included tests use x86-64 instructions.
 The `ferric-hardware` choice selects the x86-64 hardware inventory image;
 `drivers.rtl8125=true` adds the experimental RTL8125B driver to that image.
+`ferric-sched-bench` selects the x86-64 scheduler/ring baseline image. Enable
+`kernel.trace=true`, `kernel.trace_sched=true` and `kernel.rings=true` for its
+workload; this choice preserves the saved CPU/kernel policy like the other
+profiles. It is rejected on other architectures.
 Use these catalog choices instead of a mismatching command-line `CONFIG_NAME`;
 see the book's [boot reproduction guide](../../docs/src/ferric-testing.md#reproducing-a-boot).
 
