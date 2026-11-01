@@ -9,6 +9,25 @@ touch "$work/image" "$work/firmware"
 cat > "$work/bin/qemu-system-x86_64" <<'QEMU'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_QEMU_ARGS"
+# Inspect the fixture while QEMU would be using it. This also checks quoting and
+# QEMU's comma escaping when TMPDIR contains spaces and commas.
+python3 - "$@" <<'TFTP'
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+netdev = args[args.index("-netdev") + 1]
+prefix = "user,id=net0,tftp="
+assert netdev.startswith(prefix), netdev
+root = Path(netdev.removeprefix(prefix).replace(",,", ","))
+fixture = Path(os.environ["FAKE_TFTP_FIXTURE"])
+assert sorted(p.name for p in root.iterdir()) == [fixture.name]
+assert (root / fixture.name).read_bytes() == fixture.read_bytes()
+with open(os.environ["FAKE_TFTP_ROOTS"], "a") as roots:
+    print(root, file=roots)
+TFTP
+if [ "$?" -ne 0 ]; then exit 2; fi
 # The timeout fixture serves a real monitor socket, so the runner's Python probe
 # exercises register parsing, CPU selection and memory reads end to end.
 if [ -n "${FAKE_QEMU_MONITOR:-}" ]; then
@@ -34,6 +53,13 @@ QEMU
 chmod +x "$work/bin/qemu-system-x86_64"
 export PATH="$work/bin:$PATH" OVMF_FIRMWARE="$work/firmware" BOOT_TIMEOUT=5
 export FAKE_QEMU_LOG="$work/fixture" FAKE_QEMU_ARGS="$work/qemu-args"
+export FAKE_TFTP_FIXTURE="$(dirname "$runner")/../../recipes/tests/ferric-netq-test/files/fixtures/ferric-netq.txt"
+export FAKE_TFTP_ROOTS="$work/tftp-roots"
+check_tftp_cleanup() {
+    while IFS= read -r root; do
+        [ ! -e "$root" ] || { echo "runner left its TFTP directory: $root" >&2; exit 1; }
+    done < "$FAKE_TFTP_ROOTS"
+}
 check() {
     local name="$1" expected="$2" contents="$3" text="${4:-}" split="${5:-}" status=0
     printf '%s\n' "$contents" > "$FAKE_QEMU_LOG"
@@ -49,9 +75,13 @@ check() {
         tail -c 12000 "$work/output" | tail -n 60 >&2
         exit 1
     fi
+    check_tftp_cleanup
     echo "PASS: $name"
 }
 check pass 0 $'FERRIC_TEST_PASS xstate\r\nFERRIC_SMOKE_OK\r'
+mkdir "$work/temp dir,with comma"
+TMPDIR="$work/temp dir,with comma" check tftp-path-escaping 0 \
+    $'FERRIC_TEST_PASS netq-udp\nFERRIC_SMOKE_OK'
 # The repeated-boot investigation produced a large UTF-8 console. Shell glob
 # removal over the whole string took minutes after the guest had shut down.
 large_console="$(python3 - <<'PY'
@@ -169,6 +199,7 @@ if grep -q 'Traceback' "$work/stderr"; then
     exit 1
 fi
 echo "PASS: timeout-user-frames"
+check_tftp_cleanup
 
 # The smoke image's audio check needs both controllers on the QEMU command line.
 grep -q -- '-device ich9-intel-hda,id=hda0' "$FAKE_QEMU_ARGS" \

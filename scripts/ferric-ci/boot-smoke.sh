@@ -14,6 +14,7 @@
 #   treat a kernel panic as a failure: for the crash-dump image, whose first boot
 #   panics on purpose and resets (see image.yml's crash job, which checks the log).
 #   BOOT_SMP=N boots N vCPUs instead of the default 4 (the scheduler baseline runs 1).
+#   The user network serves the owned-UDP test's single-block TFTP fixture locally.
 set -euo pipefail
 
 image="$1"
@@ -110,7 +111,15 @@ disk="$(mktemp --suffix=.img)"
 cp "$image" "$disk"
 # A QEMU monitor of its own, so a run that times out can dump where each CPU is.
 monitor="$(mktemp -u --suffix=.mon)"
-trap 'rm -f "$disk" "$monitor"' EXIT
+tftp_root=""
+trap 'rm -f "$disk" "$monitor"; if [ -n "$tftp_root" ]; then rm -rf "$tftp_root"; fi' EXIT
+# Expose only this public fixture, never the checkout or the host's other files.
+# Each boot has its own directory; QEMU needs neither a host UDP port nor a daemon.
+tftp_root="$(mktemp -d)"
+runner_dir="$(cd "$(dirname "$0")" && pwd)"
+cp "$runner_dir/../../recipes/tests/ferric-netq-test/files/fixtures/ferric-netq.txt" "$tftp_root/"
+# Commas in QEMU option values are escaped by doubling them.
+tftp_option="${tftp_root//,/,,}"
 
 # Run QEMU in the background and watch the log, so a crash or the shutdown
 # ends the run at once instead of waiting for the timeout.
@@ -120,7 +129,7 @@ qemu-system-x86_64 \
     -bios "$firmware" \
     "${iommu[@]}" \
     -drive file="$disk",format=raw,if=none,id=drv0 "${disk_dev[@]}" \
-    -netdev user,id=net0 "${net_dev[@]}" \
+    -netdev "user,id=net0,tftp=$tftp_option" "${net_dev[@]}" \
     "${edu[@]}" \
     "${hda_dev[@]}" \
     -nographic -vga none "${reboot[@]}" \

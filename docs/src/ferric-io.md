@@ -1978,9 +1978,13 @@ request and receives the reply; this socket is bound with `RAW_TX`. A second
 socket, bound without it, owns a UDP port through a netstack socket bound to
 the interface's address. Filters on unowned ports or on the owned port at
 another address, an `Own` with a file and an `Own` with a socket bound to
-`0.0.0.0` are refused. It exchanges a DNS query with the configured server
-from that port, and has four spoofed frames dropped and counted: a foreign
-source MAC, an unowned source port, the owned port from another source
+`0.0.0.0` are refused. From that port it sends one TFTP read request to
+QEMU's gateway, verifies the exact fixture bytes in DATA block 1, and sends
+the final ACK to the server's transfer port. The fixture follows
+[RFC 1350](https://www.rfc-editor.org/rfc/rfc1350.html), uses octet mode and
+fits in one block. This checks owned-port TX and RX without a public DNS
+resolver or external network. It then has four spoofed frames dropped and
+counted: a foreign source MAC, an unowned source port, the owned port from another source
 address, and ICMP. `netq-tx-bounds` puts TX descriptors outside the UMEM on
 TX (past its end, near the top of the address space, inside it but not at a
 frame's start, longer than a frame, with a reserved flag) and checks each is
@@ -1994,6 +1998,19 @@ These are QEMU numbers, for trend only. Last, it
 checks the counters, closes both sockets with requests in flight, and checks
 netstack answers again. It skips when the driver has no queue sockets or
 there is no `kernel.regbuf` scheme.
+
+`scripts/ferric-ci/boot-smoke.sh` enables QEMU's read-only TFTP server and
+serves only `recipes/tests/ferric-netq-test/files/fixtures/ferric-netq.txt`
+from a temporary directory unique to that boot, removed on exit. For a
+manual QEMU run of this test image, add
+`tftp=/absolute/path/to/recipes/tests/ferric-netq-test/files/fixtures` to
+its `-netdev user,...` argument. The guest expects the server at its default
+gateway. A missing server, wrong payload or missing reply fails `netq-udp`
+within ten seconds; it does not skip or retry the request. QEMU documents
+the server under its [user-network options](https://www.qemu.org/docs/master/system/invocation.html#network-options).
+The host protocol tests check the request and ACK byte fixtures, the chosen
+server port, address and port matching, malformed headers and altered,
+truncated or extended payloads.
 
 Frame formats follow IEEE 802.3, IEEE 802.1Q, RFC 791, RFC 8200, RFC 768 and
 RFC 9293, parsed with the `etherparse` crate.

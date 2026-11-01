@@ -9,12 +9,13 @@ description = "Kernel-bypass queue sockets in copy mode: on-target test for Ferr
 [workspace]
 
 [dependencies]
+etherparse = "0.21"
 ferric-netq = { path = "../../../../crates/netq" }
 ferric-regbuf = { path = "../../../../crates/regbuf" }
 ferric-ring = { path = "../../../../crates/ring" }
+simple_endian = { version = "0.4.11", default-features = false, features = ["derive", "integer_impls", "big_endian", "byte_impls", "io-std"] }
 
 [target.'cfg(target_os = "redox")'.dependencies]
-etherparse = "0.21"
 libc = "0.2"
 libredox = "0.1.25"
 redox_syscall = "0.9.4"

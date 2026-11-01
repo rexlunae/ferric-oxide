@@ -33,6 +33,8 @@ use libredox::flag::{O_CLOEXEC, O_NONBLOCK, O_RDONLY, O_RDWR};
 use syscall::CallFlags;
 use syscall::error::{EACCES, EAGAIN, EBUSY, EINVAL, EIO, ENOENT, ENOSPC, ENOTCONN};
 
+use crate::tftp;
+
 /// The UMEM's frame size.
 const FRAME_SIZE: FrameSize = FrameSize::Bytes2048;
 /// Frames in the UMEM.
@@ -65,10 +67,8 @@ const IN_FLIGHT: u16 = 8;
 const OWNED_PORT: u16 = 47353;
 /// The UDP protocol number (RFC 768).
 const IP_PROTOCOL_UDP: u8 = 17;
-/// How long the DNS round trip may take: the configured server is past QEMU's gateway.
-const DNS_WAIT: Duration = Duration::from_secs(10);
-/// The DNS query's ID.
-const DNS_ID: u16 = 0x4e71;
+/// The owned-UDP exchange's bound; independent of any external network service.
+const UDP_WAIT: Duration = Duration::from_secs(10);
 /// Frames each side sends in the TX benchmark.
 const BENCH_FRAMES: u64 = 20_000;
 /// The UDP payload of a benchmark frame: 18 bytes make a 60-byte frame, the Ethernet minimum
@@ -127,6 +127,8 @@ enum Failure {
     FrameTooLong { len: usize },
     /// Building a frame failed.
     Build(BuildVecWriteError),
+    /// Encoding the local UDP fixture's protocol header failed.
+    Fixture(std::io::Error),
 }
 
 impl fmt::Display for Failure {
@@ -149,6 +151,7 @@ impl fmt::Display for Failure {
             Self::Frame(err) => write!(f, "bad Completion entry from the driver: {err}"),
             Self::FrameTooLong { len } => write!(f, "a {len}-byte frame does not fit a frame"),
             Self::Build(err) => write!(f, "cannot build a frame: {err}"),
+            Self::Fixture(err) => write!(f, "cannot encode the UDP fixture: {err}"),
         }
     }
 }
@@ -163,6 +166,7 @@ impl std::error::Error for Failure {
             Self::Desc(err) => Some(err),
             Self::Frame(err) => Some(err),
             Self::Build(err) => Some(err),
+            Self::Fixture(err) => Some(err),
             _ => None,
         }
     }
@@ -646,24 +650,26 @@ impl Socket {
         request: &[u8],
         answer: impl FnMut(&[u8]) -> Option<T>,
     ) -> Result<T, Failure> {
-        self.exchange_within(buffer, what, request, WAIT, answer)
+        self.exchange_within(buffer, what, request, WAIT, Some(RESEND), answer)
     }
 
-    /// [`exchange`](Self::exchange), waiting up to `wait`.
+    /// [`exchange`](Self::exchange), waiting up to `wait`; `None` sends exactly once.
     fn exchange_within<T>(
         &mut self,
         buffer: &Buffer,
         what: &'static str,
         request: &[u8],
         wait: Duration,
+        resend: Option<Duration>,
         mut answer: impl FnMut(&[u8]) -> Option<T>,
     ) -> Result<T, Failure> {
+        self.send(buffer, request)?;
         let start = Instant::now();
-        let mut sent: Option<Instant> = None;
+        let mut sent = start;
         loop {
-            if sent.is_none_or(|at| at.elapsed() >= RESEND) {
+            if resend.is_some_and(|interval| sent.elapsed() >= interval) {
                 self.send(buffer, request)?;
-                sent = Some(Instant::now());
+                sent = Instant::now();
             }
             while let Some(frame) = self.receive(buffer)? {
                 if let Some(found) = answer(&frame) {
@@ -706,8 +712,6 @@ struct Test {
     arp_filter: Option<FilterId>,
     /// The ICMP filter's ID, from the ping step.
     icmp_filter: Option<FilterId>,
-    /// The DNS server netstack is configured with.
-    dns: Ipv4Addr,
     /// The second socket, from the own step.
     owned: Option<Owned>,
 }
@@ -1056,47 +1060,33 @@ fn own_step(t: &mut Test) -> Result<(), Failure> {
     Ok(())
 }
 
-/// A DNS query (RFC 1035) for the root's name servers, which any recursive server answers.
-fn dns_query() -> Vec<u8> {
-    let mut query = Vec::with_capacity(17);
-    query.extend_from_slice(&DNS_ID.to_be_bytes());
-    // Recursion desired; one question.
-    query.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
-    // The root name, type NS (2), class IN (1).
-    query.extend_from_slice(&[0, 0, 2, 0, 1]);
-    query
-}
-
-/// Whether `frame` is the DNS server's answer to [`dns_query`], to [`OWNED_PORT`].
-fn is_dns_answer(frame: &[u8], dns: Ipv4Addr) -> bool {
-    let Ok(packet) = SlicedPacket::from_ethernet(frame) else {
-        return false;
-    };
-    let from_dns =
-        matches!(&packet.net, Some(NetSlice::Ipv4(ip)) if ip.header().source() == dns.octets());
-    let Some(TransportSlice::Udp(udp)) = packet.transport else {
-        return false;
-    };
-    let payload = udp.payload();
-    from_dns
-        && udp.source_port() == 53
-        && udp.destination_port() == OWNED_PORT
-        && payload.len() >= 3
-        && payload[..2] == DNS_ID.to_be_bytes()
-        && payload[2] & 0x80 != 0
-}
-
 fn udp_step(t: &mut Test) -> Result<(), Failure> {
-    let dns = t.dns;
-    let query = t.udp_frame(t.mac, OWNED_PORT, dns, 53, &dns_query())?;
+    let (gateway, ip) = (t.gateway, t.ip);
+    let request = t.udp_frame(
+        t.mac,
+        OWNED_PORT,
+        gateway,
+        tftp::SERVER_PORT,
+        &tftp::request().map_err(Failure::Fixture)?,
+    )?;
     let owned = t.owned()?;
-    owned.socket.exchange_within(
+    let server_port = owned.socket.exchange_within(
         &owned.buffer,
-        "DNS answer through the socket",
-        &query,
-        DNS_WAIT,
-        |f| is_dns_answer(f, dns).then_some(()),
-    )
+        "local TFTP fixture through the owned socket",
+        &request,
+        UDP_WAIT,
+        None,
+        |f| tftp::answer(f, gateway, ip, OWNED_PORT),
+    )?;
+    let ack = t.udp_frame(
+        t.mac,
+        OWNED_PORT,
+        gateway,
+        server_port,
+        &tftp::acknowledgment().map_err(Failure::Fixture)?,
+    )?;
+    let owned = t.owned()?;
+    owned.socket.send(&owned.buffer, &ack)
 }
 
 fn spoof_step(t: &mut Test) -> Result<(), Failure> {
@@ -1494,7 +1484,6 @@ fn setup() -> Result<Setup, Failure> {
     }
     let ip = live_ip()?;
     let gateway = live_gateway()?;
-    let dns = config_addr("/etc/net/dns")?;
     let size = RingSize::new(ENTRIES).expect("64 entries is a valid ring size");
     let layout = RingLayout::new(size, size, size, size);
     let buffer = Buffer::new(UMEM_BYTES + layout.map_len())?;
@@ -1512,7 +1501,6 @@ fn setup() -> Result<Setup, Failure> {
         gateway_mac: [0; 6],
         arp_filter: None,
         icmp_filter: None,
-        dns,
         owned: None,
     })))
 }

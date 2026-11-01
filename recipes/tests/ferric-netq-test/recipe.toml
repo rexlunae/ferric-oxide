@@ -3,7 +3,8 @@
 # grants of them to a queue socket on the network driver, binds it, steers ARP and then ICMP
 # from the gateway to it, answers both through its own TX ring, checks the refusals and the
 # counters, closes the socket with traffic in flight, and checks netstack works before, during
-# and after. It prints FERRIC_TEST_SKIP when there is no network driver, no kernel.regbuf
+# and after. An owned UDP port reads the exact local TFTP fixture provided by boot-smoke.sh;
+# no external resolver is needed. It prints FERRIC_TEST_SKIP when there is no network driver, no kernel.regbuf
 # scheme or no queue sockets in the driver. Only for test images. Source lives in files/; as a
 # path source (relative to the repository root) edits there rebuild it.
 [source]

@@ -42,6 +42,7 @@ on:
       - "recipes/tests/ferric-ring-test/**"
       - "recipes/tests/ferric-aslr-test/**"
       - "recipes/tests/ferric-ioport-test/**"
+      - "recipes/tests/ferric-netq-test/**"
       - ".github/workflows/host-tools.yml"
       - ".github/actions/prepare-cargo-git/**"
       - ".github/actions/prepare-image-runner/**"
@@ -126,6 +127,14 @@ jobs:
             --all-targets --target x86_64-unknown-redox -- -D warnings
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps \
             --manifest-path recipes/tests/ferric-time-test/files/Cargo.toml --target x86_64-unknown-redox
+      - name: Owned-UDP fixture checks
+        run: |
+          manifest=recipes/tests/ferric-netq-test/files/Cargo.toml
+          cargo fmt --check --manifest-path "$manifest"
+          cargo test --locked --manifest-path "$manifest"
+          cargo clippy --locked --manifest-path "$manifest" --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path "$manifest" --all-targets --target x86_64-unknown-redox -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --manifest-path "$manifest" --target x86_64-unknown-redox
       - name: Docs
         run: cargo doc --locked --no-deps -p ferric-build -p ferric-abi -p ferric-aligned-buffer -p ferric-boot-time -p ferric-heap -p ferric-exec-core -p ferric-devicetree -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-iommu -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-timed -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry && cargo doc --locked --no-deps --all-features -p ferric-iommu -p ferric-trace && cargo doc --locked --no-deps --all-features -p fox-core
         env:

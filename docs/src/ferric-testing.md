@@ -325,6 +325,14 @@ would bypass that path and miss the sparse-address-space regression. Its host
 protocol tests run with `cargo test --locked --manifest-path
 recipes/tests/ferric-aslr-test/files/Cargo.toml` and in `host-tools.yml`.
 
+The owned-UDP queue test also has host protocol tests:
+`cargo test --locked --manifest-path recipes/tests/ferric-netq-test/files/Cargo.toml`.
+`host-tools.yml` runs them and strict host/Redox Clippy and Redox Rustdoc.
+The smoke runner serves its exact single-block TFTP fixture from a private,
+per-boot directory on QEMU's gateway. No public DNS service or external
+network is needed for `netq-udp`; a missing or incorrect reply still fails.
+See [the network queue test](ferric-io.md#kernel-bypass-network-queues) for manual setup.
+
 | Recipe under `recipes/tests/` | What it exercises |
 | --- | --- |
 | `ferric-xstate-test` | SIMD/extended register-state preservation across execution |
@@ -337,7 +345,7 @@ recipes/tests/ferric-aslr-test/files/Cargo.toml` and in `host-tools.yml`.
 | `ferric-scheme-self-test` | A process opens and reads a file on a scheme it created on the same thread and serves from another, which used to spin the caller's CPU in the kernel |
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
 | `ferric-blkgrant-test` | `nvmed` DMA into an attached grant: reads and writes against `pread`, refusals, revocation, detach and a copy versus grant read benchmark |
-| `ferric-netq-test` | A queue socket on `e1000d` in copy mode (`drivers.net_bypass`): attach, refusals, ARP and ICMP exchanged with QEMU's gateway through the socket's own rings, netstack beside it, port ownership and refused filters, a DNS round trip from an owned port, spoofed TX frames dropped, a TX benchmark against netstack, counters, and close with traffic in flight |
+| `ferric-netq-test` | A queue socket on `e1000d` in copy mode (`drivers.net_bypass`): attach, refusals, ARP and ICMP exchanged with QEMU's gateway through the socket's own rings, netstack beside it, port ownership and refused filters, an exact local TFTP fixture exchanged through an owned port, spoofed TX frames dropped, a TX benchmark against netstack, counters, and close with traffic in flight |
 | `ferric-iobench` | The Phase 2 disk benchmark: fio-style read jobs on the NVMe disk with each queue policy, IOPS, bandwidth and latency percentiles, and the same-boot A/B of per-CPU queues against one queue ([Disk benchmark](ferric-io.md#disk-benchmark-ferric-iobench)) |
 | `ferric-pcache-test` | `kernel.pcache` with a file system scheme of its own: a miss filled through the queue, a hit with no scheme read, readahead after a sequential read, `EIO` from a failed fill and a retry, `EIO` (not a hang) from a done answer whose payload faults and the same answer arriving late ignored, leaving the retry alone, records put back after a queue read that faults, `EPERM` for a child process (attaching, or binding an unbound queue), a queue kept across `exec`, an invalidated page filled again and a stale fill not taken, an answer to a closed object's record ignored as stale (it neither fills nor fails the new object's fill of the same page) and no stale records after reopening it, and readers released with `EIO` when the queue closes, after which reads go to the scheme; prints a cached 4 KiB `pread` time beside the scheme's. Then on RedoxFS: a read-only description follows writes, truncations and an append through another one, a shared writable mapping keeps a file out of the cache exactly while it lasts (a private one changes neither the file nor its caching), and cached reads are benchmarked against RedoxFS's own in the same boot (`FERRIC_BENCH pcache-redoxfs-*`, paired A/B) |
 | `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsize`/`Fstat`/`Fsync` through a ring, the fixed-file table, asynchronous chains with `min_complete` waits and close, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings. `--async-only` selects the asynchronous chain and close probes used by `trace-lifecycle` to check kernel-worker identity restoration |
@@ -577,8 +585,11 @@ first driver keeps `audiohw`, so a machine with the chipset codec and GPU
 audio controllers does not lose every controller to a failed registration.
 
 `scripts/ferric-ci/test-boot-smoke.sh` exercises the runner itself with a fake
-QEMU, so it needs neither firmware nor virtualization. It covers pass, skip,
-failure, a crash after the marker, a nonzero QEMU exit or timeout after the
+QEMU, so it needs neither firmware nor virtualization. It checks that only the
+expected TFTP fixture is served, that paths with spaces and commas reach QEMU
+correctly, and that per-boot fixture directories are removed on success and
+failure. It covers pass, skip, failure, a crash after the marker, a nonzero
+QEMU exit or timeout after the
 marker, an exit during the final timeout poll, a missing test result and a missing
 marker. A smoke shell that cannot be linked fails early with that message. Any
 loader failure before a later marker, including a child failure followed by SKIP,
