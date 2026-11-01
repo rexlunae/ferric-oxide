@@ -689,3 +689,13 @@ problem and rerun `make config-generate` to retry pending rebuilds. The kernel,
 bootloader and relibc recipes also maintain feature stamps for their
 Make-driven artifacts. Generated output, `ferric.toml` and image artifacts must
 stay uncommitted.
+
+Use one active configuration output/state directory for builds sharing recipe
+caches. For temporary profiles, override `FERRIC_CONFIG` while keeping the normal
+`build/ferric` output. Separate `--out`/`FERRIC_OUT` directories have independent
+`state.toml` histories but do not isolate cookbook stages or recipe artifacts;
+switching between them can reuse the wrong profile
+([#369](https://github.com/rexlunae/ferric-oxide/issues/369)). Use `generate
+--no-touch` for standalone configuration previews. Check the requested feature's
+boot markers as well as the smoke result, and regenerate from the saved user
+configuration after temporary validation profiles.

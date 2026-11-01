@@ -1243,12 +1243,43 @@ and `cpu.frame_pointers`, boots it once, and profiles a short fuzz run.
 
 ## Validation
 
-A local smoke run with scheduler tracing active lost `trace-clock`'s second
-marker during its 200 ms interval without a consumer. The capture also reported
-cumulative ring loss. [#366](https://github.com/rexlunae/ferric-oxide/issues/366)
-tracks per-step loss attribution and a regression for the cause. A missing marker
-continues to fail the test; no retry, tracing disable or ring-budget change was
-introduced for that run.
+The clock check consumes throughout its marker interval. The previous check
+left the rings unread while sleeping for 200 ms; a real shared-ring regression
+reproduces its missing-second-marker result by filling the unchanged 64 KiB ring
+between the writes. The first marker remains and the full ring drops the second,
+with a positive loss delta. The earlier native failure in
+[#366](https://github.com/rexlunae/ferric-oxide/issues/366) reported only cumulative
+loss, so that historical run alone cannot attribute its drops to this step.
+
+`trace-clock` now maps each CPU, takes one bounded `View::peek` per CPU on each
+pass, validates records, retains only three write signatures' counts/timestamps,
+and commits the batch before polling again. Its storage is one 64 KiB buffer
+plus scalar state per CPU, independent of the event volume. It does not drain
+until empty: traced commits and reads can themselves generate more events.
+During the interval it issues controlled `EBADF` writes in bursts smaller than
+ring capacity, totaling more than twice the combined rings' capacity in
+enter/exit records. The probe may migrate; the load is not pinned or balanced
+across CPUs. Both markers and every controlled write must appear exactly once.
+Their minimum separation remains 200 ms, the calibrated-clock tolerance
+remains 0.5–2.0 of measured wall time, and the TSC check still requires increasing
+timestamps. Other enabled events continue recording throughout the interval.
+
+`FERRIC_TRACE_CLOCK` lines report each CPU's `head_before`, `head_after`,
+`tail_before`, `tail_after`, `lost_before`, `lost_after`, wrapping `lost_during`
+delta, copied `words` and the largest `peak_pending` sampled before a read.
+The counter samples are independent diagnostic loads, not one atomic snapshot.
+The pass line includes `background_writes`. Missing/duplicated writes and
+malformed records fail the step; syscall tracing is disabled and a final bounded
+pass and diagnostic report are attempted even after an earlier failure.
+
+`cargo test --locked --manifest-path recipes/tests/ferric-trace-test/files/Cargo.toml`
+runs host regressions using the production ring implementation: unconsumed
+first/second marker loss, concurrent bounded capture through multiple ring wraps,
+commit-generated refills, strict marker counts, corrupt and unknown events,
+argument-count mismatches and small buffers. The host-tools workflow also checks
+the recipe's formatting, strict host/Redox Clippy and Redox Rustdoc. Native smoke
+runs exercise the same collector against the scheme; host tests do not prove
+native clock calibration or the Phase S adoption criteria.
 
 - **Host tests.** `cargo test --locked -p ferric-trace --all-features` covers:
   - the compile-time catalog checks, that every subsystem has events, the
@@ -1319,8 +1350,10 @@ introduced for that run.
      the write keeps its `syscall.enter`, while `syscall.exit` (no filter)
      records every call; then removes the filter and checks that unknown events
      and arguments are refused (`trace-filter`).
-  11. reads the `clock` file and, with `syscall` on, makes two marker writes
-      200 ms apart: when the clock's tick length is known (the KVM clock, the
+  11. reads the `clock` file and, with `syscall` on, polls bounded mapped batches
+      between two marker writes at least 200 ms apart under controlled syscall
+      load, retaining every issued write and reporting per-CPU loss deltas:
+      when the clock's tick length is known (the KVM clock, the
       HPET), the time between their timestamps must be within a factor of two
       of the wall time; for the TSC it prints the frequency they imply
       (`trace-clock`);
