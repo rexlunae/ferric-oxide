@@ -203,6 +203,7 @@ fn assert_profile_packages(profile: &str, resolved: &redox_installer::Config) {
             "ferric-guard-test",
             "ferric-tlb-test",
             "ferric-futex-test",
+            "ferric-time-test",
             "ferric-syscall-fuzz",
             "ferric-iommu-test",
             "ferric-regbuf-test",

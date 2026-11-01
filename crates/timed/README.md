@@ -4,7 +4,14 @@ Host-testable, `no_std` clock and deadline mechanisms for Ferric's Phase S
 migration. The default build provides allocation-free time arithmetic,
 calibration, monotonic publication and hardware one-shot programming helpers.
 The `alloc` feature adds ordered monotonic/realtime timeout storage with
-queue-local cancellation tokens and earliest monotonic wakeup projection.
+globally distinct cancellation tokens and earliest monotonic wakeup projection.
+
+Expiry uses binary heaps that retain capacity, including when their last entry
+is removed. It does not enter the allocator. Individual cancellation rebuilds
+the affected heap in O(n); owner-wide cancellation filters both heaps in O(n).
+Neither leaves stale entries. Returned payloads and their destructors remain
+the caller's responsibility. A latest-deadline diagnostic performs a linear
+scan; hardware rearming uses the constant-time earliest-deadline lookup.
 
 `Nanos` is the wrapping `u64` hardware/scheduler scale. The timeout module's
 `Timestamp` retains the full `u128` absolute-date range of the native time

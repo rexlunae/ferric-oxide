@@ -26,6 +26,10 @@ pub fn resource(token: &mut CleanLockToken) -> Result<Vec<u8>> {
         Some(deadline) => alloc::format!("{deadline}"),
         None => String::from("none"),
     };
+    let timeout_latest_monotonic_ns = match timeout.latest_monotonic_ns {
+        Some(deadline) => alloc::format!("{deadline}"),
+        None => String::from("none"),
+    };
     let res = alloc::format!(
         "{}{}\n\
         boot_time: {start_time_sec}\n\
@@ -42,7 +46,8 @@ pub fn resource(token: &mut CleanLockToken) -> Result<Vec<u8>> {
         idling_cpu_count: {idling_cpu}\n\
         pipe_subcribers: {pipe_subs}\n\
         timeout_subscribers: {timeout_subs}\n\
-        timeout_next_monotonic_ns: {timeout_next_monotonic_ns}\n",
+        timeout_next_monotonic_ns: {timeout_next_monotonic_ns}\n\
+        timeout_latest_monotonic_ns: {timeout_latest_monotonic_ns}\n",
         get_cpu_stats(),
         get_irq_stats(),
         get_contexts_count(),

@@ -889,11 +889,15 @@ interrupts, scheduler wait registration or timer hardware.
 
 `cargo test --locked -p ferric-timed --features alloc` covers monotonic/realtime
 ordering and projection, forward/backward wall-clock changes, duplicate dates,
-earliest cancellation, stale identities, identifier exhaustion, dates beyond
+earliest cancellation, tokens from another queue or an earlier queue lifetime,
+owner-wide cancellation, identifier exhaustion, dates beyond
 the hardware `u64` horizon, arithmetic saturation, concurrent consumers under
 one owner lock and exactly-once resource drops. A pending-set model checks mixed
 insert/cancel/expiry sequences across both clocks. Run the allocation-free
 arithmetic build separately with `cargo test --locked -p ferric-timed`.
+An integration test instruments the actual global allocator and verifies zero
+calls during due checks, expiry through the last entry, and cancellation with
+nonallocating payloads. A calibration free confirms the instrumentation is active.
 Host CI runs both configurations and Miri with `alloc`, and the queue must pass
 Clippy and warning-free Rustdoc with `--all-features`.
 
@@ -905,18 +909,34 @@ cargo run --locked --release -p ferric-timed --features alloc --example timeout_
 
 The example compares the former vector scan against ordered storage at 1, 64
 and 4096 pending timers. It reports registration and expiry cost per event and
-cost per pass with no due event. Ordered lookup also adds tree insertion/removal
+cost per pass with no due event. Ordered lookup also adds heap insertion/removal
 work, so report those costs alongside scan savings. These numbers do not measure
 kernel locks, event callbacks, hardware timers or scheduler latency.
 
 Kernel validation must build with `kernel.time.one_shot` enabled and disabled,
 then boot the corresponding image and exercise time-scheme events. Inspect
-`timeout_subscribers` and `timeout_next_monotonic_ns` in `/scheme/sys/stat`:
-the latter is an absolute monotonic nanosecond date or `none`. It covers only
-time-scheme registrations. It does not prove the scheduler has stopped its tick.
-The final-close lifetime regression remains
-[#362](https://github.com/rexlunae/ferric-oxide/issues/362); do not claim it fixed
-until registration/close/expiry races and target resource-baseline checks pass.
+`timeout_subscribers`, `timeout_next_monotonic_ns` and
+`timeout_latest_monotonic_ns` in `/scheme/sys/stat`. Dates are absolute monotonic
+nanoseconds or `none`. The latest-date diagnostic scans the registry; it is not
+used for rearming. These fields cover only time-scheme registrations and do not
+prove the scheduler has stopped its tick.
+
+The smoke image's `ferric-time-test` covers both clock domains, distinct owners,
+non-final descriptor closes, final-close cancellation, multi-record writes
+racing close, and due-timer event delivery through `/scheme/event/`. Distant
+sentinel deadlines let it check that all of an owner's timers disappear while
+ordinary driver and network timers remain live; it does not assume a globally
+empty queue. It prints `time-ownership`, `time-close-race` and `time-expiry` pass
+markers, required by image CI. The recipe also passes target Clippy/Rustdoc.
+This is regression coverage for
+[#362](https://github.com/rexlunae/ferric-oxide/issues/362); bounded IRQ execution
+and the full S9 teardown/failure matrix remain separate gates.
+
+The wider smoke suite currently assumes a read-only ext4 daemon in its
+`ext4-erofs` step. A build with `fs.ext4_write=true` can fail that assertion;
+[#364](https://github.com/rexlunae/ferric-oxide/issues/364) tracks the fixture
+mismatch. Preserve that result when reporting a run, even if the timer
+regressions pass.
 
 ### Delayed page-cache writeback notifications
 

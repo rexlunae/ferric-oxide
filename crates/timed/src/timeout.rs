@@ -29,8 +29,51 @@
 //! # Ok::<(), ferric_timed::timeout::InsertError>(())
 //! ```
 
-use alloc::collections::BTreeMap;
-use core::fmt;
+use alloc::collections::BinaryHeap;
+use core::{
+    cmp::{Ordering, Reverse},
+    fmt, mem,
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+};
+
+// Shared by every queue, including queues dropped and created at the same address.
+// Exhaustion is permanent rather than recycling a live or stale token's identity.
+static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(0);
+
+fn next_registration(counter: &AtomicU64) -> Result<u64, InsertError> {
+    counter
+        .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .map_err(|_| InsertError::IdentifiersExhausted)
+}
+
+struct Entry<T> {
+    key: (Timestamp, u64),
+    value: T,
+}
+
+impl<T> PartialEq for Entry<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl<T> Eq for Entry<T> {}
+
+impl<T> PartialOrd for Entry<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Ord for Entry<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+type Heap<T> = BinaryHeap<Reverse<Entry<T>>>;
 
 /// Non-wrapping absolute nanoseconds in a time-scheme clock domain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,8 +131,9 @@ impl ClockSnapshot {
 
 /// An opaque registration identifying exactly one insertion into its queue.
 ///
-/// Registrations belong to the queue that returned them. Cancelling a retired
-/// registration cannot cancel a later insertion into that same queue.
+/// Registration identities are unique across all queues and are never recycled.
+/// Passing a token to another queue, or cancelling a retired token, returns
+/// `None` without removing an unrelated insertion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Registration {
     clock: Clock,
@@ -101,7 +145,7 @@ pub struct Registration {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InsertError {
-    /// All `u64` registration identities have been used; they are never recycled.
+    /// The process-wide registration identity counter is exhausted; it never wraps.
     IdentifiersExhausted,
 }
 
@@ -115,14 +159,15 @@ impl core::error::Error for InsertError {}
 
 /// Ordered timeout storage with independent monotonic and realtime queues.
 ///
-/// Earliest-deadline lookup and checking whether a timeout is due inspect only
-/// the head of each clock's queue. Insertion and removal use `BTreeMap` ordering.
+/// Earliest-deadline lookup inspects two heap heads. Expiry retains heap
+/// capacity and neither allocates nor deallocates storage, even on the last
+/// entry. Insertion may grow storage. Cancellation rebuilds the affected heap
+/// in place in O(n), and retains its capacity too. Queue destruction frees it.
 /// Queue owners supply synchronization and dispatch returned values themselves.
 /// There is no internal clock, periodic polling, hardware state or callback.
 pub struct TimeoutQueue<T> {
-    monotonic: BTreeMap<(Timestamp, u64), T>,
-    realtime: BTreeMap<(Timestamp, u64), T>,
-    next_sequence: Option<u64>,
+    monotonic: Heap<T>,
+    realtime: Heap<T>,
 }
 
 impl<T> Default for TimeoutQueue<T> {
@@ -135,9 +180,8 @@ impl<T> TimeoutQueue<T> {
     /// Constructs an empty queue without allocating.
     pub const fn new() -> Self {
         Self {
-            monotonic: BTreeMap::new(),
-            realtime: BTreeMap::new(),
-            next_sequence: Some(0),
+            monotonic: BinaryHeap::new(),
+            realtime: BinaryHeap::new(),
         }
     }
 
@@ -151,14 +195,14 @@ impl<T> TimeoutQueue<T> {
         self.monotonic.is_empty() && self.realtime.is_empty()
     }
 
-    fn queue(&self, clock: Clock) -> &BTreeMap<(Timestamp, u64), T> {
+    fn queue(&self, clock: Clock) -> &Heap<T> {
         match clock {
             Clock::Monotonic => &self.monotonic,
             Clock::Realtime => &self.realtime,
         }
     }
 
-    fn queue_mut(&mut self, clock: Clock) -> &mut BTreeMap<(Timestamp, u64), T> {
+    fn queue_mut(&mut self, clock: Clock) -> &mut Heap<T> {
         match clock {
             Clock::Monotonic => &mut self.monotonic,
             Clock::Realtime => &mut self.realtime,
@@ -171,19 +215,19 @@ impl<T> TimeoutQueue<T> {
     /// `value` is dropped without adding an entry.
     ///
     /// # Errors
-    /// Returns [`InsertError::IdentifiersExhausted`] after all identities have
-    /// been used. The queue never wraps or reuses a registration identity.
+    /// Returns [`InsertError::IdentifiersExhausted`] when the process-wide
+    /// identity source is exhausted. It never wraps or recycles identities.
     pub fn insert(
         &mut self,
         clock: Clock,
         at: Timestamp,
         value: T,
     ) -> Result<Registration, InsertError> {
-        let sequence = self
-            .next_sequence
-            .ok_or(InsertError::IdentifiersExhausted)?;
-        self.next_sequence = sequence.checked_add(1);
-        self.queue_mut(clock).insert((at, sequence), value);
+        let sequence = next_registration(&NEXT_REGISTRATION)?;
+        self.queue_mut(clock).push(Reverse(Entry {
+            key: (at, sequence),
+            value,
+        }));
         Ok(Registration {
             clock,
             at,
@@ -192,10 +236,33 @@ impl<T> TimeoutQueue<T> {
     }
 
     /// Removes a pending registration from this queue, returning its value.
-    /// Returns `None` after the registration has fired or been cancelled.
+    /// Returns `None` for another queue's token or after this registration has
+    /// fired or been cancelled. Takes O(n) without allocating or freeing storage.
     pub fn cancel(&mut self, registration: Registration) -> Option<T> {
-        self.queue_mut(registration.clock)
-            .remove(&(registration.at, registration.sequence))
+        let queue = self.queue_mut(registration.clock);
+        let index = queue
+            .iter()
+            .position(|entry| entry.0.key == (registration.at, registration.sequence))?;
+        let mut entries = mem::take(queue).into_vec();
+        let Reverse(entry) = entries.swap_remove(index);
+        *queue = BinaryHeap::from(entries);
+        Some(entry.value)
+    }
+
+    /// Cancels all values selected by `predicate`, returning their count.
+    ///
+    /// Takes O(n), retains heap capacity and does not allocate storage. Removed
+    /// values are dropped immediately; callers must account for their destructors
+    /// and any work in `predicate`. A kernel can use this on final owner close,
+    /// serialized with admission, without retaining a second list of tokens.
+    ///
+    /// # Panics
+    /// Propagates a panic from `predicate` or a removed value's destructor.
+    pub fn cancel_where(&mut self, mut predicate: impl FnMut(&T) -> bool) -> usize {
+        let before = self.len();
+        self.monotonic.retain(|entry| !predicate(&entry.0.value));
+        self.realtime.retain(|entry| !predicate(&entry.0.value));
+        before - self.len()
     }
 
     /// Returns the next required wakeup in monotonic nanoseconds.
@@ -210,10 +277,25 @@ impl<T> TimeoutQueue<T> {
             .into_iter()
             .filter_map(|clock| {
                 self.queue(clock)
-                    .first_key_value()
-                    .map(|(&(at, _), _)| clocks.project(clock, at))
+                    .peek()
+                    .map(|entry| clocks.project(clock, entry.0.key.0))
             })
             .min()
+    }
+
+    /// Returns the latest projected monotonic deadline for diagnostics.
+    ///
+    /// This scans all entries in O(n), unlike [`Self::next_deadline`]'s two
+    /// head checks. It is not intended for hardware rearming or IRQ paths.
+    pub fn latest_deadline(&self, clocks: ClockSnapshot) -> Option<Timestamp> {
+        [Clock::Monotonic, Clock::Realtime]
+            .into_iter()
+            .flat_map(|clock| {
+                self.queue(clock)
+                    .iter()
+                    .map(move |entry| clocks.project(clock, entry.0.key.0))
+            })
+            .max()
     }
 
     /// Removes one due timeout, with monotonic timeouts considered first.
@@ -221,16 +303,17 @@ impl<T> TimeoutQueue<T> {
     /// Equal dates within a clock are returned in insertion order. A second
     /// consumer cannot receive an entry already removed under the owner's lock.
     /// The caller invokes any callback only after releasing that lock. Removal
-    /// can deallocate tree storage and transfers ownership of `T` to the caller;
-    /// IRQ bindings must account for those operations in their execution model.
+    /// retains storage even when the queue becomes empty, so it never calls the
+    /// allocator. Ownership of `T` transfers to the caller; IRQ bindings must
+    /// still account for callbacks and destructors of returned values.
     pub fn pop_due(&mut self, clocks: ClockSnapshot) -> Option<T> {
         for clock in [Clock::Monotonic, Clock::Realtime] {
             let queue = self.queue_mut(clock);
             if queue
-                .first_key_value()
-                .is_some_and(|(&(at, _), _)| at <= clocks.now(clock))
+                .peek()
+                .is_some_and(|entry| entry.0.key.0 <= clocks.now(clock))
             {
-                return queue.pop_first().map(|(_, value)| value);
+                return queue.pop().map(|entry| entry.0.value);
             }
         }
         None
@@ -253,6 +336,7 @@ mod tests {
         assert!(queue.is_empty());
         assert_eq!(queue.len(), 0);
         assert_eq!(queue.next_deadline(clocks(10, 1_000)), None);
+        assert_eq!(queue.latest_deadline(clocks(10, 1_000)), None);
         assert_eq!(queue.pop_due(clocks(u128::MAX, u128::MAX)), None);
     }
 
@@ -269,14 +353,23 @@ mod tests {
             queue.next_deadline(clocks(10, 1_000)),
             Some(Timestamp::new(30))
         );
+        assert_eq!(
+            queue.latest_deadline(clocks(10, 1_000)),
+            Some(Timestamp::new(40))
+        );
         assert_eq!(queue.pop_due(clocks(29, 1_019)), None);
         assert_eq!(queue.pop_due(clocks(30, 1_020)), Some('r'));
+        assert_eq!(
+            queue.latest_deadline(clocks(30, 1_020)),
+            Some(Timestamp::new(40))
+        );
         assert_eq!(
             queue.next_deadline(clocks(30, 1_020)),
             Some(Timestamp::new(40))
         );
         assert_eq!(queue.pop_due(clocks(40, 1_030)), Some('m'));
         assert!(queue.is_empty());
+        assert_eq!(queue.latest_deadline(clocks(40, 1_030)), None);
     }
 
     #[test]
@@ -293,8 +386,16 @@ mod tests {
             Some(Timestamp::new(60))
         );
         assert_eq!(
+            queue.latest_deadline(clocks(10, 1_000)),
+            Some(Timestamp::new(100))
+        );
+        assert_eq!(
             queue.next_deadline(clocks(20, 900)),
             Some(Timestamp::new(100))
+        );
+        assert_eq!(
+            queue.latest_deadline(clocks(20, 900)),
+            Some(Timestamp::new(170))
         );
         assert_eq!(
             queue.next_deadline(clocks(30, 1_060)),
@@ -385,17 +486,62 @@ mod tests {
 
     #[test]
     fn exhaustion_never_reuses_an_identity() {
-        let mut queue = TimeoutQueue::new();
-        queue.next_sequence = Some(u64::MAX);
-        let last = queue
-            .insert(Clock::Monotonic, Timestamp::new(1), ())
+        let identities = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(next_registration(&identities), Ok(u64::MAX - 1));
+        for _ in 0..3 {
+            assert_eq!(
+                next_registration(&identities),
+                Err(InsertError::IdentifiersExhausted)
+            );
+        }
+    }
+
+    #[test]
+    fn tokens_cannot_cancel_another_queue_even_at_the_same_date() {
+        let mut first = TimeoutQueue::new();
+        let mut second = TimeoutQueue::new();
+        let a = first
+            .insert(Clock::Monotonic, Timestamp::new(10), 'a')
             .unwrap();
-        assert_eq!(queue.cancel(last), Some(()));
-        assert_eq!(
-            queue.insert(Clock::Monotonic, Timestamp::new(1), ()),
-            Err(InsertError::IdentifiersExhausted)
-        );
-        assert!(queue.is_empty());
+        let b = second
+            .insert(Clock::Monotonic, Timestamp::new(10), 'b')
+            .unwrap();
+        assert_ne!(a, b);
+        assert_eq!(second.cancel(a), None);
+        assert_eq!(first.cancel(b), None);
+        assert_eq!(second.cancel(b), Some('b'));
+        drop(second);
+        let mut replacement = TimeoutQueue::new();
+        replacement
+            .insert(Clock::Monotonic, Timestamp::new(10), 'c')
+            .unwrap();
+        assert_eq!(replacement.cancel(b), None);
+        assert_eq!(replacement.pop_due(clocks(10, 0)), Some('c'));
+        assert_eq!(first.cancel(a), Some('a'));
+    }
+
+    #[test]
+    fn final_owner_cancellation_preserves_other_owners_and_ordering() {
+        let mut queue = TimeoutQueue::new();
+        for owner in 0..4 {
+            for clock in [Clock::Monotonic, Clock::Realtime] {
+                for date in 0..8 {
+                    queue
+                        .insert(clock, Timestamp::new(date), (owner, date))
+                        .unwrap();
+                }
+            }
+        }
+        assert_eq!(queue.cancel_where(|&(owner, _)| owner == 1), 16);
+        assert_eq!(queue.cancel_where(|&(owner, _)| owner == 1), 0);
+        assert_eq!(queue.len(), 48);
+        let mut expired = 0;
+        while let Some((owner, date)) = queue.pop_due(clocks(8, 8)) {
+            assert_ne!(owner, 1);
+            assert!(date < 8);
+            expired += 1;
+        }
+        assert_eq!(expired, 48);
     }
 
     #[test]

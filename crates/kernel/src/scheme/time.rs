@@ -128,7 +128,11 @@ impl KernelScheme for TimeScheme {
     }
 
     fn close(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
-        HANDLES.write(token.token()).remove(id).and(Ok(()))
+        let mut handles = HANDLES.write(token.token());
+        handles.remove(id)?;
+        let (_, token) = handles.token_split();
+        timeout::cancel_owner(GlobalSchemes::Time.scheme_id(), id, token);
+        Ok(())
     }
     fn kread(
         &self,
@@ -189,6 +193,12 @@ impl KernelScheme for TimeScheme {
 
             match (handle.clock, handle.kind.clone()) {
                 (_, TimeSchemeKind::Default | TimeSchemeKind::Timer) => {
+                    // Usercopy may have yielded since the metadata snapshot.
+                    // Revalidate and retain the map lock through admission so
+                    // final close cannot leave a late registration behind.
+                    let mut handles = HANDLES.read(token.token());
+                    handles.get(id)?;
+                    let (_, token) = handles.token_split();
                     timeout::register(
                         GlobalSchemes::Time.scheme_id(),
                         id,
