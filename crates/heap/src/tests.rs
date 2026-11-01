@@ -3,7 +3,39 @@
 extern crate std;
 
 use super::*;
-use std::{sync::Mutex, vec, vec::Vec};
+use std::{boxed::Box, sync::Mutex, vec, vec::Vec};
+
+#[test]
+fn mapped_regions_do_not_need_zeroed_or_initialized_contents() {
+    let mut arena = Box::<[u8]>::new_uninit_slice(16 * 1024);
+    let start = arena.as_mut_ptr().cast::<u8>();
+    let mut heap = Heap::new();
+    // SAFETY: both ranges have the same allocation-wide provenance and are
+    // exclusively owned here. MaybeUninit storage is writable without being
+    // initialized; no uninitialized payload is read by this test.
+    unsafe {
+        let initial = NonNull::new_unchecked(core::ptr::slice_from_raw_parts_mut(start, 4096));
+        heap.claim(initial).unwrap();
+        let layout = Layout::from_size_align(80, 64).unwrap();
+        let allocation = heap.allocate(layout).unwrap();
+        allocation.as_ptr().write_bytes(0xa5, layout.size());
+        let extension = NonNull::new_unchecked(core::ptr::slice_from_raw_parts_mut(
+            start.add(4096),
+            12 * 1024,
+        ));
+        heap.extend(extension).unwrap();
+        assert!(
+            core::slice::from_raw_parts(allocation.as_ptr(), layout.size())
+                .iter()
+                .all(|&b| b == 0xa5)
+        );
+        heap.deallocate(allocation, layout);
+        assert!(
+            heap.allocate(Layout::from_size_align(12 * 1024, 128).unwrap())
+                .is_some()
+        );
+    }
+}
 
 fn region(arena: &mut Vec<u8>, offset: usize, length: usize) -> NonNull<[u8]> {
     assert!(offset <= arena.len() && length <= arena.len() - offset);
