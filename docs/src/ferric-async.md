@@ -5,8 +5,8 @@ appropriately scheduled kernel workers, on top of the tickless scheduler
 and its shared deadline service ([#186], [#187]), with a separate admitted
 real-time class ([#189], [#190]). This page records the architecture
 decisions, the reuse audit, the task state machine and the invariants that
-host tests must hold. It describes planned work: nothing here is running in
-the kernel yet, and no performance claim is made. The host-testable core
+host tests must hold. The executor remains planned: no async executor is running
+in the kernel yet, and no async performance claim is made. The host-testable core
 ([#180], `crates/exec-core`) implements the state machine beside this page.
 
 Completing this migration is now the
@@ -45,7 +45,7 @@ work, no hard real-time claim without a schedulability argument.
 | `userspace/base/drivers/storage/nvmed/percore.rs` | Per-CPU workers on one executor | Model per-CPU worker ownership after this; the kernel version is pinned workers, not thread-locals. |
 | `crates/kernel/src/scheme/ring/worker.rs` | Resolved file descriptions, caller credentials/address space, CQ reservation, cancel on close | Consumed as-is by the ring pilot ([#183]); the async backend reuses its request preparation, not its blocking waits. |
 | `crates/kernel/src/scheme/user.rs`, `WaitCondition` | Blocking scheme calls and waits | The future path adds a separate waiter representation ([#182]); blocking callers keep the legacy path and its direct-switch optimizations. |
-| `crates/kernel/src/context/switch.rs` | EEVDF scheduling and wakeup infrastructure | Scheduler stays EEVDF; the extraction of accounting into a host-testable module is [#187], beside `exec-core` in its own module. |
+| `crates/sched-core`, `crates/kernel/src/context/switch.rs` | Active measured-time EEVDF accounting, kernel selection and wakeup infrastructure | `sched-core` holds accounting separately from executor state. Event-driven selection and shared deadline rearming remain [#187] work. |
 | `crates/ring`, `crates/iobench`, `crates/blkqueue` (A/B), `recipes/tests/ferric-ring-test`, `tools/ferric-trace` | Ring client, fio-style histograms, paired A/B, ring tests, trace tooling | Reused unchanged by the benchmarks ([#179], [#185]) and the pilot. |
 
 Decision: one new small MIT crate, `crates/exec-core`, `no_std` with an

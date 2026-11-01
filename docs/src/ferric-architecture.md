@@ -128,8 +128,13 @@ and [Registered buffers and IOMMUs](ferric-io.md) for the new interfaces.
 The scheduler in `crates/kernel/src/context/switch.rs` implements EEVDF
 (earliest eligible virtual deadline first). It tracks virtual execution time
 and deadlines, chooses eligible runnable contexts, and accounts for CPU
-eligibility and an existing time slice. It also supports direct context
-switches for scheme requests. [Scheduling](scheduling.md) describes it and
+eligibility and an existing time slice. `ferric-sched-core` holds the active
+measured-time accounting: real remaining slices, weighted `u128` virtual time,
+fractional progress and explicit switch reasons. Only `sched_yield` forfeits
+unused service; short wake or blocking intervals do not. CPU virtual time is
+charged using the preceding runnable population; migration preserves virtual lag.
+It also supports direct context switches for scheme requests.
+[Scheduling](scheduling.md) describes it and
 the planned tickless, asynchronous and real-time work.
 
 A direct scheme handler can run on its client's timeslice. Keeping that
@@ -142,8 +147,9 @@ with a spurious `EINTR` ([#308](https://github.com/rexlunae/ferric-oxide/issues/
 Only the actual idle context reports an idle or contended scheduler return;
 a retained running user context continues its work.
 
-Timed waits are tracked by `context/timeout.rs`; direct switches preserve
-their deadlines so blocked scheme handlers can still wake. Futex wait setup
+Context waits are tracked in the per-CPU timer registry in `context/switch.rs`;
+direct switches preserve their deadlines so blocked scheme handlers can still
+wake. Futex wait setup
 and wakeups synchronize through the futex table in `syscall/futex.rs` so a
 wakeup cannot pass between the comparison and waiter registration. Expired
 waiters cannot consume a later wake intended for another waiter.

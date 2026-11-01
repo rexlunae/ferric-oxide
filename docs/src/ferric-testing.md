@@ -975,6 +975,24 @@ runs the same state/race checks. Host CI includes it with strict Clippy/Rustdoc.
 The crate is not linked into the kernel yet; these tests do not exercise actual
 interrupts, scheduler wait registration or timer hardware.
 
+### Measured scheduler accounting
+
+`cargo test --locked -p ferric-sched-core` covers real elapsed execution,
+explicit yields, short readiness events, slice exhaustion/overrun, blocking,
+fractional progress, CPU-clock population changes, wide virtual time and
+signed-lag migration. An irregular-event model checks weighted competing tasks.
+`cargo miri test --locked -p ferric-sched-core` runs the same host logic. Host CI
+includes strict Clippy/Rustdoc. For arithmetic cost against the preceding
+accounting, run `cargo run --locked --release -p ferric-sched-core --example
+accounting_bench`; it is a host microbenchmark, not a kernel speed/latency claim.
+
+Native validation must still build and boot periodic scheduling on one and
+multiple CPUs, with one-shot hardware both enabled and disabled, preserving time,
+futex, affinity, signals, rings and direct scheme calls. Model fairness does not
+prove native fairness, IRQ safety or the Phase S adoption criteria. The scheduler
+still has allocating queue paths, a separate context-timer tree and periodic
+interrupt delivery; none is made tickless by the accounting extraction.
+
 ### Shared timeout queue
 
 `cargo test --locked -p ferric-timed --features alloc` covers monotonic/realtime

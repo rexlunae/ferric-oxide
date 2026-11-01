@@ -23,6 +23,7 @@ pub(crate) mod percpu {
 pub(crate) mod context {
     use crate::sync::{CleanLockToken, LockToken, RwLock, L3, L4};
     use alloc::sync::Arc;
+    pub(crate) use ferric_sched_core::ScheduleReason;
     pub(crate) type ContextLock = RwLock<L4, Context>;
     pub(crate) struct Context {
         pub(crate) cancelled: bool,
@@ -60,7 +61,8 @@ pub(crate) mod context {
     pub(crate) fn unblock_context(_: &Arc<ContextLock>, _: &mut LockToken<'_, L3>) {
         panic!("host tests must not wake a context");
     }
-    pub(crate) fn switch(_: &mut CleanLockToken) {
+    pub(crate) fn switch(reason: ScheduleReason, _: &mut CleanLockToken) {
+        assert_eq!(reason, ScheduleReason::Block);
         panic!("host tests must not switch contexts");
     }
 }

@@ -6,6 +6,7 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 use ferric_aligned_buffer::AlignedBuffer;
+use ferric_sched_core::{FairState, Weight};
 use syscall::{SigProcControl, Sigcontrol, UPPER_FDTBL_TAG};
 
 use crate::{
@@ -182,12 +183,8 @@ pub struct Context {
     pub(crate) fmap_ret: super::fmap_reply::FmapReply<Frame>,
     /// Priority
     pub prio: usize,
-    /// Virtual Run Time
-    pub vtime: u64,
-    /// Virtual Deadline
-    pub vd: u64,
-    /// Remaining Slice of allocated time
-    pub rem_slice: u64,
+    /// Measured execution and slice state of this timeslice owner.
+    pub fair: FairState,
     /// Is currently active?
     pub is_active: bool,
     /// Key for the RunQueue.
@@ -263,9 +260,7 @@ impl Context {
             runs_user_code: false,
             fmap_ret: super::fmap_reply::FmapReply::new(),
             prio: 20,
-            vtime: 0,
-            vd: 0,
-            rem_slice: 0,
+            fair: FairState::new(),
             is_active: false,
             queue_key: None,
             being_sigkilled: false,
@@ -310,7 +305,16 @@ impl Context {
         true
     }
 
-    /// Block the context, and return true if it was runnable before being blocked
+    /// Returns the inherited scheduling weight for this context's priority.
+    ///
+    /// # Panics
+    /// Panics if kernel code violates the `prio < 40` invariant. Process-control
+    /// writes clamp priorities before storing them.
+    pub fn scheduling_weight(&self) -> Weight {
+        Weight::for_priority(self.prio).expect("context priority is in 0..40")
+    }
+
+    /// Blocks this context, returning whether it was runnable.
     pub fn block(&mut self, reason: &'static str) -> bool {
         if self.status.is_runnable() {
             self.status = Status::Blocked;

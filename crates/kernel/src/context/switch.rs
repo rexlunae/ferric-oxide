@@ -29,7 +29,10 @@ use core::{
     matches, mem,
     option::Option::{None, Some},
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    time::Duration,
 };
+pub use ferric_sched_core::ScheduleReason;
+use ferric_sched_core::VirtualTime;
 use smallvec::SmallVec;
 use spin::mutex::SpinMutex;
 use syscall::PtraceFlags;
@@ -40,17 +43,8 @@ enum UpdateResult {
     Blocked,
 }
 
-// A simple geometric series where value[i] ~= value[i + 1] * 1.25
-pub const SCHED_PRIO_TO_WEIGHT: [usize; 40] = [
-    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904,
-    3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87,
-    70, 56, 45, 36, 29, 23, 18, 15,
-];
-
-pub const SCALE: u128 = 1 << 30;
-pub const TICK_INTERVAL: u64 = 3; // Approx 6.75 ms
-pub const BASE_SLICE_TICKS: u64 = TICK_INTERVAL * 3; // Approx 20.25 ms
-pub const NANOS_PER_TICK: u128 = 2_250_000; // 2.25 ms
+// The legacy interrupt cadence is retained independently of real slice units.
+const TICK_INTERVAL: usize = 3;
 pub const MAX_STEAL: usize = 2;
 
 /// Determines if a given context is eligible to be scheduled on a given CPU (in
@@ -110,10 +104,11 @@ struct SwitchResultInner {
     _next_guard: ArcContextLockWriteGuard,
 }
 
-/// Tick function to update PIT ticks and trigger a context switch if necessary.
+/// Preserves the legacy periodic switch cadence; accounts real elapsed time.
 ///
-/// Called periodically, this function increments a per-CPU tick counter and performs a context
-/// switch if the counter reaches a set threshold (e.g., every 3 ticks).
+/// Called periodically, this function increments a per-CPU interrupt counter and
+/// reconsiders the timeslice owner after three interrupts. The count controls
+/// event delivery only; it is never converted into execution time.
 ///
 /// The function also calls the signal handler after switching contexts.
 pub fn tick(token: &mut CleanLockToken) {
@@ -122,9 +117,9 @@ pub fn tick(token: &mut CleanLockToken) {
     let new_ticks = ticks_cell.get() + 1;
     ticks_cell.set(new_ticks);
 
-    // Trigger a context switch after every 3 ticks (approx. 6.75 ms).
-    if new_ticks >= TICK_INTERVAL as usize {
-        switch(token);
+    // Preserve the legacy three-interrupt cadence; elapsed time is measured.
+    if new_ticks >= TICK_INTERVAL {
+        switch(ScheduleReason::Preempt, token);
         crate::context::signal::signal_handler(token);
     }
 }
@@ -183,8 +178,11 @@ pub enum SwitchResult {
     Contended,
 }
 
-/// This function performs the context switch, using select_next_context to
-/// actually select the next context to switch to.
+/// Reconsiders scheduling for `reason`, then switches to the selected context.
+///
+/// The explicit reason distinguishes a voluntary user yield from short timer,
+/// wake and blocking intervals. Execution is charged to the timeslice owner,
+/// including execution borrowed by a directly called scheme handler.
 ///
 /// # Warning
 /// This is not memory-unsafe to call. But do NOT call this while holding locks!
@@ -195,22 +193,23 @@ pub enum SwitchResult {
 ///   to an idle context.
 /// - `SwitchResult::Contended`: As `AllContextsIdle`, but a runnable context was passed over
 ///   for a lock held elsewhere, so the idle loop should retry instead of halting.
-pub fn switch(token: &mut CleanLockToken) -> SwitchResult {
+pub fn switch(reason: ScheduleReason, token: &mut CleanLockToken) -> SwitchResult {
     let percpu = PercpuBlock::current();
     let schedule_time = crate::time::monotonic(token);
 
-    switch_inner(percpu, schedule_time, token)
+    switch_inner(percpu, schedule_time, reason, token)
 }
 fn switch_inner(
     percpu: &PercpuBlock,
     schedule_time: u128,
+    reason: ScheduleReason,
     token: &mut CleanLockToken,
 ) -> SwitchResult {
-    if try_direct_switch_back(percpu, schedule_time, token) {
+    if reason != ScheduleReason::Yield && try_direct_switch_back(percpu, schedule_time, token) {
         return SwitchResult::Switched;
     }
 
-    let selection = schedule(percpu, schedule_time, token);
+    let selection = schedule(percpu, schedule_time, reason, token);
     let current_context_lock_ref = percpu.switch_internals.current_context();
     let (previous, next_sched_guard, next_addrsp_guard) = match selection.handoff(|owner| {
         Arc::ptr_eq(
@@ -296,6 +295,7 @@ type ScheduleResult = Scheduled<ArcContextLockWriteGuard, Option<AddrSpaceSwitch
 fn schedule(
     percpu: &PercpuBlock,
     schedule_time: u128,
+    reason: ScheduleReason,
     token: &mut CleanLockToken,
 ) -> ScheduleResult {
     percpu.stats.add_context_switch(percpu.inside_syscall.get());
@@ -319,6 +319,21 @@ fn schedule(
         return ScheduleResult::Switched;
     }
     */
+
+    // Charge the population that owned this interval before admitting wakes or
+    // removing blocked owners. A borrowed handler consumes its client's slice.
+    let elapsed = Duration::from_nanos(
+        u64::try_from(schedule_time.saturating_sub(percpu.switch_internals.schedule_time.get()))
+            .unwrap_or(u64::MAX),
+    );
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    let was_idle = percpu.stats.add_time(elapsed_ms) == CpuState::Idle as u8;
+    percpu.switch_internals.schedule_time.set(schedule_time);
+    if !was_idle {
+        let mut run_queue = percpu.switch_internals.run_queue.lock();
+        let total_weight = run_queue.total_weight;
+        run_queue.clock.account(elapsed, total_weight);
+    }
 
     // Ferric Oxide: contexts woken here whose affinity excludes this CPU, with the CPU to hand
     // each to (see below).
@@ -432,11 +447,10 @@ fn schedule(
                     continue;
                 }
 
-                let new_vtime = guard.vtime.max(run_queue.v);
-                guard.vtime = new_vtime;
-
-                let weight = SCHED_PRIO_TO_WEIGHT[guard.prio] as u64;
-                let scaled_slice = (BASE_SLICE_TICKS as u128 * SCALE) / weight as u128;
+                let weight = guard.scheduling_weight();
+                guard.fair.activate(run_queue.clock.time(), weight);
+                let new_vtime = guard.fair.runtime();
+                let weight = weight.get();
 
                 if !guard.is_active {
                     guard.is_active = true;
@@ -455,11 +469,9 @@ fn schedule(
                         .store(run_queue.queue.len(), Ordering::Relaxed);
                 }
 
-                guard.vd = new_vtime + scaled_slice as u64;
-                guard.rem_slice = BASE_SLICE_TICKS * SCALE as u64;
                 let key = ContextQueueKey {
-                    vd: guard.vd,
-                    rem_slice: Reverse(guard.rem_slice),
+                    vd: guard.fair.deadline(),
+                    rem_slice: Reverse(guard.fair.remaining()),
                     ctxt_id: guard.debug_id,
                 };
                 guard.queue_key = Some(key);
@@ -500,18 +512,12 @@ fn schedule(
     );
     */
 
-    // Update per-cpu times
-    let percpu_nanos =
-        schedule_time.saturating_sub(percpu.switch_internals.schedule_time.get()) as u64;
-    let percpu_ms = percpu_nanos / 1_000_000;
-    let was_idle = percpu.stats.add_time(percpu_ms) == CpuState::Idle as u8;
-    percpu.switch_internals.schedule_time.set(schedule_time);
-
     let next = select_next_context(
         percpu,
         percpu.cpu_id,
         schedule_time,
-        percpu_nanos,
+        elapsed,
+        reason,
         was_idle,
         &mut prev_context_guard,
         &mut forward,
@@ -588,7 +594,8 @@ fn select_next_context(
     percpu: &PercpuBlock,
     cpu_id: LogicalCpuId,
     schedule_time: u128,
-    elapsed_time: u64,
+    elapsed: Duration,
+    reason: ScheduleReason,
     was_idle: bool,
     prev_context_guard: &mut ArcRwLockWriteGuard<L4, Context>,
     forward: &mut SmallVec<[(LogicalCpuId, WeakContextRef); 4]>,
@@ -608,41 +615,18 @@ fn select_next_context(
         && affinity_elsewhere(prev_context_guard, cpu_id).is_some();
     let prev_runnable = !is_idle && prev_context_guard.status.is_runnable() && !prev_elsewhere;
 
-    let elapsed_ticks = elapsed_time as u128 * SCALE / NANOS_PER_TICK;
+    if !is_idle {
+        let weight = prev_context_guard.scheduling_weight();
+        prev_context_guard.fair.account(elapsed, weight, reason);
+    }
 
-    if prev_runnable {
-        let weight = SCHED_PRIO_TO_WEIGHT[prev_context_guard.prio] as u64;
-        prev_context_guard.rem_slice = prev_context_guard
-            .rem_slice
-            .saturating_sub((elapsed_ticks) as u64);
-        let scaled_task = elapsed_ticks / weight as u128;
-        prev_context_guard.vtime += scaled_task as u64;
-
-        if prev_context_guard.vtime < contexts_data.v {
-            prev_context_guard.vtime = contexts_data.v;
-        }
-
-        let is_yield = (elapsed_time as u128) < (TICK_INTERVAL as u128 * NANOS_PER_TICK) / 2;
-
-        if is_yield {
-            let unconsumed = prev_context_guard.rem_slice as u128;
-            let penalty = unconsumed / weight as u128;
-            prev_context_guard.vtime += penalty as u64;
-            prev_context_guard.rem_slice = 0;
-        }
-
-        if prev_context_guard.rem_slice == 0 {
-            prev_context_guard.rem_slice = BASE_SLICE_TICKS * SCALE as u64;
-            let scaled_slice = (BASE_SLICE_TICKS as u128 * SCALE) / weight as u128;
-            prev_context_guard.vd = prev_context_guard.vtime + scaled_slice as u64;
-        }
-    } else if !is_idle {
+    if !prev_runnable && !is_idle {
         if prev_context_guard.is_active {
             prev_context_guard.is_active = false;
-            let weight = SCHED_PRIO_TO_WEIGHT[prev_context_guard.prio] as u64;
+            let weight = prev_context_guard.scheduling_weight().get();
             contexts_data.total_weight = contexts_data.total_weight.saturating_sub(weight);
         }
-        prev_context_guard.rem_slice = 0;
+        prev_context_guard.fair.deactivate();
 
         if prev_elsewhere {
             if let Some(old_key) = prev_context_guard.queue_key.take() {
@@ -668,22 +652,22 @@ fn select_next_context(
     let mut prev_is_eligible = false;
 
     let mut ineligible_best = None;
-    let mut ineligible_min_vtime = u64::MAX;
-    let mut ineligible_vd = u64::MAX;
+    let mut ineligible_min_vtime = VirtualTime::MAX;
+    let mut ineligible_vd = VirtualTime::MAX;
 
     if prev_runnable {
-        if prev_context_guard.vtime <= contexts_data.v {
+        if prev_context_guard.fair.runtime() <= contexts_data.clock.time() {
             prev_is_eligible = true;
         } else {
-            ineligible_min_vtime = prev_context_guard.vtime;
-            ineligible_vd = prev_context_guard.vd;
+            ineligible_min_vtime = prev_context_guard.fair.runtime();
+            ineligible_vd = prev_context_guard.fair.deadline();
         }
     }
 
     // New BTreeMap based walk
     let mut weight_change: u64 = 0;
     let mut contexts_to_remove: SmallVec<[ContextQueueKey; 16]> = SmallVec::new();
-    let virtual_time = contexts_data.v;
+    let virtual_time = contexts_data.clock.time();
     let RunContextData { queue, timers, .. } = &mut *contexts_data;
     for (
         ContextQueueKey {
@@ -759,7 +743,7 @@ fn select_next_context(
                 guard.is_active = false;
                 weight_change += context_weight;
             }
-            guard.rem_slice = 0;
+            guard.fair.deactivate();
             guard.queue_key = None;
 
             // A directly switched scheme handler can sleep while another context owns
@@ -827,17 +811,18 @@ fn select_next_context(
         .store(contexts_data.queue.len(), Ordering::Relaxed);
 
     // No eligible context was found
-    if !(prev_is_eligible || eligible_best.is_some()) && ineligible_min_vtime != u64::MAX {
-        contexts_data.v = ineligible_min_vtime; // Advance V
+    if !(prev_is_eligible || eligible_best.is_some()) && ineligible_min_vtime != VirtualTime::MAX {
+        contexts_data.clock.advance_to(ineligible_min_vtime); // Advance V
 
-        let prev_is_earliest = prev_runnable && prev_context_guard.vtime <= ineligible_min_vtime;
+        let prev_is_earliest =
+            prev_runnable && prev_context_guard.fair.runtime() <= ineligible_min_vtime;
 
         if prev_is_earliest {
             eligible_best = None;
         } else if ineligible_best.is_some() {
-            let prev_has_slice = prev_runnable && prev_context_guard.rem_slice > 0;
+            let prev_has_slice = prev_runnable && !prev_context_guard.fair.remaining().is_zero();
 
-            if prev_has_slice && prev_context_guard.vd <= ineligible_vd {
+            if prev_has_slice && prev_context_guard.fair.deadline() <= ineligible_vd {
                 eligible_best = None;
             } else {
                 eligible_best = ineligible_best.take();
@@ -846,9 +831,9 @@ fn select_next_context(
     } else if prev_is_eligible
         && eligible_best.is_some()
         && let Some((ref guard, _)) = eligible_best
-        && (prev_context_guard.vd < guard.vd
-            || (prev_context_guard.vd == guard.vd
-                && prev_context_guard.rem_slice > guard.rem_slice))
+        && (prev_context_guard.fair.deadline() < guard.fair.deadline()
+            || (prev_context_guard.fair.deadline() == guard.fair.deadline()
+                && prev_context_guard.fair.remaining() > guard.fair.remaining()))
     {
         eligible_best = None;
     }
@@ -970,27 +955,29 @@ fn select_next_context(
                     target_queue.total_weight = target_queue.total_weight.saturating_sub(weight);
                     guard.queue_key = None;
 
-                    let offset = guard.vtime as i128 - target_queue.v as i128;
-                    guard.vtime = (contexts_data.v as i128 + offset).max(0) as u64;
+                    let current_weight = guard.scheduling_weight();
+                    guard.fair.migrate(
+                        target_queue.clock.time(),
+                        contexts_data.clock.time(),
+                        current_weight,
+                    );
 
-                    let scaled_slice = guard.rem_slice / weight;
-                    guard.vd = guard.vtime.saturating_add(scaled_slice);
-
+                    // The stolen owner is active on this CPU even when chosen
+                    // immediately rather than inserted into its runnable tree.
+                    contexts_data.total_weight = contexts_data.total_weight.saturating_add(weight);
                     if final_winner.is_none() && !prev_runnable {
                         final_winner = Some((guard, addr_space));
                     } else {
                         let new_key = ContextQueueKey {
-                            vd: guard.vd,
-                            rem_slice: Reverse(guard.rem_slice),
+                            vd: guard.fair.deadline(),
+                            rem_slice: Reverse(guard.fair.remaining()),
                             ctxt_id: guard.debug_id,
                         };
                         guard.queue_key = Some(new_key);
-                        contexts_data.total_weight =
-                            contexts_data.total_weight.saturating_add(weight);
                         contexts_data.queue_insert(
                             new_key,
                             ContextQueueValue {
-                                vtime: guard.vtime,
+                                vtime: guard.fair.runtime(),
                                 weight,
                                 context_ref,
                             },
@@ -1026,18 +1013,13 @@ fn select_next_context(
     }
 
     if final_winner.is_some() || prev_runnable {
-        if contexts_data.total_weight > 0 {
-            let v_advance = elapsed_ticks / contexts_data.total_weight as u128;
-            contexts_data.v += v_advance as u64;
-        }
-
         if let Some((chosen_guard, addr_space)) = final_winner {
             if prev_runnable {
                 let (vd, rem_slice, ctxt_id, vtime) = (
-                    prev_context_guard.vd,
-                    prev_context_guard.rem_slice,
+                    prev_context_guard.fair.deadline(),
+                    prev_context_guard.fair.remaining(),
                     prev_context_guard.debug_id,
-                    prev_context_guard.vtime,
+                    prev_context_guard.fair.runtime(),
                 );
 
                 if let Some(old_key) = prev_context_guard.queue_key.take() {
@@ -1054,7 +1036,7 @@ fn select_next_context(
                     ctxt_id,
                 });
 
-                let weight = SCHED_PRIO_TO_WEIGHT[prev_context_guard.prio] as u64;
+                let weight = prev_context_guard.scheduling_weight().get();
                 contexts_data.queue_insert(
                     ContextQueueKey {
                         vd,
@@ -1239,7 +1221,7 @@ pub fn direct_switch_to(
     ) {
         drop(prev_context_guard);
         drop(next_context_guard);
-        return switch_inner(percpu, schedule_time, token);
+        return switch_inner(percpu, schedule_time, ScheduleReason::Block, token);
     }
 
     unsafe {
@@ -1638,12 +1620,12 @@ mod tests {
         ) {
             queue.queue_insert(
                 ContextQueueKey {
-                    vd: vtime,
-                    rem_slice: Reverse(vtime),
+                    vd: VirtualTime::new(u128::from(vtime)),
+                    rem_slice: Reverse(Duration::from_nanos(vtime)),
                     ctxt_id: id,
                 },
                 ContextQueueValue {
-                    vtime,
+                    vtime: VirtualTime::new(u128::from(vtime)),
                     weight: 1024,
                     context_ref: WeakContextRef(Arc::downgrade(task)),
                 },
@@ -1660,7 +1642,8 @@ mod tests {
             cpu0,
             cpu0.cpu_id,
             1000,
-            100,
+            Duration::from_nanos(100),
+            ScheduleReason::Reconsider,
             false,
             &mut prev_guard_0,
             &mut SmallVec::new(),
@@ -1690,7 +1673,8 @@ mod tests {
             cpu0,
             cpu0.cpu_id,
             2000,
-            100,
+            Duration::from_nanos(100),
+            ScheduleReason::Reconsider,
             false,
             &mut prev_guard_0,
             &mut SmallVec::new(),
@@ -1710,7 +1694,8 @@ mod tests {
             cpu1,
             cpu1.cpu_id,
             2000,
-            100,
+            Duration::from_nanos(100),
+            ScheduleReason::Reconsider,
             false,
             &mut prev_guard_0,
             &mut SmallVec::new(),
@@ -1747,7 +1732,8 @@ mod tests {
             cpu1,
             cpu1.cpu_id,
             2000,
-            100,
+            Duration::from_nanos(100),
+            ScheduleReason::Reconsider,
             false,
             &mut prev_guard_0,
             &mut SmallVec::new(),

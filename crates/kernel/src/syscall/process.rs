@@ -88,7 +88,7 @@ pub fn exit_this_context(excp: Option<syscall::Exception>, token: &mut CleanLock
         drop(context_ref);
     }
     drop(close_files);
-    context::switch(token);
+    context::switch(context::ScheduleReason::Block, token);
     unreachable!();
 }
 

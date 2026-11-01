@@ -1481,6 +1481,10 @@ name = "ferric-rtl8125"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-sched-core"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-svm"
 version = "0.1.0"
 dependencies = [

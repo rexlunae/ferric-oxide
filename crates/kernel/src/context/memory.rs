@@ -3530,7 +3530,7 @@ fn correct_inner<'l>(
                 }
             };
             if blocked {
-                super::switch(&mut token);
+                super::switch(super::ScheduleReason::Block, &mut token);
             }
 
             let frame = context_lock

@@ -30,6 +30,7 @@ ferric-pcache = { path = "../pcache", features = ["alloc"], optional = true }
 ferric-procinfo = { path = "../procinfo", features = ["alloc"], optional = true }
 ferric-regbuf = { path = "../regbuf", features = ["alloc"], optional = true }
 ferric-ring = { path = "../ring", optional = true, features = ["alloc"] }
+ferric-sched-core = { path = "../sched-core" }
 ferric-timed = { path = "../timed", features = ["alloc"] }
 ferric-trace = { path = "../trace", features = ["alloc"], optional = true }
 ferric-vtd = { path = "../vtd" }

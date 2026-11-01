@@ -57,7 +57,7 @@ crate::interrupt!(wakeup, || {
             .borrow()
             .is_empty()
     {
-        let _ = context::switch(&mut token);
+        let _ = context::switch(context::ScheduleReason::Wake, &mut token);
     }
 });
 
@@ -81,7 +81,7 @@ crate::interrupt!(switch, || {
     local_apic::eoi();
 
     let mut token = unsafe { CleanLockToken::new() };
-    let _ = context::switch(&mut token);
+    let _ = context::switch(context::ScheduleReason::Preempt, &mut token);
 });
 
 crate::interrupt!(pit, || {

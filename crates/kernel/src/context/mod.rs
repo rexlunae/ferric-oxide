@@ -6,7 +6,8 @@ use alloc::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Weak},
 };
-use core::{cell::Ref, cmp::Reverse, num::NonZeroUsize, ops::Deref};
+use core::{cell::Ref, cmp::Reverse, num::NonZeroUsize, ops::Deref, time::Duration};
+use ferric_sched_core::{FairClock, VirtualTime};
 
 use crate::{
     context::memory::AddrSpaceWrapper,
@@ -25,7 +26,7 @@ use crate::{
 use self::context::Kstack;
 pub use self::{
     context::{BorrowedHtBuf, Context, Status},
-    switch::switch,
+    switch::{switch, ScheduleReason},
 };
 
 pub type ContextLock = RwLock<L4, Context>;
@@ -91,14 +92,14 @@ static CONTEXTS: RwLock<L2, BTreeSet<ContextRef>> = RwLock::new(BTreeSet::new())
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ContextQueueKey {
-    vd: u64,
-    rem_slice: Reverse<u64>,
+    vd: VirtualTime,
+    rem_slice: Reverse<Duration>,
     ctxt_id: u32,
 }
 
 #[derive(Debug)]
 pub struct ContextQueueValue {
-    vtime: u64,
+    vtime: VirtualTime,
     weight: u64,
     context_ref: WeakContextRef,
 }
@@ -107,7 +108,7 @@ pub struct ContextQueueValue {
 pub struct RunContextData {
     queue: BTreeMap<ContextQueueKey, ContextQueueValue>,
     timers: BTreeSet<(u128, WeakContextRef)>, // (wake, context)
-    v: u64,
+    clock: FairClock,
     total_weight: u64,
 }
 
@@ -116,7 +117,7 @@ impl RunContextData {
         Self {
             queue: BTreeMap::new(),
             timers: BTreeSet::new(),
-            v: 0,
+            clock: FairClock::new(),
             total_weight: 0,
         }
     }
@@ -351,8 +352,8 @@ pub fn spawn(
     context.userspace = userspace_allowed;
     context.runs_user_code = userspace_allowed;
     context.queue_key = Some(ContextQueueKey {
-        vd: context.vd,
-        rem_slice: Reverse(context.rem_slice),
+        vd: context.fair.deadline(),
+        rem_slice: Reverse(context.fair.remaining()),
         ctxt_id: context.debug_id,
     });
 

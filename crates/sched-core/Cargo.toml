@@ -1,0 +1,6 @@
+[package]
+name = "ferric-sched-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Allocation-free measured runtime accounting for the Ferric scheduler"

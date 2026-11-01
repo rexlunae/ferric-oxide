@@ -164,6 +164,7 @@ version = "0.1.0"
 dependencies = [
  "ferric-abi",
  "ferric-irq",
+ "ferric-sched-core",
  "redox_syscall",
  "spin",
 ]
@@ -193,6 +194,10 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.9.1",
 ]
+
+[[package]]
+name = "ferric-sched-core"
+version = "0.1.0"
 
 [[package]]
 name = "ferric-timed"
@@ -278,6 +283,7 @@ dependencies = [
  "ferric-procinfo",
  "ferric-regbuf",
  "ferric-ring",
+ "ferric-sched-core",
  "ferric-timed",
  "ferric-trace",
  "ferric-vtd",
