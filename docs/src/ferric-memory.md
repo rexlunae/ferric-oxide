@@ -9,7 +9,9 @@ kernel Cargo build or a top-level build without that file.
 The kernel global heap uses `ferric-heap` (`crates/heap`) around the crates.io
 `rlsf` TLSF implementation, under its MIT license option. Segregated free lists
 replace the former address-ordered first-fit scan, whose lock hold time grew with
-fragmentation. A single global spinlock still serializes heap operations.
+fragmentation. A single global spinlock still serializes heap operations. The
+kernel package includes both dependency MIT notices in
+`/usr/share/licenses/kernel/` (sources in `crates/kernel/licenses/`).
 
 The initial region and subsequent contiguous growth are mapped in one-MiB
 increments. The adapter tracks mapped and incorporated lengths separately,

@@ -2,7 +2,9 @@
 
 `no_std` kernel heap-region ownership and growth around the crates.io
 [`rlsf` TLSF allocator](https://docs.rs/rlsf/0.2.3/rlsf/struct.Tlsf.html), under its
-MIT license option. The kernel uses this adapter for its global heap. Fixed
+MIT license option. The kernel uses this adapter for its global heap. The kernel
+recipe installs the dependency notices from `crates/kernel/licenses/` into the
+image's `/usr/share/licenses/kernel/`. Fixed
 segregated free lists replace allocation/deallocation scans over a fragmented
 address-ordered list. The old `linked_list_allocator` is a host-only development
 dependency for the reproducible comparison, not a kernel runtime dependency.

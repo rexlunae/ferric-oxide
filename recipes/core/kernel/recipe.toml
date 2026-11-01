@@ -45,5 +45,8 @@ then
     rm -f "${COOKBOOK_BUILD}/kernel.all"
 fi
 make install BUILD="${COOKBOOK_BUILD}" DESTDIR="${COOKBOOK_STAGE}" "${KERNEL_MAKE_ARGS[@]}"
+# Keep the MIT notices of the TLSF runtime dependencies in binary images.
+mkdir -p "${COOKBOOK_STAGE}/usr/share/licenses/kernel"
+cp -v "${COOKBOOK_SOURCE}"/licenses/*.txt "${COOKBOOK_STAGE}/usr/share/licenses/kernel/"
 printf '%s' "${ferric_stamp}" > "${COOKBOOK_BUILD}/ferric.stamp"
 """
