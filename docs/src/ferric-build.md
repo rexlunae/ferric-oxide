@@ -297,7 +297,7 @@ historical source paths against [Architecture](ferric-architecture.md).
 | `build/ferric/config.mk` | Generated Make values and exported recipe settings |
 | `build/ferric/filesystem.toml` | Generated image configuration including the chosen base config and package/general overrides |
 | `build/ferric/kernel-config.toml` | Generated architecture/CPU policy, copied to the recipe's kernel source as `config.toml` |
-| `build/ferric/state.toml` | Prior per-recipe fingerprints used to mark affected recipes stale |
+| `build/ferric-rebuild-state.toml` | Applied per-recipe fingerprints shared by every generated output directory in this build root |
 
 `tools/ferric-config/src/schema.rs` parses the catalog; `expr.rs` evaluates
 conditions; `model.rs` resolves values and diagnostics; `generate.rs` writes
@@ -337,7 +337,7 @@ cargo run -q -p ferric-config -- --out "$preview_dir" generate --no-touch
 ```
 
 Inspect the generated files under `$preview_dir`. `--no-touch` writes generated
-outputs without changing recipe timestamps or committing `state.toml` rebuild
+outputs without changing recipe timestamps or committing shared rebuild
 fingerprints. Repeated previews therefore leave pending rebuilds for the next
 ordinary generation, including the first generation into a new output directory.
 A temporary directory also keeps the real generated configuration unchanged.
@@ -679,7 +679,8 @@ libraries retain their original baseline. Selecting v4 is not evidence that
 every object in an image was rebuilt for v4.
 
 Cookbook detects recipe/source timestamps rather than arbitrary environment
-changes. Configuration generation compares fingerprints in `state.toml` and
+changes. Configuration generation compares fingerprints in
+`build/ferric-rebuild-state.toml` and
 touches the `recipe.toml` files named by each changed option's `rebuild` scope.
 `["*"]` marks all recipes; kernel-only options usually mark the kernel. The
 fingerprints are saved only after all selected recipe timestamps are updated.
@@ -690,12 +691,18 @@ bootloader and relibc recipes also maintain feature stamps for their
 Make-driven artifacts. Generated output, `ferric.toml` and image artifacts must
 stay uncommitted.
 
-Use one active configuration output/state directory for builds sharing recipe
-caches. For temporary profiles, override `FERRIC_CONFIG` while keeping the normal
-`build/ferric` output. Separate `--out`/`FERRIC_OUT` directories have independent
-`state.toml` histories but do not isolate cookbook stages or recipe artifacts;
-switching between them can reuse the wrong profile
-([#369](https://github.com/rexlunae/ferric-oxide/issues/369)). Use `generate
---no-touch` for standalone configuration previews. Check the requested feature's
+`--out`/`FERRIC_OUT` selects generated settings, while every output in a build
+root shares the same applied rebuild baseline. Switching profiles A → B → A
+therefore invalidates affected recipes even when A's generated files already
+match its requested settings. Legacy output-local `state.toml` files are ignored:
+the first generation with shared state conservatively marks every configured
+rebuild scope stale. This fixes the independent-history cache problem in
+[#369](https://github.com/rexlunae/ferric-oxide/issues/369).
+
+For temporary profiles, overriding `FERRIC_CONFIG` while keeping `build/ferric`
+remains convenient. Separate outputs do not isolate cookbook stages or recipe
+artifacts and do not support concurrent builds in one checkout. Use separate
+checkouts for that. Use `generate --no-touch` for standalone configuration
+previews; it leaves the shared baseline unchanged. Check the requested feature's
 boot markers as well as the smoke result, and regenerate from the saved user
 configuration after temporary validation profiles.

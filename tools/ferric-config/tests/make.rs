@@ -78,6 +78,60 @@ impl Fixture {
 const INVALID_X86: &str = "[target]\narch='x86_64'\n[image]\nconfig='native'\n[kernel]\ntrace=true\nprofiling=true\nregbuf=true\n[kernel.cpu]\nkpti='always'\n";
 
 #[test]
+fn switching_output_histories_rebuilds_the_shared_make_artifact() {
+    use std::io::Write;
+
+    let fixture = Fixture::new("[target]\narch='x86_64'\n[image]\nconfig='native'\n");
+    let root = fixture.0.path();
+    let recipe = root.join("recipes/core/kernel/recipe.toml");
+    let artifact = root.join("cached-kernel");
+    std::fs::create_dir_all(recipe.parent().unwrap()).unwrap();
+    std::fs::write(&recipe, "[build]\n").unwrap();
+    let mut makefile = std::fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("Makefile"))
+        .unwrap();
+    writeln!(makefile, "cached-kernel: recipes/core/kernel/recipe.toml\n\t@printf '%s\\n' '$(FERRIC_KERNEL_FEATURES)' > $@").unwrap();
+
+    for (out, enabled) in [("a", false), ("b", true), ("a", false)] {
+        assert!(
+            fixture
+                .config(&[
+                    "set",
+                    "kernel.time.one_shot",
+                    if enabled { "true" } else { "false" }
+                ])
+                .status
+                .success()
+        );
+        if artifact.exists() {
+            // Distinct seconds also exercise invalidation with inherited Make 3.81.
+            for (path, seconds) in [(&recipe, 60), (&artifact, 120)] {
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_modified(
+                        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+                    )
+                    .unwrap();
+            }
+        }
+        let output = fixture.make(&["cached-kernel", &format!("FERRIC_OUT=build/{out}")]);
+        assert!(output.status.success(), "{output:?}");
+        let features = std::fs::read_to_string(&artifact).unwrap();
+        assert_eq!(
+            features
+                .trim()
+                .split(',')
+                .any(|feature| feature == "time_one_shot"),
+            enabled,
+            "cached artifact reused the wrong profile after switching to {out}: {features}"
+        );
+    }
+}
+
+#[test]
 fn architecture_override_is_resolved_before_validation_without_editing_saved_choices() {
     let fixture = Fixture::new(INVALID_X86);
     let result = fixture.probe(&["probe", "ARCH=aarch64"]);
