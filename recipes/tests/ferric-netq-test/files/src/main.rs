@@ -23,7 +23,8 @@
 //!   socket bound to the interface's address; filters on unowned ports or on the owned port at
 //!   another address, an `Own` with a file and an `Own` with a socket bound to `0.0.0.0` are
 //!   refused.
-//! - `netq-udp`: a DNS query and its answer through the owned port.
+//! - `netq-udp`: reads and acknowledges an exact, single-block TFTP fixture through the
+//!   owned port. The smoke runner serves it from QEMU's gateway, without external networking.
 //! - `netq-spoof`: frames from a foreign source MAC, an unowned port, the owned port at another
 //!   source address, and ICMP are dropped and counted.
 //! - `netq-tx-bounds`: TX descriptors outside the UMEM (past its end, not at a frame's start,
@@ -50,6 +51,8 @@
 
 #[cfg(target_os = "redox")]
 mod redox;
+#[cfg(any(target_os = "redox", test))]
+mod tftp;
 
 fn main() -> std::process::ExitCode {
     #[cfg(target_os = "redox")]

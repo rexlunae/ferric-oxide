@@ -1,9 +1,13 @@
 //! AVX-512 register state test for the Ferric Oxide kernel.
 //!
-//! Two properties are checked:
+//! Controlled signal probes first verify all registers across standard/realtime
+//! delivery, an alternate signal stack and a resumable invalid-opcode exception.
+//! A handler releases an assembly handshake only after the canaries are loaded.
+//!
+//! Two further properties are checked:
 //!
 //! 1. **Preservation.** Worker threads load all 32 zmm registers and the opmask
-//!    registers k1-k7 with a per-thread pattern, spin without making system
+//!    registers k0-k7 with a per-thread pattern, spin without making system
 //!    calls so the scheduler has to preempt them, then check every register still
 //!    holds its pattern. This exercises the XSAVE/XRSTOR path in `switch_to`.
 //! 2. **No leaks.** "Writer" threads put a marker in zmm16-zmm31 and k1-k7 and
@@ -15,17 +19,25 @@
 //! xstate ...` (no AVX-512, or the OS has not enabled its state) or
 //! `FERRIC_TEST_FAIL xstate ...`, and exits non-zero on failure.
 
+mod signal;
+
 use std::arch::asm;
 use std::arch::x86_64::{__cpuid_count, _xgetbv};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 const ZMM_BYTES: usize = 64;
-/// Opmask k1-k7 as u16 (AVX512F only guarantees 16 bits); slot 0 is unused.
+/// Eight opmask slots; F-only probes use 16 bits and BW probes use all 64.
 const K_SLOTS: usize = 8;
+/// Selects 64-bit mask moves when AVX512BW is available.
+const WIDE_MASKS: u32 = 1;
+/// Executes a resumable invalid-opcode exception while the canaries are loaded.
+const TRAP: u32 = 2;
 const LEAK_MAGIC: u64 = 0xfe44_1c0a_1de5_0000;
+/// 0 before the canaries are loaded, 1 while held, 2 after the signal handler.
+static SIGNAL_PHASE: AtomicU32 = AtomicU32::new(0);
 
 #[repr(C, align(64))]
 struct Zmm<const N: usize>([u8; N]);
@@ -48,6 +60,11 @@ fn os_enabled_avx512() -> bool {
     xcr0 & 0xe6 == 0xe6
 }
 
+/// Whether the processor implements the 64-bit opmask moves.
+fn cpu_has_avx512bw() -> bool {
+    __cpuid_count(7, 0).ebx & (1 << 30) != 0
+}
+
 fn pattern(seed: u64, len: usize) -> Vec<u8> {
     let mut x = seed | 1;
     (0..len)
@@ -61,15 +78,23 @@ fn pattern(seed: u64, len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Load every zmm and k1-k7, spin for `iters` iterations, store them back.
+/// Load every zmm and k0-k7, spin for `iters` iterations, store them back.
+///
+/// # Safety
+/// AVX-512F and its state must be enabled; `WIDE_MASKS` additionally requires
+/// AVX512BW. `TRAP` requires the probe's resumable SIGILL handler. `iters` must
+/// be nonzero. A signal phase points to an aligned atomic used by that handler.
 #[target_feature(enable = "avx512f")]
 unsafe fn hold_registers(
-    src: &Zmm<{32 * ZMM_BYTES}>,
-    ksrc: &[u16; K_SLOTS],
-    dst: &mut Zmm<{32 * ZMM_BYTES}>,
-    kdst: &mut [u16; K_SLOTS],
+    src: &Zmm<{ 32 * ZMM_BYTES }>,
+    ksrc: &[u64; K_SLOTS],
+    dst: &mut Zmm<{ 32 * ZMM_BYTES }>,
+    kdst: &mut [u64; K_SLOTS],
     iters: u64,
-) {
+    signal: Option<&AtomicU32>,
+    flags: u32,
+) -> u64 {
+    let remaining;
     unsafe {
         asm!(
             "vmovdqu64 zmm0, [{src} + 0]",
@@ -104,16 +129,44 @@ unsafe fn hold_registers(
             "vmovdqu64 zmm29, [{src} + 1856]",
             "vmovdqu64 zmm30, [{src} + 1920]",
             "vmovdqu64 zmm31, [{src} + 1984]",
-            "kmovw k1, word ptr [{ksrc} + 2]",
-            "kmovw k2, word ptr [{ksrc} + 4]",
-            "kmovw k3, word ptr [{ksrc} + 6]",
-            "kmovw k4, word ptr [{ksrc} + 8]",
-            "kmovw k5, word ptr [{ksrc} + 10]",
-            "kmovw k6, word ptr [{ksrc} + 12]",
-            "kmovw k7, word ptr [{ksrc} + 14]",
+            "test {flags:e}, {wide_masks}",
+            "jnz 5f",
+            "kmovw k0, word ptr [{ksrc} + 0]",
+            "kmovw k1, word ptr [{ksrc} + 8]",
+            "kmovw k2, word ptr [{ksrc} + 16]",
+            "kmovw k3, word ptr [{ksrc} + 24]",
+            "kmovw k4, word ptr [{ksrc} + 32]",
+            "kmovw k5, word ptr [{ksrc} + 40]",
+            "kmovw k6, word ptr [{ksrc} + 48]",
+            "kmovw k7, word ptr [{ksrc} + 56]",
+            "jmp 6f",
+            "5:",
+            "kmovq k0, qword ptr [{ksrc} + 0]",
+            "kmovq k1, qword ptr [{ksrc} + 8]",
+            "kmovq k2, qword ptr [{ksrc} + 16]",
+            "kmovq k3, qword ptr [{ksrc} + 24]",
+            "kmovq k4, qword ptr [{ksrc} + 32]",
+            "kmovq k5, qword ptr [{ksrc} + 40]",
+            "kmovq k6, qword ptr [{ksrc} + 48]",
+            "kmovq k7, qword ptr [{ksrc} + 56]",
+            "6:",
+            "test {flags:e}, {trap}",
+            "jz 7f",
+            "ud2",
+            "7:",
+            "test {signal}, {signal}",
+            "jz 2f",
+            "mov dword ptr [{signal}], 1",
+            "3:",
+            "cmp dword ptr [{signal}], 2",
+            "je 4f",
+            "dec {iters}",
+            "jnz 3b",
+            "jmp 4f",
             "2:",
             "dec {iters}",
             "jnz 2b",
+            "4:",
             "vmovdqu64 [{dst} + 0], zmm0",
             "vmovdqu64 [{dst} + 64], zmm1",
             "vmovdqu64 [{dst} + 128], zmm2",
@@ -146,18 +199,37 @@ unsafe fn hold_registers(
             "vmovdqu64 [{dst} + 1856], zmm29",
             "vmovdqu64 [{dst} + 1920], zmm30",
             "vmovdqu64 [{dst} + 1984], zmm31",
-            "kmovw word ptr [{kdst} + 2], k1",
-            "kmovw word ptr [{kdst} + 4], k2",
-            "kmovw word ptr [{kdst} + 6], k3",
-            "kmovw word ptr [{kdst} + 8], k4",
-            "kmovw word ptr [{kdst} + 10], k5",
-            "kmovw word ptr [{kdst} + 12], k6",
-            "kmovw word ptr [{kdst} + 14], k7",
+            "test {flags:e}, {wide_masks}",
+            "jnz 8f",
+            "kmovw word ptr [{kdst} + 0], k0",
+            "kmovw word ptr [{kdst} + 8], k1",
+            "kmovw word ptr [{kdst} + 16], k2",
+            "kmovw word ptr [{kdst} + 24], k3",
+            "kmovw word ptr [{kdst} + 32], k4",
+            "kmovw word ptr [{kdst} + 40], k5",
+            "kmovw word ptr [{kdst} + 48], k6",
+            "kmovw word ptr [{kdst} + 56], k7",
+            "jmp 9f",
+            "8:",
+            "kmovq qword ptr [{kdst} + 0], k0",
+            "kmovq qword ptr [{kdst} + 8], k1",
+            "kmovq qword ptr [{kdst} + 16], k2",
+            "kmovq qword ptr [{kdst} + 24], k3",
+            "kmovq qword ptr [{kdst} + 32], k4",
+            "kmovq qword ptr [{kdst} + 40], k5",
+            "kmovq qword ptr [{kdst} + 48], k6",
+            "kmovq qword ptr [{kdst} + 56], k7",
+            "9:",
             src = in(reg) src.0.as_ptr(),
             ksrc = in(reg) ksrc.as_ptr(),
             dst = in(reg) dst.0.as_mut_ptr(),
             kdst = in(reg) kdst.as_mut_ptr(),
-            iters = inout(reg) iters => _,
+            iters = inout(reg) iters => remaining,
+            signal = in(reg) signal.map_or(core::ptr::null(), core::ptr::from_ref),
+            flags = in(reg) flags,
+            wide_masks = const WIDE_MASKS,
+            trap = const TRAP,
+            out("k0") _,
             out("zmm0") _,
             out("zmm1") _,
             out("zmm2") _,
@@ -200,11 +272,12 @@ unsafe fn hold_registers(
             options(nostack),
         );
     }
+    remaining
 }
 
 /// Put the leak marker in zmm16-31 and k1-k7.
 #[target_feature(enable = "avx512f")]
-unsafe fn plant_marker(src: &Zmm<{16 * ZMM_BYTES}>, ksrc: &[u16; K_SLOTS]) {
+unsafe fn plant_marker(src: &Zmm<{ 16 * ZMM_BYTES }>, ksrc: &[u16; K_SLOTS]) {
     unsafe {
         asm!(
             "vmovdqu64 zmm16, [{src} + 0]",
@@ -262,7 +335,7 @@ unsafe fn plant_marker(src: &Zmm<{16 * ZMM_BYTES}>, ksrc: &[u16; K_SLOTS]) {
 
 /// Read zmm16-31 and k1-k7 as they are right now.
 #[target_feature(enable = "avx512f")]
-unsafe fn read_upper(dst: &mut Zmm<{16 * ZMM_BYTES}>, kdst: &mut [u16; K_SLOTS]) {
+unsafe fn read_upper(dst: &mut Zmm<{ 16 * ZMM_BYTES }>, kdst: &mut [u16; K_SLOTS]) {
     unsafe {
         asm!(
             "vmovdqu64 [{dst} + 0], zmm16",
@@ -300,17 +373,21 @@ fn preservation_test(threads: usize, rounds: u64, iters: u64) -> Result<u64, Str
         .map(|t| {
             thread::spawn(move || -> Result<(), String> {
                 for round in 0..rounds {
-                    let seed = (t as u64 + 1) * 0x9e37_79b9_7f4a_7c15 ^ round;
+                    let seed = (t as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ round;
                     let mut src = Zmm([0u8; 32 * ZMM_BYTES]);
                     src.0.copy_from_slice(&pattern(seed, 32 * ZMM_BYTES));
-                    let kp = pattern(seed ^ 0x55, 2 * K_SLOTS);
-                    let mut ksrc = [0u16; K_SLOTS];
-                    for i in 1..K_SLOTS {
-                        ksrc[i] = u16::from_le_bytes([kp[2 * i], kp[2 * i + 1]]);
+                    let kp = pattern(seed ^ 0x55, 8 * K_SLOTS);
+                    let mut ksrc = [0u64; K_SLOTS];
+                    let flags = if cpu_has_avx512bw() { WIDE_MASKS } else { 0 };
+                    for i in 0..K_SLOTS {
+                        ksrc[i] = u64::from_ne_bytes(kp[8 * i..8 * i + 8].try_into().unwrap());
+                        if flags == 0 {
+                            ksrc[i] &= 0xffff;
+                        }
                     }
                     let mut dst = Zmm([0u8; 32 * ZMM_BYTES]);
-                    let mut kdst = [0u16; K_SLOTS];
-                    unsafe { hold_registers(&src, &ksrc, &mut dst, &mut kdst, iters) };
+                    let mut kdst = [0u64; K_SLOTS];
+                    unsafe { hold_registers(&src, &ksrc, &mut dst, &mut kdst, iters, None, flags) };
                     if let Some(i) = (0..32 * ZMM_BYTES).find(|&i| src.0[i] != dst.0[i]) {
                         return Err(format!(
                             "thread {t} round {round}: zmm{} byte {} changed",
@@ -318,7 +395,7 @@ fn preservation_test(threads: usize, rounds: u64, iters: u64) -> Result<u64, Str
                             i % ZMM_BYTES
                         ));
                     }
-                    if let Some(i) = (1..K_SLOTS).find(|&i| ksrc[i] != kdst[i]) {
+                    if let Some(i) = (0..K_SLOTS).find(|&i| ksrc[i] != kdst[i]) {
                         return Err(format!("thread {t} round {round}: k{i} changed"));
                     }
                 }
@@ -343,7 +420,9 @@ fn leak_test(writers: usize, probes: usize, duration: Duration) -> Result<(u64, 
         handles.push(thread::spawn(move || {
             let mut src = Zmm([0u8; 16 * ZMM_BYTES]);
             for (i, chunk) in src.0.chunks_mut(8).enumerate() {
-                chunk.copy_from_slice(&(LEAK_MAGIC | (w as u64) << 8 | (i as u64 & 0xff)).to_le_bytes());
+                chunk.copy_from_slice(
+                    &(LEAK_MAGIC | (w as u64) << 8 | (i as u64 & 0xff)).to_le_bytes(),
+                );
             }
             let ksrc = [0xfe44u16; K_SLOTS];
             while !stop.load(Ordering::Relaxed) {
@@ -366,7 +445,7 @@ fn leak_test(writers: usize, probes: usize, duration: Duration) -> Result<(u64, 
                     .0
                     .chunks(8)
                     .any(|c| u64::from_le_bytes(c.try_into().unwrap()) & !0xffff == LEAK_MAGIC);
-                let k_leak = kdst[1..].iter().any(|&k| k == 0xfe44);
+                let k_leak = kdst[1..].contains(&0xfe44);
                 if zmm_leak || k_leak {
                     leaks.fetch_add(1, Ordering::Relaxed);
                 }
@@ -380,7 +459,10 @@ fn leak_test(writers: usize, probes: usize, duration: Duration) -> Result<(u64, 
     for h in handles {
         h.join().map_err(|_| "leak thread panicked".to_string())?;
     }
-    Ok((samples.load(Ordering::Relaxed), leaks.load(Ordering::Relaxed)))
+    Ok((
+        samples.load(Ordering::Relaxed),
+        leaks.load(Ordering::Relaxed),
+    ))
 }
 
 fn main() {
@@ -388,11 +470,22 @@ fn main() {
     let cpu = cpu_has_avx512f();
     let os = os_enabled_avx512();
     if !cpu || !os {
-        println!("FERRIC_TEST_SKIP xstate avx512 cpu={} os={}", cpu as u8, os as u8);
+        println!(
+            "FERRIC_TEST_SKIP xstate avx512 cpu={} os={}",
+            cpu as u8, os as u8
+        );
         return;
     }
 
     let start = Instant::now();
+    for delivery in signal::Delivery::ALL {
+        // SAFETY: CPU and OS AVX-512 state support were checked above.
+        if let Err(err) = unsafe { signal::test(delivery) } {
+            println!("FERRIC_TEST_FAIL xstate signal {delivery:?}: {err}");
+            std::process::exit(1);
+        }
+        println!("FERRIC_TEST_PASS xstate-signal {delivery:?}");
+    }
     let threads = (cpus * 3).max(4);
     let rounds = match preservation_test(threads, 20, 100_000_000) {
         Ok(n) => n,

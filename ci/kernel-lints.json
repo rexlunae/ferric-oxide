@@ -1,9 +1,9 @@
 {
-  "clippy::arithmetic_side_effects": 357,
+  "clippy::arithmetic_side_effects": 356,
   "clippy::assertions_on_constants": 5,
   "clippy::indexing_slicing": 161,
   "clippy::missing_safety_doc": 29,
-  "clippy::undocumented_unsafe_blocks": 527,
+  "clippy::undocumented_unsafe_blocks": 523,
   "clippy::unwrap_used": 70,
   "dead_code": 10,
   "unsafe keyword": 1154

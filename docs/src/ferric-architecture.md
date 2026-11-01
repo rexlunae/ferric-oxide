@@ -251,6 +251,7 @@ cannot be treated as ordinary private frames to copy.
 | Crate directory | Role |
 | --- | --- |
 | `crates/nospec/` | `no_std` bounds-index hardening helpers used at kernel trust boundaries |
+| `crates/heap/` | Kernel TLSF heap-region ownership and contiguous growth; host-tested layout, fragmentation and mapping-boundary rules |
 | `crates/hwrand/` | RDRAND-based layout entropy with an unavailable-source result |
 | `crates/elfreloc/` | Safe, host-testable ELF relocation replay for kernel-image KASLR |
 | `crates/cet/` | CET capability/policy decoding and shadow-stack layout/token arithmetic |

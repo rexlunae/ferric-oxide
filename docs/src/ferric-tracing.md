@@ -1243,6 +1243,13 @@ and `cpu.frame_pointers`, boots it once, and profiles a short fuzz run.
 
 ## Validation
 
+A local smoke run with scheduler tracing active lost `trace-clock`'s second
+marker during its 200 ms interval without a consumer. The capture also reported
+cumulative ring loss. [#366](https://github.com/rexlunae/ferric-oxide/issues/366)
+tracks per-step loss attribution and a regression for the cause. A missing marker
+continues to fail the test; no retry, tracing disable or ring-budget change was
+introduced for that run.
+
 - **Host tests.** `cargo test --locked -p ferric-trace --all-features` covers:
   - the compile-time catalog checks, that every subsystem has events, the
     levels of the new events, and the page fault, interrupt source and IOMMU

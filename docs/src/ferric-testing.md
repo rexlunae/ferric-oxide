@@ -57,13 +57,14 @@ reading their payload, and check generated wire layouts against literal byte
 fixtures. CI also checks `ferric-fat-types` on the host and bare metal and verifies
 that fatd's default dependency graph excludes `ferric-exfat`.
 
-Host, kernel and image jobs use `.github/actions/prepare-cargo-git` before
-running Cargo. It enables Git's fetch client, caches pinned Git dependencies and
-rewrites the verified `pkgar` and `pkgutils` URLs to their GitHub mirrors, retaining
-the lockfiles' exact commit IDs. Other mirrors can lack current commits, so their
-upstream URLs remain in use with increased retries. This also covers Cargo
-dependency resolution during feature generation; successful submodule checkout
-alone does not establish that Cargo can reach GitLab.
+Host, kernel and image jobs use `.github/actions/prepare-cargo-git`, directly or
+through `.github/actions/prepare-submodules`, before running Cargo. It enables
+Git's fetch client and caches pinned Git dependencies from the
+[Ferric-maintained mirrors](ferric-build.md#dependency-sources), retaining the
+lockfiles' exact commit IDs. The submodule setup restores Git metadata and then
+materializes the pinned working trees. These are separate prerequisites: relibc's
+workspace resolution needs its `dlmalloc-rs` submodule, while Cargo also needs
+its registry and Git dependencies.
 
 `cargo test --locked -p ferric-config` includes smoke/fuzz and scheduler-baseline profile regressions
 in `tools/ferric-config/tests/profiles.rs`. They exercise the public CLI and
@@ -312,6 +313,47 @@ RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
   -Z json-target-spec
 ```
 
+### x86-64 signal state
+
+`ferric-xstate-test` runs only when CPUID and XCR0 permit AVX-512. The controlled
+signal probe loads every ZMM register and mask, then publishes an assembly
+handshake. A sender delivers SIGUSR1 or an application realtime signal (44);
+only the handler releases the held-register loop. An alternate-stack case also
+checks that the handler actually ran in its registered allocation. A synchronous
+UD2 case resumes by advancing RIP through the existing public context. Handlers
+clobber representatives of every additional AVX-512 state component. BW-capable
+CPUs use full 64-bit mask canaries; F-only CPUs use 16 bits. Missing delivery or
+changed state fails, without retrying the probe. Existing preservation and
+cross-context leakage stress still run afterward.
+
+The host capability/layout checks compile the actual runtime module without the
+rest of the Redox-only runtime. Cargo commands for the relibc workspace also
+require its pinned submodules, including `dlmalloc-rs` for workspace dependency
+resolution:
+
+```sh
+rustc --edition=2024 --test -D warnings \
+  crates/relibc/redox-rt/tests/vector_state.rs -o /tmp/ferric-vector-state-tests
+/tmp/ferric-vector-state-tests
+git submodule update --init --recursive
+cargo build --locked --manifest-path crates/relibc/Cargo.toml \
+  -p redox-rt --target x86_64-unknown-redox
+cargo clippy --locked --manifest-path recipes/tests/ferric-xstate-test/files/Cargo.toml \
+  --all-targets --target x86_64-unknown-redox -- -D warnings
+```
+
+Host CI runs these checks, strict runtime/recipe Clippy and Rustdoc, and the
+recipe's host program (a capability skip when AVX-512 is unavailable).
+Its test job uses the same cached pinned-submodule setup as image builds,
+including materializing working trees after restoring Git metadata. That setup
+also prepares Cargo's Git dependencies.
+The native image test exercises the actual signal trampolines. A host execution
+of the recipe program uses the host's signal runtime, so it validates the probe
+rather than relibc. Running all of `redox-rt`'s unit tests as a Linux-target
+package is not supported: its process code uses Redox-only auxiliary-vector
+constants. The direct harness keeps the new capability/layout tests runnable
+without changing that target boundary.
+
 ## Image tests
 
 `config/ferric-smoke.toml` includes the minimal image and forces local source
@@ -325,9 +367,17 @@ would bypass that path and miss the sparse-address-space regression. Its host
 protocol tests run with `cargo test --locked --manifest-path
 recipes/tests/ferric-aslr-test/files/Cargo.toml` and in `host-tools.yml`.
 
+The owned-UDP queue test also has host protocol tests:
+`cargo test --locked --manifest-path recipes/tests/ferric-netq-test/files/Cargo.toml`.
+`host-tools.yml` runs them and strict host/Redox Clippy and Redox Rustdoc.
+The smoke runner serves its exact single-block TFTP fixture from a private,
+per-boot directory on QEMU's gateway. No public DNS service or external
+network is needed for `netq-udp`; a missing or incorrect reply still fails.
+See [the network queue test](ferric-io.md#kernel-bypass-network-queues) for manual setup.
+
 | Recipe under `recipes/tests/` | What it exercises |
 | --- | --- |
-| `ferric-xstate-test` | SIMD/extended register-state preservation across execution |
+| `ferric-xstate-test` | Every ZMM register and k0-k7 across preemption and controlled standard/realtime signals, alternate-stack delivery and a resumable invalid-opcode exception; full 64-bit masks on AVX512BW; syscall-return leakage probes |
 | `ferric-aslr-test` | Sparse 32 GiB virtual reservation after exec, and address variation between executions |
 | `ferric-guard-test` | Thread/main-stack guard faults and accessible stack controls |
 | `ferric-tlb-test` | Mapping/protection changes and TLB invalidation across CPUs |
@@ -337,7 +387,7 @@ recipes/tests/ferric-aslr-test/files/Cargo.toml` and in `host-tools.yml`.
 | `ferric-scheme-self-test` | A process opens and reads a file on a scheme it created on the same thread and serves from another, which used to spin the caller's CPU in the kernel |
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
 | `ferric-blkgrant-test` | `nvmed` DMA into an attached grant: reads and writes against `pread`, refusals, revocation, detach and a copy versus grant read benchmark |
-| `ferric-netq-test` | A queue socket on `e1000d` in copy mode (`drivers.net_bypass`): attach, refusals, ARP and ICMP exchanged with QEMU's gateway through the socket's own rings, netstack beside it, port ownership and refused filters, a DNS round trip from an owned port, spoofed TX frames dropped, a TX benchmark against netstack, counters, and close with traffic in flight |
+| `ferric-netq-test` | A queue socket on `e1000d` in copy mode (`drivers.net_bypass`): attach, refusals, ARP and ICMP exchanged with QEMU's gateway through the socket's own rings, netstack beside it, port ownership and refused filters, an exact local TFTP fixture exchanged through an owned port, spoofed TX frames dropped, a TX benchmark against netstack, counters, and close with traffic in flight |
 | `ferric-iobench` | The Phase 2 disk benchmark: fio-style read jobs on the NVMe disk with each queue policy, IOPS, bandwidth and latency percentiles, and the same-boot A/B of per-CPU queues against one queue ([Disk benchmark](ferric-io.md#disk-benchmark-ferric-iobench)) |
 | `ferric-pcache-test` | `kernel.pcache` with a file system scheme of its own: a miss filled through the queue, a hit with no scheme read, readahead after a sequential read, `EIO` from a failed fill and a retry, `EIO` (not a hang) from a done answer whose payload faults and the same answer arriving late ignored, leaving the retry alone, records put back after a queue read that faults, `EPERM` for a child process (attaching, or binding an unbound queue), a queue kept across `exec`, an invalidated page filled again and a stale fill not taken, an answer to a closed object's record ignored as stale (it neither fills nor fails the new object's fill of the same page) and no stale records after reopening it, and readers released with `EIO` when the queue closes, after which reads go to the scheme; prints a cached 4 KiB `pread` time beside the scheme's. Then on RedoxFS: a read-only description follows writes, truncations and an append through another one, a shared writable mapping keeps a file out of the cache exactly while it lasts (a private one changes neither the file nor its caching), and cached reads are benchmarked against RedoxFS's own in the same boot (`FERRIC_BENCH pcache-redoxfs-*`, paired A/B) |
 | `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsize`/`Fstat`/`Fsync` through a ring, the fixed-file table, asynchronous chains with `min_complete` waits and close, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings. `--async-only` selects the asynchronous chain and close probes used by `trace-lifecycle` to check kernel-worker identity restoration |
@@ -577,8 +627,11 @@ first driver keeps `audiohw`, so a machine with the chipset codec and GPU
 audio controllers does not lose every controller to a failed registration.
 
 `scripts/ferric-ci/test-boot-smoke.sh` exercises the runner itself with a fake
-QEMU, so it needs neither firmware nor virtualization. It covers pass, skip,
-failure, a crash after the marker, a nonzero QEMU exit or timeout after the
+QEMU, so it needs neither firmware nor virtualization. It checks that only the
+expected TFTP fixture is served, that paths with spaces and commas reach QEMU
+correctly, and that per-boot fixture directories are removed on success and
+failure. It covers pass, skip, failure, a crash after the marker, a nonzero
+QEMU exit or timeout after the
 marker, an exit during the final timeout poll, a missing test result and a missing
 marker. A smoke shell that cannot be linked fails early with that message. Any
 loader failure before a later marker, including a child failure followed by SKIP,
@@ -891,6 +944,26 @@ image/boot remains the check for measured wake latency and real completions.
 `bash scripts/ferric-ci/test-check-sched-bench-log.sh` checks that the baseline
 log validator accepts the actual trace-benchmark workload/state format and
 rejects missing measurement states, loss accounting or completion markers.
+
+### Kernel heap regions
+
+`cargo test --locked -p ferric-heap` exercises exact layouts/alignment, initialized
+live contents, rejected growth/reinitialization, unaligned and tiny extensions,
+cross-increment coalescing, separated small free holes and synchronized threads.
+`cargo miri test --locked -p ferric-heap` checks the same pointer-ownership paths.
+Host CI includes the crate's tests, Miri and strict Clippy/Rustdoc.
+
+Run `cargo run --locked --release -p ferric-heap --example fragmentation_bench`
+for a backend-only comparison with the former first-fit allocator. Both backends
+keep small holes separated by live barriers before a large free tail. Report cost
+at each hole count, including setup/host conditions. This measures neither SMP
+lock waiting nor the mapping/physical-allocation paths; constant bookkeeping is
+not a bound for a complete kernel allocation.
+
+Native changes require full image builds and SMP/uniprocessor boots, including
+page-cache fill/close, fault/fuzzer teardown and installed-package verification.
+A timeout must preserve its CPU/context samples and be investigated; a passing
+host allocator test does not establish native progress or IRQ safety.
 
 ### Portable executor core
 

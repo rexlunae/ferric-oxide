@@ -1,4 +1,4 @@
-name: Prepare image submodules
+name: Prepare pinned submodules
 description: Restore pinned submodule Git data and retry failed fetches.
 runs:
   using: composite

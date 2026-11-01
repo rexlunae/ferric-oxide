@@ -135,7 +135,15 @@ pub const SS_DISABLE: usize = 2;
 // Redox note: should include both SigStack size, and some extra room for the libc handler
 // Linux note: Those two should be updated from kernel headers
 /// Minimum stack size for a signal handler.
+#[cfg(all(target_os = "redox", target_arch = "x86_64"))]
+pub const MINSIGSTKSZ: usize = 8192;
+#[cfg(not(all(target_os = "redox", target_arch = "x86_64")))]
+/// Minimum stack size for a signal handler.
 pub const MINSIGSTKSZ: usize = 2048;
+/// Default size in bytes for the alternate signal stack.
+#[cfg(all(target_os = "redox", target_arch = "x86_64"))]
+pub const SIGSTKSZ: usize = 16384;
+#[cfg(not(all(target_os = "redox", target_arch = "x86_64")))]
 /// Default size in bytes for the alternate signal stack.
 pub const SIGSTKSZ: usize = 8096;
 

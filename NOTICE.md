@@ -8,7 +8,7 @@ Redox OS is distributed under the MIT License. This fork keeps that license and 
 
 Third-party software built by the recipes in this repository keeps its own license.
 
-Components that this fork consumes as Cargo dependencies or git submodules are mirrored with full history under [github.com/rexlunae](https://github.com/rexlunae) so builds do not depend on upstream infrastructure. The mirrors keep their original MIT license and copyright notices.
+Redox components that this fork consumes as git dependencies or git submodules are mirrored with full history under [github.com/rexlunae](https://github.com/rexlunae) so builds do not depend on upstream infrastructure. The mirrors keep their original MIT license and copyright notices.
 
 ## Trademarks
 
@@ -34,3 +34,12 @@ from the [GNU config project](https://savannah.gnu.org/projects/config), Copyrig
 exception stated in its header, which lets it be distributed with the packages
 whose configure scripts use it. The cookbook's `GNU_CONFIG_GET` writes this copy
 instead of downloading one.
+
+## Kernel TLSF allocator
+
+The kernel uses `rlsf` 0.2.3 under its MIT license option (Copyright 2021 yvt),
+with `const-default` 1.0.0 (Copyright 2021 Aaron Lindsay). Their complete MIT
+notices are kept in [`crates/kernel/licenses/`](crates/kernel/licenses/) and
+installed into `/usr/share/licenses/kernel/` by the kernel recipe.
+The `rlsf` notice comes from its published crate's source revision
+[`1eda84da633972157e65cb7956bd3f3e43a32528`](https://github.com/yvt/rlsf/blob/1eda84da633972157e65cb7956bd3f3e43a32528/LICENSE-MIT).

@@ -4,6 +4,34 @@ These mechanisms are integrated into the x86-64 kernel, loader and runtime.
 Defaults here refer to a build configured through `ferric.toml`, not a direct
 kernel Cargo build or a top-level build without that file.
 
+## Kernel heap
+
+The kernel global heap uses `ferric-heap` (`crates/heap`) around the crates.io
+`rlsf` TLSF implementation, under its MIT license option. Segregated free lists
+replace the former address-ordered first-fit scan, whose lock hold time grew with
+fragmentation. A single global spinlock still serializes heap operations. The
+kernel package includes both dependency MIT notices in
+`/usr/share/licenses/kernel/` (sources in `crates/kernel/licenses/`).
+
+The initial region and subsequent contiguous growth are mapped in one-MiB
+increments. The adapter tracks mapped and incorporated lengths separately,
+including unused trailing bytes when it appends a region, so allocations can span
+mapping boundaries. Ownership transfer requires exclusive permanently mapped
+storage with provenance for the combined region. Freeing requires the exact
+original allocation layout. Reinitialization and noncontiguous growth are rejected
+without changing live allocations. Heap memory is not unmapped or returned to the
+physical allocator.
+
+TLSF bounds local allocation/deallocation bookkeeping, **not** global lock wait,
+heap growth, physical-page allocation or TLB shootdown time. Hard IRQ paths must
+still avoid allocations and destructors that might enter the allocator: an
+interrupt cannot acquire a lock held by code it preempted. The remaining Phase S
+preemption and latency audit includes these costs.
+
+[Validation](ferric-testing.md#kernel-heap-regions) describes host ownership/growth
+regressions, Miri, the fragmentation comparison and native checks. This adapter
+adds no allocator choice or fallback and changes no feature defaults.
+
 ## CPU state and feature policy
 
 `kernel.cpu.*` options generally choose `always`, `auto` or `never`. The
@@ -31,6 +59,26 @@ implementation in host tests and the kernel. Empty buffers require no allocation
 invalid alignments and oversized layouts return typed errors. Kernel context
 creation maps allocation failures to `ENOMEM`. The buffer holds initialized bytes
 rather than arbitrary zeroed Rust types, so it needs no unsafe zero-validity trait.
+
+On x86-64, relibc also preserves vector state across standard and realtime signals
+and resumable exceptions. The public `ucontext` keeps its existing x87/XMM/YMM
+layout. A private 1,600-byte spill saves the upper halves of zmm0-zmm15,
+zmm16-zmm31 and k0-k7; it is restored after the YMM loads, whose VEX encoding
+clears the upper ZMM halves. Realtime dequeue uses a per-thread scratch area
+before a handler stack has been selected. Ordinary handlers use private stack
+space below the public context, including on an alternate signal stack.
+Every thread reserves the additional 1,600 bytes of TLS scratch. The extra
+1,600 stack bytes are reserved only when AVX-512 state is enabled.
+
+The runtime checks CPUID and XCR0 before using AVX or AVX-512 instructions.
+AVX512F processors use 16-bit mask moves; AVX512BW processors preserve all 64
+mask bits. The shared spill instructions follow the Intel instruction reference,
+and exception entry also preserves YMM state. On x86-64 Redox the minimum
+alternate stack (`MINSIGSTKSZ`) is now 8 KiB and the recommended `SIGSTKSZ` is
+16 KiB, to accommodate the private spill and runtime frames. Applications with
+fixed smaller alternate stacks must enlarge them. The extra ZMM/mask state is
+preserved privately and is not exposed for editing through the legacy context.
+[Signal-state validation](ferric-testing.md#x86-64-signal-state) covers each path.
 
 The boot-time `rmm::BumpAllocator` requires an unsafe constructor: its caller
 must transfer exclusive ownership of disjoint, aligned, writable mapped areas.

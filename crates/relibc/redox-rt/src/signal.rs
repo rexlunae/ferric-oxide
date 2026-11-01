@@ -1,3 +1,9 @@
+//! Signal dispositions, masks and dispatch through architecture entry trampolines.
+//!
+//! Per-thread setup initializes scratch storage and vector capabilities before
+//! installing the kernel's entry points. Handlers use the public signal context
+//! while architecture code preserves private register state around dispatch.
+
 use core::{
     ffi::{c_int, c_void},
     ptr::NonNull,
@@ -606,13 +612,13 @@ fn sigaction_inner(
     action.first.store(new_first, Ordering::Relaxed);
     action.user_data.store(mask, Ordering::Relaxed);
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    update_excp_stack_bitset(i32::from(signal), flags);
+    update_excp_stack_bitset(usize::from(signal), flags);
     Ok(())
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn update_excp_stack_bitset(sig_num: i32, flags: SigactionFlags) {
-    use redox_protocols::flag::*;
+fn update_excp_stack_bitset(sig_num: usize, flags: SigactionFlags) {
+    use redox_protocols::protocol::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
     let onstack = flags.contains(SigactionFlags::ONSTACK);
 
     // see map_err_code
@@ -764,6 +770,12 @@ const fn sig_bit(sig: u32) -> u64 {
     1 << (sig - 1)
 }
 
+/// Initializes the current thread's signal state and installs its entry points.
+///
+/// The first thread also initializes process-wide default dispositions.
+///
+/// # Panics
+/// Panics if required thread/TLS handles are absent or the kernel rejects setup.
 pub fn setup_sighandler(tcb: &RtTcb, first_thread: bool) {
     if first_thread {
         let _guard = SIGACTIONS_LOCK.lock();
@@ -801,11 +813,7 @@ pub fn setup_sighandler(tcb: &RtTcb, first_thread: bool) {
         #[allow(unused_unsafe)]
         let cpuid_eax1_ecx = unsafe { core::arch::x86_64::__cpuid(1) }.ecx;
         CPUID_EAX1_ECX.store(cpuid_eax1_ecx, core::sync::atomic::Ordering::Relaxed);
-        let supports_avx_itself = cpuid_eax1_ecx & 1 << 28 != 0; // AVX
-        let kernel_supports_avx = cpuid_eax1_ecx & 1 << 27 != 0; // OSXSAVE
-        let supports_avx = supports_avx_itself && kernel_supports_avx;
-
-        SUPPORTS_AVX.store(u8::from(supports_avx), Ordering::Relaxed);
+        init_vector_support(cpuid_eax1_ecx);
     }
 
     let data = current_setsighandler_struct();
@@ -903,6 +911,11 @@ pub unsafe fn sigaltstack(
     Ok(())
 }
 
+#[cfg(target_arch = "x86_64")]
+/// Minimum alternate stack, including the private AVX-512 spill and runtime frames.
+pub const MIN_SIGALTSTACK_SIZE: usize = 8192;
+#[cfg(not(target_arch = "x86_64"))]
+/// Minimum alternate stack for this architecture's signal frame and runtime.
 pub const MIN_SIGALTSTACK_SIZE: usize = 2048;
 
 pub fn currently_pending_blocked() -> u64 {

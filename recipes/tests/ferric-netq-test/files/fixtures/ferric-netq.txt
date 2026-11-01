@@ -1,0 +1,2 @@
+Ferric Oxide owned UDP queue fixture.
+The reply must preserve every byte.
