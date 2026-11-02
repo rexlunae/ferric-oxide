@@ -1195,7 +1195,7 @@ which are sound on memory mapped like this.
 | `--guest-ram <file>` | — | The guest's RAM file |
 | `--out <dir>` | — | The capture directory; it must not exist |
 | `--phys <hex>` | scan | The directory's address from the kernel's line. Without it, `follow` scans the pages of the file that hold data (it asks the file system with `SEEK_DATA`, so it does not allocate the file's holes) for the magic, and takes a page only if its address field is where it was found, so a copy of the directory elsewhere is not taken for it |
-| `--ram-mib <n>` | the file's size | The guest's RAM, for q35's placement of it: RAM below 2.75 GiB lies below 4 GiB; larger RAM keeps 2 GiB there and continues at 4 GiB, which the file holds right after the first 2 GiB |
+| `--ram-mib <n>` | the file's size | The guest's RAM, for q35's placement of it: RAM below 2.75 GiB lies below 4 GiB; larger RAM keeps 2 GiB there and continues at 4 GiB, which the file holds right after the first 2 GiB. Checked against QEMU 10.2.1 on 2 November 2026 by writing markers into the shared file and reading the guest-physical addresses with the monitor's `xp`, for 2560, 2816 (the threshold), 4096 and 8192 MiB |
 | `--interval-ms <n>` | 10 | Time between polls |
 | `--live` | off | One line a second on standard output, see below |
 | `--duration <s>` | until stopped | Stop after following this long |
