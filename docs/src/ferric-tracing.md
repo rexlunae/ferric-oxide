@@ -1019,7 +1019,8 @@ that waits for the whole capture, say); the mean and maximum stay exact.
 `open` counts intervals that started in the capture and had not ended by its last
 record, such as a call still blocked or a request not yet answered; the `all`
 line's `unmatched` counts ends whose start is not in the capture. Neither is in
-the histogram. Both grow when a ring dropped records, and a lost record can pair
+the histogram, and a key whose intervals all stayed open prints `count=0` with no
+distribution fields rather than zeros. Both grow when a ring dropped records, and a lost record can pair
 the wrong records (an exit whose enter was lost ends an older call of the same
 number whose exit was lost). When the capture directories hold the drain's
 `stats.start` and `stats.end` snapshots, the view starts with a

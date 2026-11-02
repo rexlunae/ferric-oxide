@@ -28,7 +28,7 @@
 //!
 //! ```text
 //! latency syscall nr=0x9e name=yield count=2 open=0 min_ns=50 mean_ns=75 p50_ns=50 p90_ns=100 p99_ns=100 max_ns=100
-//! latency syscall nr=0xf0 name=futex count=0 open=1 min_ns=0 mean_ns=0 p50_ns=0 p90_ns=0 p99_ns=0 max_ns=0
+//! latency syscall nr=0xf0 name=futex count=0 open=1
 //! latency syscall nr=0x21000004 name=write count=1 open=0 min_ns=3000 mean_ns=3000 p50_ns=3000 p90_ns=3000 p99_ns=3000 max_ns=3000
 //! latency syscall nr=all count=3 open=1 unmatched=1 min_ns=50 mean_ns=1050 p50_ns=100 p90_ns=2992 p99_ns=2992 max_ns=3000
 //! latency scheme scheme=2 opcode=Write count=1 open=0 min_ns=1900 mean_ns=1900 p50_ns=1900 p90_ns=1900 p99_ns=1900 max_ns=1900
@@ -38,6 +38,8 @@
 //! latency irq irq=11 count=1 open=0 min_ns=1100 mean_ns=1100 p50_ns=1100 p90_ns=1100 p99_ns=1100 max_ns=1100
 //! latency irq irq=all count=1 open=1 unmatched=0 min_ns=1100 mean_ns=1100 p50_ns=1100 p90_ns=1100 p99_ns=1100 max_ns=1100
 //! ```
+//!
+//! A key with no ended interval (`count=0`) has no distribution fields.
 //!
 //! `name` is the call's name where `redox_syscall` defines the number. That is the crates.io
 //! release this tool links, which lacks numbers only the in-tree kernel's copy
@@ -149,7 +151,7 @@ impl<K: Ord> Kind<K> {
         for (key, series) in &self.by_key {
             writeln!(
                 out,
-                "latency {kind} {} count={} open={} {}",
+                "latency {kind} {} count={} open={}{}",
                 label(key),
                 series.latency.count(),
                 series.open,
@@ -159,7 +161,7 @@ impl<K: Ord> Kind<K> {
         let all = self.merged();
         writeln!(
             out,
-            "latency {kind} {all_label} count={} open={} unmatched={} {}",
+            "latency {kind} {all_label} count={} open={} unmatched={}{}",
             all.latency.count(),
             all.open,
             self.unmatched,
@@ -168,10 +170,14 @@ impl<K: Ord> Kind<K> {
     }
 }
 
-/// The distribution fields of `latency`.
+/// The distribution fields of `latency`, each after a space; none when it is empty, so a
+/// key whose intervals all stayed open does not read as taking 0 ns.
 fn fields(latency: &Histogram) -> String {
+    if latency.count() == 0 {
+        return String::new();
+    }
     format!(
-        "min_ns={} mean_ns={} p50_ns={} p90_ns={} p99_ns={} max_ns={}",
+        " min_ns={} mean_ns={} p50_ns={} p90_ns={} p99_ns={} max_ns={}",
         latency.min(),
         latency.mean(),
         latency.percentile(500_000),
@@ -299,7 +305,7 @@ impl Latencies {
             for (cpu, waits) in &self.wake_run {
                 writeln!(
                     out,
-                    "latency wake_run cpu={cpu} count={} {}",
+                    "latency wake_run cpu={cpu} count={}{}",
                     waits.count(),
                     fields(waits)
                 )?;
@@ -307,7 +313,7 @@ impl Latencies {
             }
             writeln!(
                 out,
-                "latency wake_run cpu=all count={} {}",
+                "latency wake_run cpu=all count={}{}",
                 all.count(),
                 fields(&all)
             )?;
@@ -370,8 +376,7 @@ mod tests {
         // TSC cycles at the default 1000 MHz: one cycle is a nanosecond.
         assert_eq!(
             view(&[cpu0], None),
-            "latency syscall nr=0xdead count=0 open=1 min_ns=0 mean_ns=0 p50_ns=0 p90_ns=0 \
-             p99_ns=0 max_ns=0\n\
+            "latency syscall nr=0xdead count=0 open=1\n\
              latency syscall nr=0x21000004 name=write count=2 open=0 min_ns=100 mean_ns=200 \
              p50_ns=100 p90_ns=300 p99_ns=300 max_ns=300\n\
              latency syscall nr=all count=2 open=1 unmatched=1 min_ns=100 mean_ns=200 \
@@ -394,8 +399,7 @@ mod tests {
             view(&[cpu0, cpu1], Some("clock hpet period_fs 10000000\n")),
             "latency scheme scheme=2 opcode=Write count=1 open=0 min_ns=200 mean_ns=200 \
              p50_ns=200 p90_ns=200 p99_ns=200 max_ns=200\n\
-             latency scheme scheme=2 opcode=200 count=0 open=1 min_ns=0 mean_ns=0 p50_ns=0 \
-             p90_ns=0 p99_ns=0 max_ns=0\n\
+             latency scheme scheme=2 opcode=200 count=0 open=1\n\
              latency scheme scheme=all opcode=all count=1 open=1 unmatched=1 min_ns=200 \
              mean_ns=200 p50_ns=200 p90_ns=200 p99_ns=200 max_ns=200\n"
         );
