@@ -34,7 +34,7 @@ use super::dso::Rela;
 use super::{
     access::accessible,
     debug::{_dl_debug_state, _r_debug, RTLDState},
-    dso::{DSO, ProgramHeader},
+    dso::{self, DSO, ProgramHeader},
     tcb::{Master, Tcb},
 };
 
@@ -860,7 +860,7 @@ impl Linker {
 
         let file = {
             let flags = fcntl::O_RDONLY | fcntl::O_CLOEXEC;
-            MmapFile::open(CStr::borrow(&path_c), flags).map_err(|err| {
+            MmapFile::open(CStr::borrow(&path_c), flags, dso::loaded_len).map_err(|err| {
                 if debug {
                     eprintln!("[ld.so]: failed to load '{}': {:?}", path, err)
                 }

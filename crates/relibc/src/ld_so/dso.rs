@@ -3,10 +3,10 @@
 //! * <https://www.akkadia.org/drepper/dsohowto.pdf>
 
 use object::{
-    NativeEndian, Object, StringTable, SymbolIndex, U32, elf,
+    NativeEndian, StringTable, SymbolIndex, U32, elf,
     read::elf::{
-        Dyn as _, GnuHashTable, HashTable as SysVHashTable, ProgramHeader as _, Rel as _,
-        Rela as _, Sym as _, Version, VersionTable,
+        Dyn as _, FileHeader as _, GnuHashTable, HashTable as SysVHashTable, ProgramHeader as _,
+        Rel as _, Rela as _, Sym as _, Version, VersionTable,
     },
 };
 
@@ -42,7 +42,7 @@ pub type Relr = usize;
 
 #[cfg(target_pointer_width = "32")]
 mod shim {
-    use object::{NativeEndian, elf, read::elf::ElfFile32};
+    use object::{NativeEndian, elf};
     pub type Dyn = elf::Dyn32<NativeEndian>;
     pub type Rel = elf::Rel32<NativeEndian>;
     pub type Rela = elf::Rela32<NativeEndian>;
@@ -51,12 +51,11 @@ mod shim {
     pub type ProgramHeader = elf::ProgramHeader32<NativeEndian>;
     pub type GnuHashHeader = elf::GnuHashHeader<NativeEndian>;
     pub type SysVHashHeader = elf::HashHeader<NativeEndian>;
-    pub type ElfFile<'a> = ElfFile32<'a, NativeEndian>;
 }
 
 #[cfg(target_pointer_width = "64")]
 mod shim {
-    use object::{NativeEndian, elf, read::elf::ElfFile64};
+    use object::{NativeEndian, elf};
     pub type Dyn = elf::Dyn64<NativeEndian>;
     pub type Rel = elf::Rel64<NativeEndian>;
     pub type Rela = elf::Rela64<NativeEndian>;
@@ -65,7 +64,6 @@ mod shim {
     pub type ProgramHeader = elf::ProgramHeader64<NativeEndian>;
     pub type GnuHashHeader = elf::GnuHashHeader<NativeEndian>;
     pub type SysVHashHeader = elf::HashHeader<NativeEndian>;
-    pub type ElfFile<'a> = ElfFile64<'a, NativeEndian>;
 }
 
 pub use shim::*;
@@ -77,6 +75,54 @@ pub const DT_RELRENT: u32 = 37;
 
 /// Undefined Symbol Index
 pub const STN_UNDEF: SymbolIndex = SymbolIndex(0);
+
+/// Ferric Oxide: the parts of an ELF object that loading uses, its header and program
+/// headers. Unlike `object`'s `ElfFile`, parsing them does not read the section headers,
+/// which come after the part of the file [`loaded_len`] maps.
+struct Image<'a> {
+    header: &'a FileHeader,
+    segments: &'a [ProgramHeader],
+}
+
+impl<'a> Image<'a> {
+    /// Parses the header and program headers at the start of `data`.
+    fn parse(data: &'a [u8]) -> object::Result<Self> {
+        let header = FileHeader::parse(data)?;
+        let segments = header.program_headers(header.endian()?, data)?;
+        Ok(Self { header, segments })
+    }
+
+    fn entry(&self) -> u64 {
+        self.header.e_entry(NativeEndian).into()
+    }
+
+    /// The end of the program header table or of the last part of the file a program
+    /// header covers, whichever is later.
+    fn loaded_end(&self) -> u64 {
+        let table_start: u64 = self.header.e_phoff(NativeEndian).into();
+        let table_end = table_start.saturating_add(size_of_val(self.segments) as u64);
+        self.segments
+            .iter()
+            .map(|ph| {
+                let (offset, size) = ph.file_range(NativeEndian);
+                offset.saturating_add(size)
+            })
+            .fold(table_end, u64::max)
+    }
+}
+
+/// Ferric Oxide: how many bytes from the start of an object loading reads, given its first
+/// bytes `probe` and its length `size`: up to the end of its program header table or of the
+/// last part of the file a program header covers. The section headers and the sections no
+/// segment holds (debug info, the full symbol table) usually come after, and are not mapped.
+/// When `probe` does not hold the header and program headers, all of `size`, so that parsing
+/// the mapped object reports what is wrong with it.
+pub(super) fn loaded_len(probe: &[u8], size: usize) -> usize {
+    Image::parse(probe)
+        .ok()
+        .and_then(|image| usize::try_from(image.loaded_end()).ok())
+        .map_or(size, |end| end.min(size))
+}
 
 enum HashTable<'a> {
     Gnu(GnuHashTable<'a, FileHeader>),
@@ -447,7 +493,7 @@ impl DSO {
         tls_module_id: usize,
         tls_offset: usize,
     ) -> Result<(DSO, Option<Master>, Vec<ProgramHeader>), String> {
-        let elf = ElfFile::parse(data).map_err(|err| err.to_string())?;
+        let elf = Image::parse(data).map_err(|err| err.to_string())?;
         let (mmap, tcb_master, dynamic) =
             DSO::mmap_and_copy(path, &elf, data, base_addr, tls_offset)?;
 
@@ -505,7 +551,7 @@ impl DSO {
             recorded_image,
         };
 
-        Ok((dso, tcb_master, elf.elf_program_headers().to_vec()))
+        Ok((dso, tcb_master, elf.segments.to_vec()))
     }
 
     #[inline]
@@ -578,19 +624,19 @@ impl DSO {
 
     fn mmap_and_copy<'a>(
         path: &str,
-        elf: &ElfFile<'a>,
+        elf: &Image<'a>,
         data: &'a [u8],
         base_addr: Option<usize>,
         tls_offset: usize,
     ) -> Result<(MemoryMapHandle, Option<Master>, Dynamic<'static>), String> {
-        let endian = elf.endian();
+        let endian = NativeEndian;
         log::trace!("# {}", path);
         // data for struct LinkMap
         let mut l_ld = 0;
         // Calculate virtual memory bounds
         let bounds = {
             let mut bounds_opt: Option<(usize, usize)> = None;
-            for ph in elf.elf_program_headers() {
+            for ph in elf.segments {
                 let align = ph.p_align(endian);
                 if align == 0 {
                     // clang generated PT_GNU_STACK with 0 align
@@ -673,7 +719,7 @@ impl DSO {
 
         // Copy data
         let mut dynamic = None;
-        for ph in elf.elf_program_headers() {
+        for ph in elf.segments {
             match ph.p_type(endian) {
                 elf::PT_LOAD => {
                     if skip_load_segment_copy {
@@ -1413,8 +1459,8 @@ impl Drop for DSO {
     }
 }
 
-fn is_pie_enabled(elf: &ElfFile) -> bool {
-    elf.elf_header().e_type.get(elf.endian()) == elf::ET_DYN
+fn is_pie_enabled(elf: &Image) -> bool {
+    elf.header.e_type(NativeEndian) == elf::ET_DYN
 }
 
 fn basename(path: &str) -> &str {

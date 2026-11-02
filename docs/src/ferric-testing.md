@@ -580,7 +580,8 @@ assumed to share this cause.
 
 ld.so's fatal message is followed by a second `[ld.so]:` line with the reason
 for the failing attempt: the path, original errno and exact operation (`open`,
-`fstat`, or `mmap`, including the requested mapping length), or the search paths
+`fstat`, the `pread` of the object's headers, or `mmap`, including the requested
+mapping length), or the search paths
 a library is in none of. Thus an `ENOMEM` while loading a library does not by
 itself establish physical memory exhaustion or even that `open` failed. The next
 occurrence names the file and error without `LD_DEBUG`. Context is carried
@@ -591,9 +592,13 @@ mapping ownership, error, fatal-message formatter and errno modules. It checks
 candidate order,
 successful fallback, missing and inaccessible libraries reaching the fatal
 output, isolation from a later parse/TLS failure, stable `dlerror` messages,
-and descriptor cleanup after failed stat/map operations. File descriptors are
-owned immediately after open, including on error paths; a successful mapping
-retains its descriptor until after unmap. Platform I/O, file guards, errno storage
+and descriptor cleanup after failed stat, header-read and map operations. File
+descriptors are owned immediately after open, including on error paths; a
+successful mapping retains its descriptor until after unmap. It also checks that
+only the length the loader asks for after reading the first 4 KiB is mapped, and
+that a shorter file is read and mapped only to its end. Which length an ELF
+object needs (`dso::loaded_len`) uses the `object` crate, which the harness does
+not build; every dynamically linked program in a boot test loads through it. Platform I/O, file guards, errno storage
 and its message table use host adapters; this is not an end-to-end dynamic-link
 or guest-boot test.
 

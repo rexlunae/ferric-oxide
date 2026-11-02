@@ -14,6 +14,7 @@ mod platform {
     pub trait Pal {
         fn open(path: CStr, flags: i32, mode: u32) -> Result<i32, Errno>;
         fn fstat(fd: i32, out: Out<stat>) -> Result<(), Errno>;
+        fn pread(fd: i32, buf: &mut [u8], offset: i64) -> Result<usize, Errno>;
         unsafe fn mmap(
             addr: *mut types::c_void,
             size: usize,
@@ -33,6 +34,13 @@ mod platform {
             crate::mapping_tests::step("stat")?;
             out.0.st_size = crate::mapping_tests::STATE.with(|s| s.borrow().size);
             Ok(())
+        }
+        fn pread(_: i32, buf: &mut [u8], offset: i64) -> Result<usize, Errno> {
+            crate::mapping_tests::step("read")?;
+            assert_eq!(offset, 0);
+            crate::mapping_tests::STATE.with(|s| s.borrow_mut().probed = Some(buf.len()));
+            buf.fill(5);
+            Ok(buf.len())
         }
         unsafe fn mmap(
             _: *mut types::c_void,
@@ -118,15 +126,21 @@ mod object_search;
 mod mmap_file;
 
 mod mapping_tests {
-    use super::{error::Errno, load_error::ObjectIoOperation, mmap_file::MmapFile};
+    use super::{
+        error::Errno,
+        load_error::ObjectIoOperation,
+        mmap_file::{MmapFile, PROBE_LEN},
+    };
     use std::cell::RefCell;
     pub struct State {
         pub fail: Option<&'static str>,
         pub size: i64,
         pub calls: Vec<&'static str>,
         pub mapping: Option<Box<[u8]>>,
+        /// How many bytes the probe asked to read.
+        pub probed: Option<usize>,
     }
-    std::thread_local! { pub static STATE: RefCell<State> = const { RefCell::new(State { fail: None, size: 16, calls: Vec::new(), mapping: None }) }; }
+    std::thread_local! { pub static STATE: RefCell<State> = const { RefCell::new(State { fail: None, size: 16, calls: Vec::new(), mapping: None, probed: None }) }; }
     pub fn step(operation: &'static str) -> Result<(), Errno> {
         STATE.with(|s| {
             let mut s = s.borrow_mut();
@@ -145,8 +159,13 @@ mod mapping_tests {
                 size,
                 calls: vec![],
                 mapping: None,
+                probed: None,
             }
         });
+    }
+    /// Maps the whole file, as for an object whose headers could not be parsed.
+    fn whole(_: &[u8], size: usize) -> usize {
+        size
     }
     #[test]
     fn failed_operations_keep_errno_and_close_only_owned_descriptors() {
@@ -158,13 +177,18 @@ mod mapping_tests {
                 vec!["open", "stat", "close"],
             ),
             (
+                "read",
+                ObjectIoOperation::Read,
+                vec!["open", "stat", "read", "close"],
+            ),
+            (
                 "map",
                 ObjectIoOperation::Map { size: 16 },
-                vec!["open", "stat", "map", "close"],
+                vec!["open", "stat", "read", "map", "close"],
             ),
         ] {
             reset(Some(fail), 16);
-            let error = MmapFile::open("/lib/test.so", 0).err().unwrap();
+            let error = MmapFile::open("/lib/test.so", 0, whole).err().unwrap();
             assert_eq!(error.operation, operation);
             assert_eq!(error.source.0, 12);
             STATE.with(|s| assert_eq!(s.borrow().calls, calls));
@@ -173,7 +197,7 @@ mod mapping_tests {
     #[test]
     fn invalid_file_size_is_typed_and_closes_the_descriptor() {
         reset(None, -1);
-        let error = MmapFile::open("/lib/test.so", 0).err().unwrap();
+        let error = MmapFile::open("/lib/test.so", 0, whole).err().unwrap();
         assert_eq!(error.operation, ObjectIoOperation::Stat);
         assert_eq!(error.source.0, 75);
         STATE.with(|s| assert_eq!(s.borrow().calls, ["open", "stat", "close"]));
@@ -181,10 +205,42 @@ mod mapping_tests {
     #[test]
     fn successful_mapping_keeps_descriptor_until_after_unmap() {
         reset(None, 16);
-        let map = MmapFile::open("/lib/test.so", 0).unwrap();
+        let map = MmapFile::open("/lib/test.so", 0, whole).unwrap();
         assert_eq!(map.data(), [7; 16]);
-        STATE.with(|s| assert_eq!(s.borrow().calls, ["open", "stat", "map"]));
+        STATE.with(|s| assert_eq!(s.borrow().calls, ["open", "stat", "read", "map"]));
         drop(map);
-        STATE.with(|s| assert_eq!(s.borrow().calls, ["open", "stat", "map", "unmap", "close"]));
+        STATE.with(|s| {
+            assert_eq!(
+                s.borrow().calls,
+                ["open", "stat", "read", "map", "unmap", "close"]
+            )
+        });
+    }
+    /// Only the start of the file the caller asks for is mapped, decided from the
+    /// file's first `PROBE_LEN` bytes, so a large tail (debug info) is never mapped.
+    #[test]
+    fn only_the_needed_start_of_the_file_is_mapped() {
+        reset(None, 1 << 30);
+        let map = MmapFile::open("/lib/test.so", 0, |probe, size| {
+            assert_eq!(probe, [5; PROBE_LEN]);
+            assert_eq!(size, 1 << 30);
+            100
+        })
+        .unwrap();
+        assert_eq!(map.data().len(), 100);
+        STATE.with(|s| assert_eq!(s.borrow().probed, Some(PROBE_LEN)));
+    }
+    /// A file shorter than the probe is read only to its end, and an answer beyond
+    /// the file's length maps the whole file rather than past its end.
+    #[test]
+    fn short_files_are_probed_and_mapped_to_their_end() {
+        reset(None, 16);
+        let map = MmapFile::open("/lib/test.so", 0, |probe, _| {
+            assert_eq!(probe.len(), 16);
+            usize::MAX
+        })
+        .unwrap();
+        assert_eq!(map.data().len(), 16);
+        STATE.with(|s| assert_eq!(s.borrow().probed, Some(16)));
     }
 }
