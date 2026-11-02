@@ -24,7 +24,7 @@
 //! - [`filter`] holds per-event argument filters (`nr == 3 && a < 0x1000`) and the lock-free
 //!   slot the kernel checks them in.
 //! - [`abi`] is the `kernel.trace` scheme's interface: its name, paths, commands and listing
-//!   format.
+//!   format; [`capture`] names the files a capture directory adds to the records.
 //! - [`crash`] is the crash dump a panic writes to reserved memory for the next boot to
 //!   read: its layout, a writer that copies the newest records of each ring, and a parser.
 //! - [`tlb`] holds the kernel's per-CPU TLB, CR3 and shootdown counters (`kernel.tlb_stats`)
@@ -65,6 +65,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod abi;
+pub mod capture;
 pub mod clock;
 #[cfg(feature = "config")]
 pub mod config;

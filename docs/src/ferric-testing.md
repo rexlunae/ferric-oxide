@@ -882,6 +882,28 @@ additional log checks for feature-specific validation. Image variants without
 the requested kernel features cannot exercise those paths merely by adding a
 QEMU device.
 
+## Test harness
+
+`ferric-harness` (`tools/ferric-harness/`) boots an image in QEMU under a
+supervisor and drives it from the host. It logs the serial console with host
+timestamps, waits for patterns on it, takes screenshots, reads the text
+consoles exactly, sends keyboard and pointer input, and passes a boot
+environment through fw_cfg or the bootloader's editor. Each run ends with a
+verdict and a `report.json` that holds boot milestones, `FERRIC_TEST_*` and
+`FERRIC_BENCH` records, and host CPU and KVM statistics. `report` compares
+groups of runs pair by pair, the same way `check-trace-overhead.sh` does. It
+applies the crash, loader and smoke rules of `boot-smoke.sh`, uses the same
+machine topology, and adds the `mode` check: a normal-mode run fails if the
+kernel prints a `trace:` line. For example:
+
+```sh
+cargo run -p ferric-harness -- run build/x86_64/ferric-smoke/harddrive.img --display none --smoke
+```
+
+[Test harness](ferric-harness.md) documents every command, the scenario
+format, the run directory and the report. It also lists what has been
+validated against real images. CI's image boots still use `boot-smoke.sh`.
+
 ## Fuzzing and diagnostics
 
 The smoke configuration runs a short fixed-seed syscall fuzz test.

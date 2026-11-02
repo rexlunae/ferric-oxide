@@ -18,7 +18,7 @@
 //! | File | Content |
 //! | --- | --- |
 //! | `INCOMPLETE` | present until the follower stops cleanly ([`crate::capture::INCOMPLETE`]) |
-//! | `clock` | the trace clock, from the directory |
+//! | `clock` | the trace clock, from the directory; for a TSC whose rate the kernel does not know, the rate measured against host time over the CPU whose samples span the most host time ([`measured_period_longest`]) once following ends |
 //! | `cpu<n>` | CPU n's records, appended as they are read |
 //! | `stats.start` | per CPU, the words in the ring when following began and the records lost before then (`lost_before`, a lower bound), written after the first poll, once each ring's first copy says what was overwritten before following began |
 //! | `stats.end` | per CPU, the words left unread and the records lost: those of `stats.start` plus the follower's own losses |
@@ -46,6 +46,7 @@ use std::time::Duration;
 
 use ferric_guest_ram::GuestRam;
 use ferric_trace::abi::{READ_MIN, StatsLine};
+use ferric_trace::clock::{Clock, ClockLine};
 use ferric_trace::host::{
     self, ClockSampleLine, DIRECTORY_MAGIC, DIRECTORY_WORDS, Directory, DirectoryError,
 };
@@ -410,6 +411,9 @@ struct CpuState<'a> {
     words: u64,
     /// When this CPU's last [`HOST_CLOCK`] sample was taken.
     last_sample_ns: Option<u64>,
+    /// This CPU's first and latest [`HOST_CLOCK`] samples, for measuring an unknown TSC
+    /// rate.
+    span: Option<SampleSpan>,
     /// The words in the ring, from `oldest` to `head`, when following began.
     pending_at_start: u64,
 }
@@ -441,12 +445,56 @@ impl CpuState<'_> {
     }
 }
 
+/// The shortest span of host time [`measured_period_fs`] measures the trace clock over.
+pub const MIN_MEASURED_SPAN: Duration = Duration::from_secs(1);
+
+/// A [`HOST_CLOCK`] sample as `(host ns, trace timestamp)`.
+pub type ClockSample = (u64, u64);
+
+/// One CPU's first and latest [`ClockSample`]s.
+pub type SampleSpan = (ClockSample, ClockSample);
+
+/// The length of one tick of the trace clock in femtoseconds, measured from two
+/// [`HOST_CLOCK`] samples `(host ns, trace timestamp)`: the trace ticks between them against
+/// the host nanoseconds. `None` when they are less than [`MIN_MEASURED_SPAN`] apart or the
+/// clock did not move forward.
+///
+/// Each sample's timestamp is the newest record read at that poll, which is older than the
+/// host time by up to a poll interval, so over the minimum span the error is below about
+/// 1% for the default 10 ms interval, and it shrinks as the span grows.
+pub fn measured_period_fs(first: ClockSample, last: ClockSample) -> Option<u64> {
+    let host_ns = last.0.checked_sub(first.0)?;
+    let ticks = last.1.checked_sub(first.1)?;
+    if host_ns < MIN_MEASURED_SPAN.as_nanos() as u64 || ticks == 0 {
+        return None;
+    }
+    let period = u128::from(host_ns) * 1_000_000 / u128::from(ticks);
+    u64::try_from(period).ok().filter(|&fs| fs > 0)
+}
+
+/// The trace clock's period measured over the CPU whose [`SampleSpan`] covers the most host
+/// time, as [`measured_period_fs`]; `None` without spans, or when the longest is too short.
+///
+/// Each CPU's samples are compared only with each other: a sample's timestamp is the newest
+/// record read on its CPU, and an idle CPU's newest record can be much older than the host
+/// time it was read at, so pairing one CPU's first sample with another's latest would mix
+/// record ages. The longest span keeps that error, at most a poll interval at each end,
+/// smallest relative to the time measured.
+pub fn measured_period_longest(spans: impl IntoIterator<Item = SampleSpan>) -> Option<u64> {
+    let (first, last) = spans
+        .into_iter()
+        .max_by_key(|(first, last)| last.0.saturating_sub(first.0))?;
+    measured_period_fs(first, last)
+}
+
 /// The rings of one directory being followed into a capture directory.
 pub struct Follower<'a> {
     ram: &'a GuestRam,
     out: PathBuf,
     phys: u64,
     generation: u64,
+    /// The directory's clock, as written to `clock` at the start.
+    clock: ClockLine,
     cpus: Vec<CpuState<'a>>,
     host_clock: BufWriter<File>,
     /// The host clock a [`HOST_CLOCK`] sample is taken with, after its ring was read:
@@ -489,6 +537,7 @@ impl<'a> Follower<'a> {
             out: out.to_owned(),
             phys,
             generation: directory.generation(),
+            clock: directory.clock(),
             cpus,
             host_clock,
             read_clock: monotonic_ns,
@@ -628,6 +677,11 @@ impl<'a> Follower<'a> {
                 timestamp,
             };
             write!(self.host_clock, "{line}").map_err(io_error(&self.out.join(HOST_CLOCK)))?;
+            let sample = (read_ns, timestamp);
+            state.span = Some(match state.span {
+                None => (sample, sample),
+                Some((first, _)) => (first, sample),
+            });
         }
         Ok(Poll::Read)
     }
@@ -669,6 +723,21 @@ impl<'a> Follower<'a> {
         }
         let stats = self.out.join(STATS_END);
         fs::write(&stats, end).map_err(io_error(&stats))?;
+        // The TSC's rate is the one the kernel cannot always give; the tools would otherwise
+        // assume 1000 MHz. The TSC is invariant (the kernel chooses it only then), so it
+        // runs at one rate on every CPU, and any CPU's samples measure it.
+        if self.clock.clock == Clock::Tsc
+            && self.clock.period_fs.is_none()
+            && let Some(period_fs) =
+                measured_period_longest(self.cpus.iter().filter_map(|state| state.span))
+        {
+            let line = ClockLine {
+                clock: Clock::Tsc,
+                period_fs: Some(period_fs),
+            };
+            let clock = self.out.join(CLOCK);
+            fs::write(&clock, line.to_string()).map_err(io_error(&clock))?;
+        }
         let marker = self.out.join(INCOMPLETE);
         fs::remove_file(&marker).map_err(io_error(&marker))?;
         Ok(Summary {
@@ -712,6 +781,7 @@ fn open_cpu<'a>(
         },
         words: 0,
         last_sample_ns: None,
+        span: None,
         pending_at_start,
     })
 }
@@ -725,6 +795,60 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> FollowError + '_ {
 
 #[cfg(test)]
 mod tests {
+
+    /// A 4.3 GHz TSC over 10 s of host time: 4.3e10 ticks, 232.56 fs a tick.
+    #[test]
+    fn the_tsc_period_is_measured_against_host_time() {
+        let first = (1_000_000_000, 5_000);
+        let last = (11_000_000_000, 5_000 + 43_000_000_000);
+        assert_eq!(super::measured_period_fs(first, last), Some(232_558));
+        let line = ClockLine {
+            clock: Clock::Tsc,
+            period_fs: super::measured_period_fs(first, last),
+        };
+        let mhz = line.ticks_per_us().unwrap();
+        assert!((mhz - 4300.0).abs() < 0.01, "{mhz}");
+    }
+
+    /// Too short a span, or a clock that did not move, measures nothing.
+    #[test]
+    fn a_short_or_still_span_measures_nothing() {
+        assert_eq!(
+            super::measured_period_fs((0, 0), (999_999_999, 4_000_000_000)),
+            None
+        );
+        assert_eq!(super::measured_period_fs((0, 7), (2_000_000_000, 7)), None);
+        assert_eq!(super::measured_period_fs((5, 9), (1, 3)), None);
+    }
+
+    /// The CPU whose samples span the most host time measures the clock, not a pair taken
+    /// across CPUs: CPU 0 went idle early, so its latest sample is stale; CPU 2's span is
+    /// below the minimum; CPU 1 ran throughout.
+    #[test]
+    fn the_longest_span_of_one_cpu_measures_the_tsc() {
+        let ghz_4_3 = |host_ns: u64| host_ns * 43 / 10;
+        let idle = (
+            (1_000_000_000, 5_000),
+            (1_200_000_000, 5_000 + ghz_4_3(200_000_000)),
+        );
+        let busy = (
+            (1_100_000_000, 9_000),
+            (11_100_000_000, 9_000 + ghz_4_3(10_000_000_000)),
+        );
+        let short = (
+            (10_000_000_000, 1),
+            (10_500_000_000, 1 + ghz_4_3(500_000_000)),
+        );
+        assert_eq!(
+            super::measured_period_longest([idle, busy, short]),
+            Some(232_558)
+        );
+        // A mixed pair, CPU 0's first sample with CPU 1's latest, would be off by the
+        // timestamps' offset between the two CPUs.
+        assert_ne!(super::measured_period_fs(idle.0, busy.1), Some(232_558));
+        assert_eq!(super::measured_period_longest([idle, short]), None);
+        assert_eq!(super::measured_period_longest([]), None);
+    }
     use super::*;
     use crate::capture::Capture;
     use ferric_guest_ram::RamLayout;

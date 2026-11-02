@@ -125,8 +125,9 @@ the same kernel source again and installs it as `usr/lib/boot/kernel-trace`
 `ferric-config` exports its Cargo features as `FERRIC_TRACE_KERNEL_FEATURES`:
 the image kernel's features (`FERRIC_KERNEL_FEATURES`) plus `trace`,
 `trace_mode`, every subsystem's `trace_<subsystem>`, the level feature of
-`kernel.trace_max_level`'s default (`trace_level_info`) and `trace_crash`,
-without `profiling`, which cannot be combined with tracing. Both kernels use the
+`kernel.trace_max_level`'s default (`trace_level_info`), `trace_crash` and
+`trace_host` ([host-visible rings](#host-visible-rings), inactive unless booted
+with `FERRIC_TRACE_HOST`), without `profiling`, which cannot be combined with tracing. Both kernels use the
 same `kernel-config.toml` and link arguments, every option that rebuilds the
 kernel rebuilds the trace-mode kernel too, and like the kernel it never gets
 the user-space CPU flags (`cpu.flags_exclude`). The kernel recipes
@@ -1303,7 +1304,7 @@ It writes the [capture directory format](#reading-a-capture-on-the-host), so
 | File | Content |
 | --- | --- |
 | `INCOMPLETE` | Present until `follow` stops cleanly |
-| `clock` | The trace clock, from the directory |
+| `clock` | The trace clock, from the directory. When it is the TSC and the kernel does not know its rate, `follow` measures the rate against host time once it stops and writes the period, so `counts`, `latency` and `perfetto` need no `--tsc-mhz`. It measures from one CPU's first and latest `host-clock` samples, the CPU whose samples span the most host time (at least 1 s), never from a pair taken on two CPUs: an idle CPU's newest record can be much older than the time it was read at |
 | `cpu<n>` | CPU n's records, appended as they are read |
 | `stats.start` | Per CPU, the words in the ring when following began and the records lost before then, written after the first poll (which comes right after following starts, so "before" means before that poll; a guest that boots again before it gets the kernel's count alone): the larger of the kernel's count and the records in the words the first copy skipped, which include records a guest reader consumed before the kernel overwrote them. It is a lower bound: the kernel does not say how much of its count is records it dropped without writing, which the skip does not hold |
 | `stats.end` | Per CPU, the words left unread, and the records lost: those of `stats.start` plus `follow`'s own losses |

@@ -1,0 +1,37 @@
+[package]
+name = "ferric-harness"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Boots Ferric Oxide images in QEMU under a supervisor: serial, QMP screen and input, boot control, measurements and reports"
+
+[[bin]]
+name = "ferric-harness"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["env"] }
+# The boot environment's key names, fw_cfg file and size limit, as the bootloader reads them.
+ferric-abi = { path = "../../crates/abi" }
+# The host ring sizes the kernel accepts (`host::RingSize`).
+ferric-trace = { path = "../../crates/trace" }
+# The 8x16 console font fbcond, fbbootlogd and the kernel's graphical debug draw with; the
+# `text` OCR matches screen cells against it. No SDL: only the font table is used.
+orbclient = { version = "0.4.6", default-features = false, features = ["unifont"] }
+png = "0.18"
+regex = "1"
+# Safe wrappers for the monotonic clock, clock ticks, signalling `ferric-trace follow` and
+# the control socket's peer credentials (SO_PEERCRED).
+rustix = { version = "1", features = ["net", "param", "process", "termios", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+signal-hook = "0.3"
+thiserror = { workspace = true, features = ["std"] }
+time = { workspace = true, features = ["std", "formatting"] }
+toml = { workspace = true, features = ["parse", "serde", "std"] }
+
+[dev-dependencies]
+# A pseudo-terminal for the `serial send --secret` echo tests.
+rustix = { version = "1", features = ["pty", "termios", "process"] }
+tempfile.workspace = true
