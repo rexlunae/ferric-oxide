@@ -457,7 +457,7 @@ impl<'a> Follower<'a> {
             start.push_str(
                 &StatsLine {
                     cpu,
-                    pending: observer.head().saturating_sub(observer.tail()),
+                    pending: observer.head().saturating_sub(observer.oldest()),
                     lost: state.summary.lost_before,
                 }
                 .to_string(),
@@ -948,6 +948,49 @@ mod tests {
         assert_eq!(cpu0_samples[0].host_ns, 1_500);
         assert_eq!(cpu0_samples[1].host_ns, 300_000_700);
         assert_eq!(samples.iter().filter(|s| s.cpu == 1).count(), 1);
+    }
+
+    /// A reader in the guest drains CPU 0's ring after the kernel overwrote its oldest
+    /// records: the follower, which starts behind both, still gets every record the ring
+    /// holds, and `stats.start` counts them as in the ring.
+    #[test]
+    fn a_guest_reader_hides_nothing_from_the_follower() {
+        let mut guest = Guest::new(RamLayout::q35(8 * MIB), 3 * MIB, 1, 4);
+        let pushed = pairs(&mut guest, 0, 100);
+        let mut drained = vec![0u8; 8192];
+        while guest.rings[0].read(&mut drained).expect("fits") > 0 {}
+        assert_eq!(guest.rings[0].pending(), 0);
+        guest.sync();
+        let out_dir = tempfile::tempdir().expect("a directory");
+        let out = out_dir.path().join("trace");
+        let ram = guest.map();
+        let (phys, directory) = find_directory(&ram, Some(3 * MIB))
+            .expect("reads")
+            .expect("finds the directory");
+        create_output(&out).expect("created");
+        let follower = Follower::start(&ram, phys, &directory, &out).expect("starts");
+        let summary = follower.finish(StopReason::Duration).expect("finishes");
+
+        let kept = &captured(&out)[&0];
+        assert_eq!(
+            kept[..],
+            pushed[pushed.len() - kept.len()..],
+            "the newest records, without a gap"
+        );
+        let start = stats(&out.join(STATS_START));
+        let in_ring = start[0].pending;
+        // 512 words, less than one record lost at the boundary.
+        assert!(
+            (512 - 7..=512).contains(&in_ring),
+            "{in_ring} words in the ring"
+        );
+        let records = summary.cpus[0].records;
+        assert_eq!(records, kept.len() as u64);
+        assert!(
+            records >= in_ring / 11 * 2,
+            "{records} records of {in_ring} words"
+        );
+        assert_eq!(stats(&out.join(STATS_END))[0].pending, 0);
     }
 
     #[test]
