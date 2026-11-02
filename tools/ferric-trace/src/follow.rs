@@ -20,8 +20,8 @@
 //! | `INCOMPLETE` | present until the follower stops cleanly ([`crate::capture::INCOMPLETE`]) |
 //! | `clock` | the trace clock, from the directory; for a TSC whose rate the kernel does not know, the rate measured against host time over the CPU whose samples span the most host time ([`measured_period_longest`]) once following ends |
 //! | `cpu<n>` | CPU n's records, appended as they are read |
-//! | `stats.start` | per CPU, the words in the ring when following began and the records the kernel had dropped by then (`lost_before`) |
-//! | `stats.end` | per CPU, the words left unread and the records lost: before following began (the larger of the kernel's count and the records in the words the first copy skipped, which include records a guest reader consumed before the kernel overwrote them) plus the follower's own losses |
+//! | `stats.start` | per CPU, the words in the ring when following began and the records lost before then (`lost_before`, a lower bound), written after the first poll, once each ring's first copy says what was overwritten before following began |
+//! | `stats.end` | per CPU, the words left unread and the records lost: those of `stats.start` plus the follower's own losses |
 //! | [`HOST_CLOCK`] | samples tying host time to trace time, [`ClockSampleLine`]s |
 //!
 //! The rings overwrite their oldest records, so the kernel never waits: a follower that falls
@@ -136,11 +136,13 @@ pub struct CpuSummary {
     pub bytes: u64,
     /// The records saved.
     pub records: u64,
-    /// The records lost before following began: the larger of the kernel's count (records it
-    /// dropped, or overwrote before any reader took them) and the records estimated in
-    /// [`CpuSummary::lost_words_before`], which also holds records a guest reader consumed
-    /// before they were overwritten, which the kernel does not count. The kernel's records are
-    /// among those, so the two are not added.
+    /// The records lost before following began, a lower bound: the larger of the kernel's
+    /// count (records it overwrote before any reader took them, and records it dropped
+    /// without writing) and the records estimated in [`CpuSummary::lost_words_before`],
+    /// which also holds records a guest reader consumed before they were overwritten, which
+    /// the kernel does not count. The two overlap in the overwritten records the kernel
+    /// counted, and the kernel does not say how many of its count those are, so they are
+    /// not added; records dropped without being written can then go uncounted.
     pub lost_before: u64,
     /// The words the first copy skipped: everything the kernel had overwritten before
     /// following began, whether a guest reader had consumed it or not.
@@ -411,6 +413,8 @@ struct CpuState<'a> {
     /// This CPU's first and latest [`HOST_CLOCK`] samples, for measuring an unknown TSC
     /// rate.
     span: Option<SampleSpan>,
+    /// The words in the ring, from `oldest` to `head`, when following began.
+    pending_at_start: u64,
 }
 
 impl CpuState<'_> {
@@ -495,13 +499,16 @@ pub struct Follower<'a> {
     /// The host clock a [`HOST_CLOCK`] sample is taken with, after its ring was read:
     /// [`monotonic_ns`], or a test's own.
     read_clock: fn() -> u64,
+    /// Whether `stats.start` was written, after the first poll.
+    start_written: bool,
     buf: Vec<u8>,
 }
 
 impl<'a> Follower<'a> {
     /// Starts following the rings `directory` (found at `phys`) lists into the capture
-    /// directory `out`, which exists: writes `clock` and `stats.start` and creates the
-    /// `cpu<n>` and [`HOST_CLOCK`] files.
+    /// directory `out`, which exists: writes `clock` and creates the `cpu<n>` and
+    /// [`HOST_CLOCK`] files. `stats.start` follows the first [`Follower::poll`], once each
+    /// ring's first copy says what was lost before following began.
     ///
     /// # Errors
     ///
@@ -516,23 +523,10 @@ impl<'a> Follower<'a> {
         let clock = out.join(CLOCK);
         fs::write(&clock, directory.clock().to_string()).map_err(io_error(&clock))?;
         let mut cpus = Vec::with_capacity(directory.cpu_count());
-        let mut start = String::new();
         for index in 0..directory.cpu_count() {
             let cpu = u32::try_from(index).unwrap_or(u32::MAX);
-            let state = open_cpu(ram, directory, cpu, out)?;
-            let observer = &state.observer;
-            start.push_str(
-                &StatsLine {
-                    cpu,
-                    pending: observer.head().saturating_sub(observer.oldest()),
-                    lost: state.summary.lost_before,
-                }
-                .to_string(),
-            );
-            cpus.push(state);
+            cpus.push(open_cpu(ram, directory, cpu, out)?);
         }
-        let stats = out.join(STATS_START);
-        fs::write(&stats, start).map_err(io_error(&stats))?;
         let host_clock = out.join(HOST_CLOCK);
         let host_clock = File::create(&host_clock)
             .map(BufWriter::new)
@@ -546,6 +540,7 @@ impl<'a> Follower<'a> {
             cpus,
             host_clock,
             read_clock: monotonic_ns,
+            start_written: false,
             buf: vec![0; READ_BYTES],
         })
     }
@@ -574,7 +569,32 @@ impl<'a> Follower<'a> {
         self.host_clock
             .flush()
             .map_err(io_error(&self.out.join(HOST_CLOCK)))?;
+        if !self.start_written {
+            self.write_start()?;
+        }
         Ok(Poll::Read)
+    }
+
+    /// Writes `stats.start`: per CPU, the words in the ring when following began and the
+    /// records lost before then, as the first copy left them ([`CpuSummary::lost_before`]),
+    /// which `finish` keeps, so `stats.end` minus `stats.start` is what following lost.
+    fn write_start(&mut self) -> Result<(), FollowError> {
+        let mut start = String::new();
+        for state in &mut self.cpus {
+            state.summary.lost_before = state.lost_before();
+            start.push_str(
+                &StatsLine {
+                    cpu: state.summary.cpu,
+                    pending: state.pending_at_start,
+                    lost: state.summary.lost_before,
+                }
+                .to_string(),
+            );
+        }
+        let stats = self.out.join(STATS_START);
+        fs::write(&stats, start).map_err(io_error(&stats))?;
+        self.start_written = true;
+        Ok(())
     }
 
     /// Whether the directory is still the one followed: same magic and generation.
@@ -684,7 +704,6 @@ impl<'a> Follower<'a> {
         let mut cpus = Vec::with_capacity(self.cpus.len());
         for state in &mut self.cpus {
             state.summary.lost_records = state.lost_records();
-            state.summary.lost_before = state.lost_before();
             let pending = state.observer.head().saturating_sub(state.pos);
             end.push_str(
                 &StatsLine {
@@ -742,6 +761,7 @@ fn open_cpu<'a>(
         .map(BufWriter::new)
         .map_err(io_error(&path))?;
     let lost_before = observer.lost();
+    let pending_at_start = observer.head().saturating_sub(observer.oldest());
     Ok(CpuState {
         observer,
         file,
@@ -756,6 +776,7 @@ fn open_cpu<'a>(
         words: 0,
         last_sample_ns: None,
         span: None,
+        pending_at_start,
     })
 }
 
@@ -1173,11 +1194,8 @@ mod tests {
             "estimated {} for {lost}",
             cpu.lost_before
         );
-        assert_eq!(
-            stats(&out.join(STATS_START))[0].lost,
-            0,
-            "the kernel's own count"
-        );
+        // Lost before following began, in both snapshots: `counts` reports none as lost during.
+        assert_eq!(stats(&out.join(STATS_START))[0].lost, cpu.lost_before);
         assert_eq!(stats(&out.join(STATS_END))[0].lost, cpu.lost_before);
     }
 
