@@ -39,6 +39,12 @@ pub const OBSERVE_TRIES: usize = 8;
 /// again from `tail`, as [`View::peek`](super::View::peek) does. What it passed over is
 /// reported as [`Observed::skipped`].
 ///
+/// That recovery takes `tail` as the oldest record still whole, which holds when only the
+/// producer moves it. A reader that consumes the ring moves it to records it has read but
+/// the producer has not overwritten, and an overtaken observer then skips those too. So an
+/// observer that may fall behind should be the ring's only reader; the kernel refuses
+/// `cpu/<n>` reads of its host-visible rings for that reason.
+///
 /// Every load is relaxed, with acquire fences where ordering matters, because the memory may
 /// be mapped read-only, where only relaxed atomic loads are allowed.
 #[derive(Debug)]
