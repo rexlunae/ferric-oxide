@@ -652,6 +652,22 @@ fn links_native_sysroot(name: &str) -> bool {
     !matches!(name, "relibc" | "kernel" | "kernel-trace" | "bootloader")
 }
 
+/// Ferric Oxide: when the recipe last changed: the newest top-level file in its directory,
+/// following symbolic links, so `recipe.toml` and anything its script reads from there
+/// (patches, lockfiles, a shared build script linked in) count. Directories (the build's
+/// `source/` and `target/`) and the downloaded `source*` archives do not. `None` when there is
+/// none to read.
+fn recipe_modified(recipe_dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::read_dir(recipe_dir)
+        .ok()?
+        .flatten()
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with("source"))
+        .filter_map(|entry| std::fs::metadata(entry.path()).ok())
+        .filter(|metadata| metadata.is_file())
+        .filter_map(|metadata| metadata.modified().ok())
+        .max()
+}
+
 fn build_is_source_newer(
     logger: &PtyOut,
     recipe_dir: &Path,
@@ -671,7 +687,7 @@ fn build_is_source_newer(
         return false;
     };
     let mut recipe_is_newest = false;
-    if let Ok(recipe_modified) = fs::modified(&recipe_dir.join("recipe.toml"))
+    if let Some(recipe_modified) = recipe_modified(recipe_dir)
         && recipe_modified > source_modified
     {
         source_modified = recipe_modified;
@@ -1228,6 +1244,46 @@ mod tests {
         for name in ["base", "kernel-tools", "ferric-trace"] {
             assert!(super::links_native_sysroot(name), "{name}");
         }
+    }
+
+    /// Every file beside recipe.toml counts, through a symbolic link too; directories and the
+    /// downloaded source archive do not.
+    #[test]
+    fn a_recipe_changes_with_any_file_in_its_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let recipe = temp.path().join("recipe");
+        std::fs::create_dir(&recipe).unwrap();
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let at = |minutes: u64| base + std::time::Duration::from_secs(60 * minutes);
+        let touch = |path: &std::path::Path, time| {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(time))
+                .unwrap();
+        };
+        let toml = recipe.join("recipe.toml");
+        std::fs::write(&toml, "").unwrap();
+        touch(&toml, at(1));
+        assert_eq!(super::recipe_modified(&recipe), Some(at(1)));
+
+        let shared = temp.path().join("build-shared.sh");
+        std::fs::write(&shared, "").unwrap();
+        touch(&shared, at(5));
+        std::os::unix::fs::symlink(&shared, recipe.join("build-shared.sh")).unwrap();
+        assert_eq!(super::recipe_modified(&recipe), Some(at(5)));
+
+        for name in ["source.tar", "source"] {
+            let path = recipe.join(name);
+            if name == "source" {
+                std::fs::create_dir(&path).unwrap();
+            } else {
+                std::fs::write(&path, "").unwrap();
+            }
+            touch(&path, at(9));
+        }
+        std::fs::create_dir(recipe.join("target")).unwrap();
+        touch(&recipe.join("target"), at(9));
+        assert_eq!(super::recipe_modified(&recipe), Some(at(5)));
     }
 
     #[test]

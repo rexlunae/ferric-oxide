@@ -9,7 +9,7 @@ path = "crates/kernel"
 [build]
 template = "custom"
 script = """
-source "${COOKBOOK_ROOT}/recipes/core/kernel/build-kernel.sh"
+source "${COOKBOOK_RECIPE}/build-kernel.sh"
 # ferric-config exports the image kernel's features plus tracing when
 # kernel.trace_mode is on, and leaves the variable unset otherwise.
 if [ -z "${FERRIC_TRACE_KERNEL_FEATURES}" ]

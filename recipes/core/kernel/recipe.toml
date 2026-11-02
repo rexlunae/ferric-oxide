@@ -8,7 +8,7 @@ path = "crates/kernel"
 template = "custom"
 script = """
 # Ferric Oxide: the build is shared with recipes/core/kernel-trace.
-source "${COOKBOOK_ROOT}/recipes/core/kernel/build-kernel.sh"
+source "${COOKBOOK_RECIPE}/build-kernel.sh"
 # Kernel features from ferric.toml (make menuconfig). Unset without ferric.toml,
 # which keeps the upstream defaults.
 if [ -n "${FERRIC_KERNEL_FEATURES+set}" ]

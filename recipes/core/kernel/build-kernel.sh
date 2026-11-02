@@ -1,5 +1,6 @@
-# Ferric Oxide: the kernel build shared by recipes/core/kernel and recipes/core/kernel-trace.
-# A recipe's build script sources this file and calls ferric_kernel_build.
+# Ferric Oxide: the kernel build shared by recipes/core/kernel and recipes/core/kernel-trace,
+# whose directory links to this file. A recipe's build script sources it from its own
+# directory ("${COOKBOOK_RECIPE}/build-kernel.sh") and calls ferric_kernel_build.
 #
 # ferric_kernel_build NAME [FEATURES]
 #   NAME      the file name in usr/lib/boot (kernel, kernel-trace); NAME.all and NAME.sym go
@@ -9,8 +10,8 @@
 #
 # FERRIC_KERNEL_LINK_ARGS and FERRIC_KERNEL_CONFIG from ferric.toml apply to every kernel.
 #
-# The cookbook marks a recipe stale only when its recipe.toml or its source changes, so after
-# editing this file run `make cr.kernel` (and `make cr.kernel-trace`).
+# The cookbook counts every file in a recipe's directory, through links too, so editing this
+# file rebuilds both kernels.
 
 ferric_kernel_build() {
     local name="$1"
