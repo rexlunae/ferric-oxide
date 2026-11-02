@@ -62,10 +62,13 @@ pub(super) fn init(madt: Madt) {
         }
     }
 
+    let preliminary_cpu_count = madt.startable_cpus(me.get());
     unsafe {
-        let preliminary_cpu_count = madt.iter().filter(|e| matches!(e, MadtEntry::LocalApic(entry) if u32::from(entry.id) == me.get() || entry.flags & 1 == 1)).count();
         crate::profiling::allocate(preliminary_cpu_count as u32);
     }
+    // Ferric Oxide: the trace rings of the CPUs about to start, when tracing records from boot.
+    #[cfg(feature = "trace")]
+    crate::trace::init_cpus(preliminary_cpu_count);
     for madt_entry in madt.iter() {
         crate::debug!("      {:x?}", madt_entry);
         if let MadtEntry::LocalApic(ap_local_apic) = madt_entry {

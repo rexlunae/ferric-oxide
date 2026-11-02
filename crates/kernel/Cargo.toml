@@ -147,6 +147,10 @@ trace_crash = ["trace"]
 # Ferric Oxide: writing `panic` to kernel.trace/crash panics the kernel and resets the machine
 # after the dump, for testing it in CI.
 trace_crash_test = ["trace_crash"]
+# Ferric Oxide: with FERRIC_TRACE_HOST=<KiB per CPU> in the boot environment, the trace rings go
+# into one physically contiguous region with a directory page, which a host reads out of the
+# guest's RAM (`ferric-trace follow`).
+trace_host = ["trace", "dep:ferric-hwrand"]
 # Ferric Oxide: everything the kernel logs is also kept in reserved memory that survives a warm
 # reboot, served by sys:log_previous on the next boot.
 log_persist = ["dep:ferric-trace"]

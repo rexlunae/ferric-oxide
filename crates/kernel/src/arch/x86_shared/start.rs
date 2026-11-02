@@ -172,6 +172,11 @@ unsafe extern "C" fn start(args_ptr: *const KernelArgs, _stack_end: usize) -> ! 
         #[cfg(all(feature = "numa", target_arch = "x86_64"))]
         numa::init(mapper.allocator_mut());
 
+        // Ferric Oxide (`kernel.trace_host`): one contiguous region for the host-visible trace
+        // rings, from the boot-time allocator while it still has large free runs.
+        #[cfg(feature = "trace_host")]
+        crate::trace::host::reserve(args.env(), mapper.allocator_mut());
+
         let numa_region_mask = crate::memory::init_mm(mapper.allocator_mut());
 
         // SAFETY: The kernel page tables and frame allocator are ready, and no
@@ -253,9 +258,20 @@ fn continue_after_kmain_stack(
             // Activate memory logging
             crate::log::init();
 
-            // Ferric Oxide: tracepoints enabled from boot, before the other CPUs start.
+            // Ferric Oxide: tracepoints enabled from boot, before the other CPUs start. Their
+            // rings are made first, which needs the trace clock: when that is the KVM clock,
+            // this CPU's clock page is set up here instead of in `device::init_noncore`, after
+            // the other CPUs start.
             #[cfg(feature = "trace")]
-            crate::trace::init_boot(args.env());
+            {
+                #[cfg(feature = "x86_kvm_pv")]
+                if crate::trace::clock::wants_early_kvm_clock(crate::trace::rings_wanted_at_boot(
+                    args.env(),
+                )) {
+                    device::tsc::init();
+                }
+                crate::trace::init_boot(args.env());
+            }
 
             // Initialize miscellaneous processor features
             #[cfg(target_arch = "x86_64")]

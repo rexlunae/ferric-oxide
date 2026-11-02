@@ -12,11 +12,16 @@
 //!   is patched to a jump to the code that records it (`arch::static_key`).
 //! - **Boot time.** `FERRIC_TRACE=<selection>` in the boot environment, or the build-time default
 //!   `trace.boot` in the kernel's `config.toml`, enables events before the other CPUs start.
+//!   The rings are then made first, so records from boot are kept (unless the trace clock is
+//!   the HPET, which runs only once ACPI is read).
 //! - **Run time.** The `kernel.trace` scheme (`scheme::trace`) enables and disables events and
 //!   drains the rings, or maps them read-only into a reader.
 //!
 //! - **Crash dump.** With `trace_crash`, a panic leaves its message and the newest records in
 //!   memory that survives a warm reboot, for the next boot to hand out (`crash`).
+//! - **Host rings.** With `trace_host` and `FERRIC_TRACE_HOST=<KiB per CPU>` in the boot
+//!   environment, the rings live in one physically contiguous region with a directory page,
+//!   which a host reads straight out of the guest's RAM (`host`).
 //!
 //! Records go to a ring per CPU (`ferric_trace::ring::Ring` in the shared layout, 64 KiB of
 //! records after a header page), stamped by the clock the `clock` module picks at boot: an
@@ -30,6 +35,8 @@
 pub mod clock;
 #[cfg(feature = "trace_crash")]
 pub mod crash;
+#[cfg(feature = "trace_host")]
+pub mod host;
 #[cfg(feature = "trace")]
 mod imp;
 

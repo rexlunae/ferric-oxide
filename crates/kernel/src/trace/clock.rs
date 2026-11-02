@@ -1,11 +1,17 @@
 //! Ferric Oxide (`kernel.trace`, roadmap T3d): the clock behind record timestamps.
 //!
-//! [`choice`] picks the clock once, the first time it is asked (when `kmain` makes the
-//! rings, before any record is written), with `ferric_trace::clock::choose`: the TSC when
+//! [`choice`] picks the clock once, the first time it is asked (when the first ring is made,
+//! before any record is written), with `ferric_trace::clock::choose`: the TSC when
 //! CPUID `0x8000_0007` says it is invariant, otherwise the KVM paravirtual clock, otherwise
 //! a 64-bit HPET main counter, otherwise the TSC anyway with a warning. [`now`] reads it
 //! for each record. The `kernel.trace` scheme's `clock` file serves the choice, so decoders
 //! know what a timestamp counts.
+//!
+//! Rings made at boot, before the other CPUs start ([`choice_early`]), need the choice before
+//! ACPI is read. The TSC and the KVM clock rank above the HPET, so when either is there the
+//! early choice is the one `kmain` would make; the boot CPU's KVM clock page is set up early
+//! for it ([`wants_early_kvm_clock`]). Only a machine whose clock would be the HPET, which
+//! runs once ACPI is read, has to wait for `kmain`.
 //!
 //! [`now`] runs inside tracepoints, with interrupts off, so none of the readers takes a lock
 //! or logs: the KVM clock is read with `tsc::pvclock_ns`, which keeps no state, and the HPET
@@ -36,7 +42,9 @@ pub fn choice() -> Choice {
 
 /// The clock timestamps come from now, without picking one: [`choice`]'s line once it has
 /// run, and the TSC with an unknown period before, which is what [`now`] reads until then.
-/// The panic handler uses it for the crash dump, where picking and logging is not wanted.
+/// The panic handler uses it for the crash dump, where picking and logging is not wanted,
+/// and the host ring directory, written once the choice is made.
+#[cfg(any(feature = "trace_crash", feature = "trace_host"))]
 pub fn current() -> clock::ClockLine {
     CHOICE.get().map_or(
         clock::ClockLine {
@@ -47,17 +55,37 @@ pub fn current() -> clock::ClockLine {
     )
 }
 
-/// Picks the clock from what this machine offers and logs why.
-fn select() -> Choice {
+/// The clock picked now, if what is known before ACPI is read settles it: an invariant TSC,
+/// or a KVM clock on this CPU (see [`wants_early_kvm_clock`]). `None` leaves the choice to
+/// [`choice`] once the HPET runs.
+pub fn choice_early() -> Option<Choice> {
+    (CHOICE.is_completed() || invariant_tsc() || kvm_clock()).then(choice)
+}
+
+/// Whether the boot CPU's KVM clock page should be set up before the other CPUs start: rings
+/// are wanted from boot (`rings_wanted`) and the TSC is not invariant, so the clock will be
+/// the KVM clock if KVM offers one. `tsc::init` decides whether it does.
+#[cfg(feature = "x86_kvm_pv")]
+pub fn wants_early_kvm_clock(rings_wanted: bool) -> bool {
+    rings_wanted && !invariant_tsc()
+}
+
+/// Whether CPUID says the TSC is invariant.
+fn invariant_tsc() -> bool {
     let max_extended = core::arch::x86_64::__cpuid(0x8000_0000).eax;
     let edx = if max_extended >= INVARIANT_TSC_LEAF {
         core::arch::x86_64::__cpuid(INVARIANT_TSC_LEAF).edx
     } else {
         0
     };
+    clock::invariant_tsc(max_extended, edx)
+}
+
+/// Picks the clock from what this machine offers and logs why.
+fn select() -> Choice {
     let hpet = hpet_counter();
     let choice = clock::choose(Offered {
-        invariant_tsc: clock::invariant_tsc(max_extended, edx),
+        invariant_tsc: invariant_tsc(),
         kvm_clock: kvm_clock(),
         hpet_period_fs: hpet.map(|(_, period_fs)| period_fs),
     });

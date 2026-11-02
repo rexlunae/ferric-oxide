@@ -26,6 +26,34 @@ static MADT: SyncUnsafeCell<Option<Madt>> = SyncUnsafeCell::new(None);
 pub fn madt() -> Option<&'static Madt> {
     unsafe { &*MADT.get() }.as_ref()
 }
+
+/// Ferric Oxide (`kernel.trace_host`): the MADT, noted while `init_before_mem` maps the
+/// tables, so the CPUs can be counted before the frame allocator exists.
+#[cfg(feature = "trace_host")]
+static EARLY_MADT: spin::Once<&'static Sdt> = spin::Once::new();
+
+/// Ferric Oxide (`kernel.trace_host`): notes `sdt` if it is the MADT, for
+/// [`early_cpu_count`].
+#[cfg(feature = "trace_host")]
+pub fn note_early(sdt: &'static Sdt) {
+    if &sdt.signature == b"APIC" {
+        EARLY_MADT.call_once(|| sdt);
+    }
+}
+
+/// Ferric Oxide (`kernel.trace_host`): how many CPUs the boot CPU, whose local APIC is
+/// `bsp_apic_id`, will start ([`Madt::startable_cpus`]), from the MADT `init_before_mem`
+/// noted, or `None` without one.
+#[cfg(all(
+    feature = "trace_host",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+pub fn early_cpu_count(bsp_apic_id: u32) -> Option<usize> {
+    EARLY_MADT
+        .get()
+        .and_then(|sdt| Madt::new(sdt))
+        .map(|madt| madt.startable_cpus(bsp_apic_id))
+}
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub const FLAG_PCAT: u32 = 1;
 
@@ -68,6 +96,21 @@ impl Madt {
             sdt: self.sdt,
             i: 8, // Skip local controller address and flags
         }
+    }
+
+    /// Ferric Oxide: the CPUs `arch::init` starts, the boot CPU included: the local APIC
+    /// entries that are enabled or are the boot CPU's own (`me`). One without `multi_core`.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    pub fn startable_cpus(&self, me: u32) -> usize {
+        if cfg!(not(feature = "multi_core")) {
+            return 1;
+        }
+        self.iter()
+            .filter(|entry| {
+                matches!(entry, MadtEntry::LocalApic(apic)
+                    if u32::from(apic.id) == me || apic.flags & 1 == 1)
+            })
+            .count()
     }
 }
 

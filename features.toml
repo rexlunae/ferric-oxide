@@ -1069,6 +1069,28 @@ the dump is written, so the next boot can read it back. CI's crash-dump image
 turns it on; never turn it on elsewhere."""
 
 [[option]]
+id = "kernel.trace_host"
+menu = "kernel.tracing"
+type = "bool"
+title = "Host-visible trace rings"
+default = false
+depends = "kernel.trace"
+kernel_feature = "trace_host"
+rebuild = ["kernel"]
+help = """
+Let a host read the trace rings straight out of a VM's RAM. Booted with
+FERRIC_TRACE_HOST=<KiB per CPU> in the boot environment (a power of two from 4
+to 1048576, e.g. 4096), the kernel puts every CPU's ring, of that size, into
+one physically contiguous region with a directory page, before the other CPUs
+start, and logs `trace: host rings at phys 0x<address>, <n> CPUs x <KiB> KiB`.
+These rings overwrite their oldest records when full. With QEMU guest RAM in a
+shared file (memory-backend-file,share=on), `ferric-trace follow` on the host
+reads them as the guest runs, without any guest code, interrupt or exit, and
+saves a capture directory. Without FERRIC_TRACE_HOST the kernel behaves as
+with kernel.trace alone. Readers in the guest can still drain host rings but
+not map them."""
+
+[[option]]
 id = "kernel.log_persist"
 menu = "kernel"
 type = "bool"
