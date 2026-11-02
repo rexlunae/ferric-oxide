@@ -1372,6 +1372,13 @@ name = "ferric-fspath"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-fwcfg"
+version = "0.1.0"
+dependencies = [
+ "simple_endian",
+]
+
+[[package]]
 name = "ferric-heap"
 version = "0.1.0"
 dependencies = [
