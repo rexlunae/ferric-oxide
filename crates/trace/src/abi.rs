@@ -26,7 +26,8 @@
 //! without a system call per batch. To let the kernel reuse what it has read, the reader
 //! writes `commit <end>` to the descriptor, `end` being the [`Peek::end`] of its last copy;
 //! the kernel accepts only the end of a record between its own `tail` and `head`, and returns
-//! `EINVAL` otherwise and `EAGAIN` while another reader of that CPU is reading.
+//! `EINVAL` otherwise and `EAGAIN` while another reader of that CPU is reading. A ring in the
+//! host-visible region ([`host`](crate::host)) cannot be mapped (`EINVAL`); read it instead.
 //!
 //! The kernel stays the only writer of the mapped words, and it never takes a value from them
 //! that it did not store itself: the ring's size and its counters are kept in the kernel, so

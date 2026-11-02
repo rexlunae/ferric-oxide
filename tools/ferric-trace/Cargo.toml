@@ -31,6 +31,13 @@ redox_syscall = { version = "0.9.4", default-features = false }
 serde_json.workspace = true
 thiserror = { workspace = true, features = ["std"] }
 
+# On a Linux host, `ferric-trace follow` maps the guest's RAM file, reads the monotonic
+# clock and stops cleanly on SIGINT and SIGTERM.
+[target.'cfg(target_os = "linux")'.dependencies]
+ferric-guest-ram = { path = "../../crates/guest-ram" }
+rustix = { workspace = true, features = ["time"] }
+signal-hook = { version = "0.3.18", default-features = false }
+
 # On the target, `ferric-trace profile` names the sampled contexts with a `call` on the
 # debug scheme.
 [target.'cfg(target_os = "redox")'.dependencies]

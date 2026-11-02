@@ -29,6 +29,9 @@
 //!   here.
 //! - [`spans`] pairs a capture's records into system call and scheme request spans on the
 //!   contexts that made them, and [`otlp`] exports those as OpenTelemetry (OTLP/JSON) traces.
+//! - `follow` (Linux hosts) reads a guest's host-visible rings (`kernel.trace_host`) straight
+//!   out of its RAM file while it runs, into a capture directory (the `ferric-trace follow`
+//!   command).
 //!
 //! # Examples
 //!
@@ -58,6 +61,8 @@ pub mod crash;
 pub mod describe;
 pub mod drain;
 pub mod flamegraph;
+#[cfg(target_os = "linux")]
+pub mod follow;
 pub mod otlp;
 pub mod perfetto;
 pub mod profile;

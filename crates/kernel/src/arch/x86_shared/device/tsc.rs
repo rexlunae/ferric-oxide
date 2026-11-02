@@ -134,11 +134,28 @@ pub fn get_kvm_support() -> &'static Option<KvmSupport> {
     })
 }
 
+/// Sets up this CPU's KVM clock page when KVM offers a stable clock, and returns whether it
+/// has one. Ferric Oxide: once per CPU; a later call on the same CPU returns `true` and
+/// changes nothing, so tracing can set the boot CPU's up before `device::init_noncore` does.
+///
+/// # Safety
+///
+/// Call it on the CPU whose clock it sets up, after the frame allocator is ready: it hands a
+/// frame to the hypervisor through that CPU's KVM system-time MSR.
 pub unsafe fn init() -> bool {
     unsafe {
         let cpuid = crate::arch::cpuid::cpuid();
         if !cpuid.get_feature_info().is_some_and(|f| f.has_tsc()) {
             return false;
+        }
+        if !PercpuBlock::current()
+            .misc_arch_info
+            .tsc_info
+            .vcpu_page
+            .get()
+            .is_null()
+        {
+            return true;
         }
 
         let kvm_support = get_kvm_support();

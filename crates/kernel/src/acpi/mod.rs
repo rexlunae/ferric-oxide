@@ -151,7 +151,12 @@ pub unsafe fn init_before_mem(
             // TODO: Don't touch ACPI tables in kernel?
 
             for sdt in rxsdt.iter() {
+                #[cfg(not(feature = "trace_host"))]
                 get_sdt(sdt, mapper);
+                // Ferric Oxide (`kernel.trace_host`): the host-visible trace rings are sized by
+                // the CPU count before the tables are indexed.
+                #[cfg(feature = "trace_host")]
+                madt::note_early(get_sdt(sdt, mapper));
             }
         } else {
             crate::error!("NO RSDP FOUND");
