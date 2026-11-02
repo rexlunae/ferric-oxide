@@ -1078,6 +1078,25 @@ fn harness(args: &[&str]) -> std::process::Output {
         .expect("run ferric-harness")
 }
 
+/// Runs the CLI with `input` on its standard input.
+fn harness_with_stdin(args: &[&str], input: &str) -> std::process::Output {
+    use std::io::Write as _;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferric-harness"))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run ferric-harness");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for ferric-harness")
+}
+
 #[test]
 fn cli_up_commands_down_report() {
     let fixture = Fixture::new();
@@ -1144,8 +1163,15 @@ fn cli_up_commands_down_report() {
     assert!(out.status.success());
     let out = run_args(&["expect", "assword", "--timeout", "20"]);
     assert!(out.status.success());
-    let out = run_args(&["serial", "send", "--secret", "password"]);
-    assert!(out.status.success());
+    let out = harness_with_stdin(
+        &["serial", "send", "--secret", "--run", run_s.as_str()],
+        "password\n",
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = run_args(&["expect", "root:~# $", "--timeout", "20"]);
     assert!(out.status.success(), "the guest got the secret");
     let input = fs::read_to_string(run.join("serial-input.jsonl")).expect("input log");

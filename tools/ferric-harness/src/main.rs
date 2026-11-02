@@ -248,12 +248,14 @@ impl ButtonHow {
 enum SerialCmd {
     /// Write text to the console, then a line ending.
     Send {
-        /// The text.
-        text: String,
+        /// The text; with `--secret`, it is read from standard input instead.
+        #[arg(required_unless_present = "secret", conflicts_with = "secret")]
+        text: Option<String>,
         /// The line ending.
         #[arg(long, value_enum, default_value_t = Eol::Cr)]
         eol: Eol,
-        /// Send the text (a password) but log it only as `<redacted N bytes>`.
+        /// Read the text (a password) as one line of standard input, so it is not in the
+        /// command line other users can see, and log it only as `<redacted N bytes>`.
         #[arg(long)]
         secret: bool,
     },
@@ -463,6 +465,21 @@ fn verdict_exit(outcome: Option<Outcome>) -> ExitCode {
     }
 }
 
+/// One line of standard input, without its line ending: `serial send --secret`'s text.
+///
+/// # Errors
+///
+/// [`Error::SecretInput`] when standard input cannot be read.
+fn read_secret() -> Result<String, Error> {
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(Error::SecretInput)?;
+    let len = line.trim_end_matches(['\n', '\r']).len();
+    line.truncate(len);
+    Ok(line)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match dispatch(cli.command) {
@@ -529,10 +546,9 @@ fn dispatch(command: Cmd) -> Result<ExitCode, Error> {
             run,
             action: SerialCmd::Send { text, eol, secret },
         } => {
-            let secrecy = if secret {
-                Secrecy::Secret
-            } else {
-                Secrecy::Logged
+            let (text, secrecy) = match text {
+                Some(text) if !secret => (text, Secrecy::Logged),
+                _ => (read_secret()?, Secrecy::Secret),
             };
             request_output(&run.dir(), &Request::SerialSend { text, eol, secrecy })
         }
@@ -1025,15 +1041,24 @@ mod tests {
                 action: SerialCmd::Send { secret: false, .. },
             }
         ));
-        let cli = Cli::try_parse_from(["ferric-harness", "serial", "send", "--secret", "pw"])
-            .expect("parse");
+        // A secret comes from standard input, never the command line.
+        let cli =
+            Cli::try_parse_from(["ferric-harness", "serial", "send", "--secret"]).expect("parse");
         assert!(matches!(
             cli.command,
             Cmd::Serial {
-                action: SerialCmd::Send { secret: true, ref text, .. },
+                action: SerialCmd::Send {
+                    secret: true,
+                    text: None,
+                    ..
+                },
                 ..
-            } if text == "pw"
+            }
         ));
+        assert!(
+            Cli::try_parse_from(["ferric-harness", "serial", "send", "--secret", "pw"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["ferric-harness", "serial", "send"]).is_err());
         let cli = Cli::try_parse_from(["ferric-harness", "pointer", "button", "left", "--down"])
             .expect("parse");
         assert!(matches!(

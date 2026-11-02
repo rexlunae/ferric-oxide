@@ -16,6 +16,9 @@ use crate::screen::ScreenError;
 /// Everything that can go wrong in the harness.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// `serial send --secret` could not read its text from standard input.
+    #[error("reading the secret from standard input")]
+    SecretInput(#[source] std::io::Error),
     /// A file or directory operation failed.
     #[error("{path}")]
     Io {
