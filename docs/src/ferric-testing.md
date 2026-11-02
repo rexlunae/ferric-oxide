@@ -600,9 +600,14 @@ a shorter file is read and mapped only to its end, and that an interrupted
 (`EINTR`) or short read of those 4 KiB is retried rather than failing the load.
 A scheme call can return `EINTR` with no signal handler involved: the kernel
 cancels a call whose context was woken, and the smoke image's last commands hit
-this at the end of every boot. Which length an ELF
-object needs (`dso::loaded_len`) uses the `object` crate, which the harness does
-not build; every dynamically linked program in a boot test loads through it. Platform I/O, file guards, errno storage
+this at the end of every boot. The script builds the
+`object` crate for the host from relibc's own workspace and lockfile, so the
+harness also compiles `ld_so/image.rs` and checks which length an ELF object
+needs (`image::loaded_len`): on hand-built objects (segment contents, a note after
+the last load segment, a program header table that ends last, a segment past the
+end of the file, and headers the probe cannot parse, including `PN_XNUM`), and on
+the test binary itself, whose mapping must cover every segment and stop before
+its section headers. Platform I/O, file guards, errno storage
 and its message table use host adapters; this is not an end-to-end dynamic-link
 or guest-boot test.
 

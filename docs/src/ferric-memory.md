@@ -180,7 +180,7 @@ image tests exercise these behaviors.
 `ld.so` maps only the start of each object that loading reads: up to the end of
 its program header table or of the last part of the file a program header
 covers, decided from the object's first 4 KiB (`crates/relibc/src/ld_so/`,
-`dso::loaded_len`). The section headers and the sections no segment holds, such
+`image::loaded_len`). The section headers and the sections no segment holds, such
 as debug information and the full symbol table, usually follow and stay
 unmapped; an object whose headers are not in its first 4 KiB is mapped whole.
 This matters because a scheme fills a file mapping when it is made: RedoxFS

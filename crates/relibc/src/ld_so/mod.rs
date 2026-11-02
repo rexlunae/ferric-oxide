@@ -24,6 +24,7 @@ pub use object_search::PATH_SEP;
 mod access;
 pub mod debug;
 pub mod dso;
+mod image;
 pub mod linker;
 mod load_error;
 mod mmap_file;

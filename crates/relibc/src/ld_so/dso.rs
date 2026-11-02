@@ -14,6 +14,7 @@ use object::{
 use super::tcb::Tcb;
 use super::{
     debug::{_r_debug, RTLDDebug},
+    image::Image,
     linker::{__plt_resolve_trampoline, GLOBAL_SCOPE, Resolve, Scope, Symbol},
     tcb::Master,
 };
@@ -47,8 +48,6 @@ mod shim {
     pub type Rel = elf::Rel32<NativeEndian>;
     pub type Rela = elf::Rela32<NativeEndian>;
     pub type Sym = elf::Sym32<NativeEndian>;
-    pub type FileHeader = elf::FileHeader32<NativeEndian>;
-    pub type ProgramHeader = elf::ProgramHeader32<NativeEndian>;
     pub type GnuHashHeader = elf::GnuHashHeader<NativeEndian>;
     pub type SysVHashHeader = elf::HashHeader<NativeEndian>;
 }
@@ -60,12 +59,11 @@ mod shim {
     pub type Rel = elf::Rel64<NativeEndian>;
     pub type Rela = elf::Rela64<NativeEndian>;
     pub type Sym = elf::Sym64<NativeEndian>;
-    pub type FileHeader = elf::FileHeader64<NativeEndian>;
-    pub type ProgramHeader = elf::ProgramHeader64<NativeEndian>;
     pub type GnuHashHeader = elf::GnuHashHeader<NativeEndian>;
     pub type SysVHashHeader = elf::HashHeader<NativeEndian>;
 }
 
+pub use super::image::{FileHeader, ProgramHeader};
 pub use shim::*;
 
 // TODO: missing from the `object` crate
@@ -75,54 +73,6 @@ pub const DT_RELRENT: u32 = 37;
 
 /// Undefined Symbol Index
 pub const STN_UNDEF: SymbolIndex = SymbolIndex(0);
-
-/// Ferric Oxide: the parts of an ELF object that loading uses, its header and program
-/// headers. Unlike `object`'s `ElfFile`, parsing them does not read the section headers,
-/// which come after the part of the file [`loaded_len`] maps.
-struct Image<'a> {
-    header: &'a FileHeader,
-    segments: &'a [ProgramHeader],
-}
-
-impl<'a> Image<'a> {
-    /// Parses the header and program headers at the start of `data`.
-    fn parse(data: &'a [u8]) -> object::Result<Self> {
-        let header = FileHeader::parse(data)?;
-        let segments = header.program_headers(header.endian()?, data)?;
-        Ok(Self { header, segments })
-    }
-
-    fn entry(&self) -> u64 {
-        self.header.e_entry(NativeEndian).into()
-    }
-
-    /// The end of the program header table or of the last part of the file a program
-    /// header covers, whichever is later.
-    fn loaded_end(&self) -> u64 {
-        let table_start: u64 = self.header.e_phoff(NativeEndian).into();
-        let table_end = table_start.saturating_add(size_of_val(self.segments) as u64);
-        self.segments
-            .iter()
-            .map(|ph| {
-                let (offset, size) = ph.file_range(NativeEndian);
-                offset.saturating_add(size)
-            })
-            .fold(table_end, u64::max)
-    }
-}
-
-/// Ferric Oxide: how many bytes from the start of an object loading reads, given its first
-/// bytes `probe` and its length `size`: up to the end of its program header table or of the
-/// last part of the file a program header covers. The section headers and the sections no
-/// segment holds (debug info, the full symbol table) usually come after, and are not mapped.
-/// When `probe` does not hold the header and program headers, all of `size`, so that parsing
-/// the mapped object reports what is wrong with it.
-pub(super) fn loaded_len(probe: &[u8], size: usize) -> usize {
-    Image::parse(probe)
-        .ok()
-        .and_then(|image| usize::try_from(image.loaded_end()).ok())
-        .map_or(size, |end| end.min(size))
-}
 
 enum HashTable<'a> {
     Gnu(GnuHashTable<'a, FileHeader>),

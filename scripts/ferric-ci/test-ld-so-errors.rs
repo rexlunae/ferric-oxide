@@ -46,7 +46,11 @@ mod platform {
                     return Err(Errno(crate::header::errno::EINTR));
                 }
                 let offset = usize::try_from(offset).unwrap();
-                assert_eq!(offset, s.probed.unwrap_or(0), "reads continue where the last ended");
+                assert_eq!(
+                    offset,
+                    s.probed.unwrap_or(0),
+                    "reads continue where the last ended"
+                );
                 let size = usize::try_from(s.size).unwrap();
                 let count = buf.len().min(s.chunk).min(size.saturating_sub(offset));
                 buf[..count].fill(5);
@@ -137,6 +141,135 @@ mod object_search;
 
 #[path = "../../crates/relibc/src/ld_so/mmap_file.rs"]
 mod mmap_file;
+
+#[path = "../../crates/relibc/src/ld_so/image.rs"]
+mod image;
+
+/// How much of an ELF object the loader maps (`image::loaded_len`), on hand-built objects and
+/// on this test binary, a real ELF file with section headers after its segments.
+mod image_tests {
+    use super::{image::loaded_len, mmap_file::PROBE_LEN};
+
+    const PT_LOAD: u32 = 1;
+    const PT_DYNAMIC: u32 = 2;
+    const PT_NOTE: u32 = 4;
+
+    /// A 64-bit little-endian ELF header at the start of a `len`-byte object, with its
+    /// program header table at `phoff` holding `segments` as (type, offset, file size).
+    fn object(phoff: usize, phnum: u16, segments: &[(u32, u64, u64)], len: usize) -> Vec<u8> {
+        let mut bytes = vec![0; len];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2; // ELFCLASS64
+        bytes[5] = 1; // ELFDATA2LSB
+        bytes[6] = 1; // EV_CURRENT
+        let put16 =
+            |b: &mut Vec<u8>, at: usize, v: u16| b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 =
+            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 =
+            |b: &mut Vec<u8>, at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        put16(&mut bytes, 16, 3); // ET_DYN
+        put16(&mut bytes, 18, 62); // EM_X86_64
+        put32(&mut bytes, 20, 1);
+        put64(&mut bytes, 32, phoff as u64);
+        put64(&mut bytes, 40, (len - 64 * 4) as u64); // section headers at the end
+        put16(&mut bytes, 52, 64);
+        put16(&mut bytes, 54, 56);
+        put16(&mut bytes, 56, phnum);
+        put16(&mut bytes, 58, 64);
+        put16(&mut bytes, 60, 4);
+        for (i, &(kind, offset, size)) in segments.iter().enumerate() {
+            let at = phoff + i * 56;
+            put32(&mut bytes, at, kind);
+            put64(&mut bytes, at + 8, offset);
+            put64(&mut bytes, at + 16, offset);
+            put64(&mut bytes, at + 32, size);
+            put64(&mut bytes, at + 40, size);
+            put64(&mut bytes, at + 48, 0x1000);
+        }
+        bytes
+    }
+
+    fn probe(bytes: &[u8]) -> &[u8] {
+        &bytes[..bytes.len().min(PROBE_LEN)]
+    }
+
+    fn table(segments: &[(u32, u64, u64)]) -> u16 {
+        u16::try_from(segments.len()).unwrap()
+    }
+
+    #[test]
+    fn the_mapping_ends_with_the_last_segment_contents() {
+        let segments = [
+            (PT_LOAD, 0, 0x2000),
+            (PT_LOAD, 0x2000, 0x1800),
+            (PT_DYNAMIC, 0x3000, 0x100),
+        ];
+        let bytes = object(64, table(&segments), &segments, 1 << 20);
+        assert_eq!(loaded_len(probe(&bytes), bytes.len()), 0x3800);
+    }
+
+    #[test]
+    fn every_program_header_counts_not_only_load_segments() {
+        let segments = [(PT_LOAD, 0, 0x2000), (PT_NOTE, 0x5000, 0x20)];
+        let bytes = object(64, table(&segments), &segments, 1 << 20);
+        assert_eq!(loaded_len(probe(&bytes), bytes.len()), 0x5020);
+    }
+
+    #[test]
+    fn the_program_header_table_counts_when_it_ends_last() {
+        let segments = [(PT_LOAD, 0, 0x100)];
+        let bytes = object(0x800, table(&segments), &segments, 1 << 20);
+        assert_eq!(loaded_len(probe(&bytes), bytes.len()), 0x800 + 56);
+    }
+
+    #[test]
+    fn a_segment_past_the_end_of_the_file_maps_only_the_file() {
+        let segments = [(PT_LOAD, 0, 0x3800)];
+        let bytes = object(64, table(&segments), &segments, 0x2000);
+        assert_eq!(loaded_len(probe(&bytes), bytes.len()), 0x2000);
+    }
+
+    /// Whatever the probe cannot parse maps the whole file, so the full parse reports it.
+    #[test]
+    fn unparsable_headers_map_the_whole_file() {
+        let segments = [(PT_LOAD, 0, 0x2000)];
+        let size = 1 << 20;
+        let not_elf = vec![0x55; size];
+        assert_eq!(loaded_len(probe(&not_elf), size), size);
+        let truncated = object(64, table(&segments), &segments, size);
+        assert_eq!(loaded_len(&truncated[..32], size), size);
+        let past_probe = object(PROBE_LEN + 64, table(&segments), &segments, size);
+        assert_eq!(loaded_len(probe(&past_probe), size), size);
+        // PN_XNUM: the real count is in section header 0, at the end of the file.
+        let extended = object(64, 0xffff, &segments, size);
+        assert_eq!(loaded_len(probe(&extended), size), size);
+    }
+
+    /// This test binary is a real ELF object; the mapping covers every segment and stops
+    /// before the section header table.
+    #[test]
+    fn a_real_object_maps_its_segments_and_not_its_section_headers() {
+        let bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let u16_at =
+            |at: usize| usize::from(u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()));
+        let u64_at = |at: usize| {
+            usize::try_from(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())).unwrap()
+        };
+        let (phoff, phentsize, phnum, shoff) = (u64_at(32), u16_at(54), u16_at(56), u64_at(40));
+        let expected = (0..phnum)
+            .map(|i| phoff + i * phentsize)
+            .map(|at| u64_at(at + 8) + u64_at(at + 32))
+            .fold(phoff + phnum * phentsize, usize::max);
+        let len = loaded_len(probe(&bytes), bytes.len());
+        assert_eq!(len, expected);
+        assert!(
+            len <= shoff && shoff < bytes.len(),
+            "{len} {shoff} {}",
+            bytes.len()
+        );
+    }
+}
 
 mod mapping_tests {
     use super::{
