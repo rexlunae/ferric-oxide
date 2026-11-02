@@ -27,8 +27,8 @@
 //! [`Spans::last_seen`] gives its context's last record, where an export can end it.
 //!
 //! Interrupts are not a context's spans: the CPU that takes one and the driver that
-//! acknowledges it are unrelated contexts. [`Interrupt::pair`] pairs each `irq.deliver` with
-//! the `irq.ack` of the same IRQ, CPU and count, the span a driver took to handle it.
+//! acknowledges it are unrelated contexts. [`Interrupts::pair`] pairs each `irq.deliver` with
+//! the `irq.ack` that ends its handling, the span a driver took to handle it.
 
 use std::collections::HashMap;
 
@@ -107,7 +107,7 @@ pub struct Spans {
 }
 
 /// An interrupt's handling: from the `irq.deliver` that woke its `irq:` handles to the
-/// `irq.ack` a driver wrote for it. Records are indices into [`Capture::entries`].
+/// `irq.ack` that ended it. Records are indices into [`Capture::entries`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Interrupt {
     /// The IRQ number.
@@ -117,37 +117,73 @@ pub struct Interrupt {
     pub cpu: u64,
     /// The `irq.deliver` record.
     pub deliver: usize,
-    /// The matching `irq.ack` record, or `None` when the capture ends before it.
+    /// The `irq.ack` that ended it, or `None` when the capture ends before one.
     pub ack: Option<usize>,
 }
 
-impl Interrupt {
-    /// The interrupts of `capture`, in delivery order.
+/// The interrupts of a capture, paired by [`Interrupts::pair`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Interrupts {
+    /// The deliveries that woke a handle, in delivery order.
+    pub interrupts: Vec<Interrupt>,
+    /// Acknowledgements of a count whose delivery is not in the capture: it came before the
+    /// capture started, or its record was lost.
+    pub unmatched_acks: u64,
+}
+
+impl Interrupts {
+    /// Pairs the `irq.deliver` and `irq.ack` records of `capture`.
     ///
-    /// A delivery is matched with the next `irq.ack` of the same IRQ, CPU and count, as the
-    /// event's documentation says: a later interrupt of the IRQ raises the count. A delivery
-    /// that woke no handle is left out, since nothing will acknowledge it, and so is an
-    /// acknowledgement whose delivery is not in the capture.
-    pub fn pair(capture: &Capture) -> Vec<Self> {
-        let mut interrupts = Vec::new();
-        let mut waiting: HashMap<(u64, u64, u64), usize> = HashMap::new();
+    /// The kernel counts the interrupts of each IRQ and CPU, and a driver acknowledges the
+    /// count it read; the kernel records an acknowledgement only of the current count. So an
+    /// `irq.ack` ends the delivery of the same IRQ, CPU and count and, when a later interrupt
+    /// raised the count before the driver got to an earlier one, those earlier deliveries
+    /// too: the driver's acknowledgement of the earlier count was refused and not recorded,
+    /// and this one covers them.
+    ///
+    /// A delivery that woke no handle is left out, since nothing will acknowledge it. When
+    /// several handles share an IRQ, each acknowledges the same count; the first ends the
+    /// interrupt and the others are neither paired nor counted as unmatched.
+    pub fn pair(capture: &Capture) -> Self {
+        let mut pairs = Self::default();
+        // Deliveries not yet acknowledged, by (IRQ, CPU), oldest first, with their counts.
+        let mut waiting: HashMap<(u64, u64), Vec<(u64, usize)>> = HashMap::new();
+        // The count each (IRQ, CPU) was last acknowledged with.
+        let mut acknowledged: HashMap<(u64, u64), u64> = HashMap::new();
         for (index, entry) in capture.entries().iter().enumerate() {
             let id = entry.event.id();
+            let source = (entry.arg(0), entry.arg(1));
             if id == IRQ_DELIVER.id() && entry.arg(4) != 0 {
-                waiting.insert((entry.arg(0), entry.arg(1), entry.arg(3)), interrupts.len());
-                interrupts.push(Self {
-                    irq: entry.arg(0),
-                    cpu: entry.arg(1),
+                waiting
+                    .entry(source)
+                    .or_default()
+                    .push((entry.arg(3), pairs.interrupts.len()));
+                pairs.interrupts.push(Interrupt {
+                    irq: source.0,
+                    cpu: source.1,
                     deliver: index,
                     ack: None,
                 });
-            } else if id == IRQ_ACK.id()
-                && let Some(at) = waiting.remove(&(entry.arg(0), entry.arg(1), entry.arg(2)))
-            {
-                interrupts[at].ack = Some(index);
+            } else if id == IRQ_ACK.id() {
+                let count = entry.arg(2);
+                let mut ended = false;
+                if let Some(deliveries) = waiting.get_mut(&source) {
+                    deliveries.retain(|&(delivered, at)| {
+                        let covered = delivered <= count;
+                        if covered {
+                            pairs.interrupts[at].ack = Some(index);
+                            ended = true;
+                        }
+                        !covered
+                    });
+                }
+                if !ended && acknowledged.get(&source) != Some(&count) {
+                    pairs.unmatched_acks += 1;
+                }
+                acknowledged.insert(source, count);
             }
         }
-        interrupts
+        pairs
     }
 }
 
@@ -519,6 +555,15 @@ mod tests {
         assert_eq!(request.end, Some(5));
     }
 
+    fn interrupt(irq: u64, deliver: usize, ack: Option<usize>) -> Interrupt {
+        Interrupt {
+            irq,
+            cpu: 0,
+            deliver,
+            ack,
+        }
+    }
+
     #[test]
     fn interrupts_pair_by_irq_cpu_and_count() {
         let capture = capture(&[
@@ -537,21 +582,58 @@ mod tests {
             ]),
         ]);
         assert_eq!(
-            Interrupt::pair(&capture),
-            [
-                Interrupt {
-                    irq: 11,
-                    cpu: 0,
-                    deliver: 0,
-                    ack: Some(3),
-                },
-                Interrupt {
-                    irq: 11,
-                    cpu: 0,
-                    deliver: 4,
-                    ack: None,
-                },
-            ]
+            Interrupts::pair(&capture),
+            Interrupts {
+                interrupts: vec![interrupt(11, 0, Some(3)), interrupt(11, 4, None)],
+                unmatched_acks: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_later_count_ends_the_deliveries_it_overtook() {
+        let capture = capture(&[bytes(&[
+            (&IRQ_DELIVER, 100, &[11, 0, 1, 5, 1]),
+            // Count 6 arrives before the driver acknowledged 5, so the kernel refused that
+            // acknowledgement; 7 is for another CPU's count.
+            (&IRQ_DELIVER, 110, &[11, 0, 1, 6, 1]),
+            (&IRQ_DELIVER, 115, &[11, 1, 1, 7, 1]),
+            (&IRQ_ACK, 150, &[11, 0, 6]),
+            (&IRQ_DELIVER, 160, &[11, 0, 1, 7, 1]),
+        ])]);
+        assert_eq!(
+            Interrupts::pair(&capture),
+            Interrupts {
+                interrupts: vec![
+                    interrupt(11, 0, Some(3)),
+                    interrupt(11, 1, Some(3)),
+                    Interrupt {
+                        irq: 11,
+                        cpu: 1,
+                        deliver: 2,
+                        ack: None,
+                    },
+                    interrupt(11, 4, None),
+                ],
+                unmatched_acks: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn handles_sharing_an_irq_acknowledge_it_once_each() {
+        let capture = capture(&[bytes(&[
+            // Two handles woken; both drivers acknowledge count 5.
+            (&IRQ_DELIVER, 100, &[11, 0, 1, 5, 2]),
+            (&IRQ_ACK, 140, &[11, 0, 5]),
+            (&IRQ_ACK, 150, &[11, 0, 5]),
+        ])]);
+        assert_eq!(
+            Interrupts::pair(&capture),
+            Interrupts {
+                interrupts: vec![interrupt(11, 0, Some(1))],
+                unmatched_acks: 0,
+            }
         );
     }
 

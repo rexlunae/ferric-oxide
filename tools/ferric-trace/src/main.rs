@@ -326,6 +326,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             let stdout = io::stdout();
             let mut out = BufWriter::new(stdout.lock());
             Latencies::new(&capture, rate)
+                .with_losses(counts::losses(&inputs))
                 .write(&mut out)
                 .and_then(|()| out.flush())
                 .map_err(|source| CliError::Write {

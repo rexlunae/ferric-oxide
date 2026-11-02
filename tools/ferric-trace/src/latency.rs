@@ -11,14 +11,19 @@
 //!   kernel accepting the answer.
 //! - **`wake_run`**, by the CPU it ran on: `sched.wake_run`'s `wait`, from a context being made
 //!   runnable to it running.
-//! - **`irq`**, by IRQ: from `irq.deliver` to the `irq.ack` of the same IRQ, CPU and count
-//!   ([`Interrupt::pair`]): how long a driver took to handle an interrupt.
+//! - **`irq`**, by IRQ: from `irq.deliver` to the `irq.ack` that ended it ([`Interrupts::pair`]):
+//!   how long a driver took to handle an interrupt. When a later interrupt of the IRQ came
+//!   first, the acknowledgement of the later one ends both.
 //!
 //! [`Latencies::write`] prints one line per key and a merged `all` line per kind, with
 //! integer-only `key=value` fields like the `counts` view's, from `ferric_iobench`'s
 //! fio-layout [`Histogram`]: the minimum, mean and maximum are exact, and a percentile is the
 //! middle of the bucket its rank falls in, within 1/64 of the true value (clamped to the
-//! minimum and maximum). Some lines of the test fixture capture
+//! minimum and maximum). The rank is the nearest rank, rounded up: with fewer than 100
+//! intervals `p99` is the longest, and the median of an even count is the lower middle one.
+//! Durations above about 17 s share the histogram's last bucket, so a percentile that falls
+//! there reads as about 17 s; the mean and maximum stay exact. Some lines of the test fixture
+//! capture
 //! (`tools/ferric-trace/tests/fixtures/latency`):
 //!
 //! ```text
@@ -39,7 +44,13 @@
 //! that started in the capture and had not ended by its last record (a call still blocked, an
 //! unanswered request), and the `all` line's `unmatched` counts ends whose start the capture
 //! does not have. Neither is in the histogram. Both grow when the rings dropped records, so a
-//! capture with `lost` records (see the `counts` view) reads as a sample, not a census.
+//! capture with lost records reads as a sample, not a census: when the capture directories
+//! hold the drain's `stats.start` and `stats.end` snapshots, the view starts with a
+//! `latency lost cpu=<n> lost_before=<n> lost_during=<n>` line per CPU, as the `counts` view
+//! reports them ([`counts::losses`](crate::counts::losses)). A lost record can also pair two
+//! records that do not belong together (an exit whose enter was lost closes an older call of
+//! the same number whose exit was lost), so read the distributions of a lossy capture with
+//! care.
 //!
 //! Attributing a call to a context needs `sched.switch` in the capture. Without it, every call
 //! on a CPU is one context's, and a call that blocks while another context makes a call of a
@@ -49,13 +60,13 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 use ferric_iobench::latency::Histogram;
-use ferric_trace::kernel::{IRQ_ACK, SCHED_WAKE_RUN, SCHEME_RESPONSE, SYSCALL_EXIT};
+use ferric_trace::kernel::{SCHED_WAKE_RUN, SCHEME_RESPONSE, SYSCALL_EXIT};
 
 use crate::capture::Capture;
 use crate::counts::ticks_to_ns;
 use crate::describe;
 use crate::perfetto::TickRate;
-use crate::spans::{Interrupt, SpanKind, Spans};
+use crate::spans::{Interrupts, SpanKind, Spans};
 
 /// The intervals of one key: their durations, and how many had not ended.
 #[derive(Clone, Debug, Default)]
@@ -178,6 +189,8 @@ pub struct Latencies {
     wake_run: BTreeMap<u32, Histogram>,
     /// Interrupts by IRQ.
     irqs: Kind<u64>,
+    /// Each CPU's records lost before and during the drain, when the capture recorded them.
+    losses: BTreeMap<u32, (u64, u64)>,
 }
 
 impl Latencies {
@@ -205,11 +218,14 @@ impl Latencies {
             }
         }
         let mut irqs = Kind::new();
-        for interrupt in Interrupt::pair(capture) {
+        let interrupts = Interrupts::pair(capture);
+        for interrupt in interrupts.interrupts {
             irqs.record(interrupt.irq, duration(interrupt.deliver, interrupt.ack));
         }
+        // One acknowledgement can end several deliveries, so `pair` counts the unmatched ones.
+        irqs.unmatched = interrupts.unmatched_acks;
         let mut wake_run: BTreeMap<u32, Histogram> = BTreeMap::new();
-        let (mut exits, mut responses, mut acks) = (0, 0, 0);
+        let (mut exits, mut responses) = (0, 0);
         for entry in entries {
             let id = entry.event.id();
             if id == SCHED_WAKE_RUN.id() {
@@ -221,28 +237,41 @@ impl Latencies {
                 exits += 1;
             } else if id == SCHEME_RESPONSE.id() {
                 responses += 1;
-            } else if id == IRQ_ACK.id() {
-                acks += 1;
             }
         }
         syscalls.set_ends(exits);
         requests.set_ends(responses);
-        irqs.set_ends(acks);
         Self {
             syscalls,
             requests,
             wake_run,
             irqs,
+            losses: BTreeMap::new(),
         }
     }
 
-    /// Writes the view to `out`, as the module documents: system calls, scheme requests,
-    /// wake-ups and interrupts, each kind only when the capture has any.
+    /// Adds each CPU's `(lost_before, lost_during)` records, as
+    /// [`counts::losses`](crate::counts::losses) reads them, to print before the histograms.
+    #[must_use]
+    pub fn with_losses(mut self, losses: BTreeMap<u32, (u64, u64)>) -> Self {
+        self.losses = losses;
+        self
+    }
+
+    /// Writes the view to `out`, as the module documents: the losses, if any were added,
+    /// then system calls, scheme requests, wake-ups and interrupts, each kind only when the
+    /// capture has any.
     ///
     /// # Errors
     ///
     /// The error of a failed write.
     pub fn write(&self, out: &mut impl Write) -> io::Result<()> {
+        for (cpu, (before, during)) in &self.losses {
+            writeln!(
+                out,
+                "latency lost cpu={cpu} lost_before={before} lost_during={during}"
+            )?;
+        }
         self.syscalls.write(
             out,
             "syscall",
@@ -289,7 +318,7 @@ impl Latencies {
 mod tests {
     use ferric_trace::clock::ClockLine;
     use ferric_trace::kernel::{
-        IRQ_DELIVER, SCHED_SWITCH, SCHEME_REQUEST, SYSCALL_ENTER, SYSCALL_EXIT,
+        IRQ_ACK, IRQ_DELIVER, SCHED_SWITCH, SCHEME_REQUEST, SYSCALL_ENTER, SYSCALL_EXIT,
     };
 
     use super::*;
@@ -366,6 +395,45 @@ mod tests {
              p90_ns=0 p99_ns=0 max_ns=0\n\
              latency scheme scheme=all opcode=all count=1 open=1 unmatched=1 min_ns=200 \
              mean_ns=200 p50_ns=200 p90_ns=200 p99_ns=200 max_ns=200\n"
+        );
+    }
+
+    #[test]
+    fn losses_come_first() {
+        let cpu0 = bytes(&[(&SCHED_WAKE_RUN, 5, &[3, 7, 40])]);
+        let capture = Capture::from_cpus(vec![CpuCapture::decode(0, &cpu0).expect("valid")]);
+        let rate = TickRate::for_clock(None, TscMhz::new(1000.0).expect("mhz"));
+        let mut out = Vec::new();
+        Latencies::new(&capture, rate)
+            .with_losses(BTreeMap::from([(0, (3, 0)), (1, (0, 12))]))
+            .write(&mut out)
+            .expect("writes");
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8"),
+            "latency lost cpu=0 lost_before=3 lost_during=0\n\
+             latency lost cpu=1 lost_before=0 lost_during=12\n\
+             latency wake_run cpu=0 count=1 min_ns=40 mean_ns=40 p50_ns=40 p90_ns=40 \
+             p99_ns=40 max_ns=40\n\
+             latency wake_run cpu=all count=1 min_ns=40 mean_ns=40 p50_ns=40 p90_ns=40 \
+             p99_ns=40 max_ns=40\n"
+        );
+    }
+
+    #[test]
+    fn overtaken_and_shared_interrupts_are_not_open_or_unmatched() {
+        let cpu0 = bytes(&[
+            (&IRQ_DELIVER, 100, &[11, 0, 1, 5, 2]),
+            (&IRQ_DELIVER, 110, &[11, 0, 1, 6, 2]),
+            // Both handles acknowledge count 6, which covers 5 as well.
+            (&IRQ_ACK, 130, &[11, 0, 6]),
+            (&IRQ_ACK, 135, &[11, 0, 6]),
+        ]);
+        assert_eq!(
+            view(&[cpu0], None),
+            "latency irq irq=11 count=2 open=0 min_ns=20 mean_ns=25 p50_ns=20 p90_ns=30 \
+             p99_ns=30 max_ns=30\n\
+             latency irq irq=all count=2 open=0 unmatched=0 min_ns=20 mean_ns=25 p50_ns=20 \
+             p90_ns=30 p99_ns=30 max_ns=30\n"
         );
     }
 
