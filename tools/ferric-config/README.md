@@ -155,10 +155,11 @@ see the book's [boot reproduction guide](../../docs/src/ferric-testing.md#reprod
 
 | Option kind | Mechanism |
 | --- | --- |
-| Make variables (`ARCH`, `CONFIG_NAME`, `PODMAN_BUILD`, `REPO_*`, `QEMU_*`, ...) | `build/ferric/config.mk`, included near the top of `mk/config.mk`. Values use `?=`, so `.config` and the command line still win; `check` warns when `.config` shadows one. |
+| Make variables (`ARCH`, `CONFIG_NAME`, `PODMAN_BUILD`, `REPO_*`, `QEMU_*`, ...) | `build/ferric/config.mk`, included near the top of `mk/config.mk`. Values use `?=`, so `.config` and the command line still win; `check` warns when `.config` shadows one. A variable that one option assigns and others append to (`make_append`) is written once, with the appended words after the value. |
 | Image contents | `build/ferric/filesystem.toml` includes the base `config/…/<name>.toml` and adds packages, `"ignore"` entries and `[general]` overrides. It becomes `FILESYSTEM_CONFIG`. |
 | Processor baseline and extra flags | `FERRIC_TARGET_RUSTFLAGS` and `FERRIC_TARGET_CPPFLAGS`, appended by the cookbook prescript (`tools/cookbook/src/cook/script.rs`) for every package built for the target, except the recipes in `cpu.flags_exclude` (the kernel and bootloader). C, C++, CMake, Meson and the `cc` crate all read `CPPFLAGS`. |
 | Kernel Cargo features | `FERRIC_KERNEL_FEATURES`, passed by `recipes/core/kernel/recipe.toml` as `KERNEL_CARGO_FEATURES` together with `--no-default-features`, so turning a default feature off works. |
+| Trace-mode kernel (`kernel.trace_mode`) | `FERRIC_TRACE_KERNEL_FEATURES`: the kernel's features plus `trace`, `trace_mode`, every `trace_<subsystem>`, the default level's `trace_level_*` and `trace_crash`, without `profiling`. `recipes/core/kernel-trace` builds it into `usr/lib/boot/kernel-trace`; options that rebuild the kernel rebuild it too, and it is added to `cpu.flags_exclude`. See the book's [Trace mode](../../docs/src/ferric-tracing.md#trace-mode). |
 | Kernel CPU feature policy | `build/ferric/kernel-config.toml`, copied into the kernel source as `config.toml`, which the kernel's `build.rs` reads (`always`/`auto`/`never` for SMAP, FSGSBASE, XSAVE, XSAVEOPT). |
 
 Make passes explicit `ARCH`, `BOARD` and `CONFIG_NAME` assignments (including

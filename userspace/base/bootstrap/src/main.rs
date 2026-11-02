@@ -174,4 +174,15 @@ impl KernelSchemeMap {
     fn get(&self, scheme: GlobalSchemes) -> Option<&FdGuard> {
         self.0.get(&scheme)
     }
+    /// Ferric Oxide: the kernel's trace scheme (`kernel.trace`), which only a kernel built with
+    /// tracing has. The in-tree redox_syscall numbers it (`GlobalSchemes::Trace`); an older one
+    /// lists it by name.
+    fn trace(&self) -> Option<&FdGuard> {
+        self.get(GlobalSchemes::Trace).or_else(|| {
+            self.1
+                .iter()
+                .find(|(name, _)| *name == ferric_trace::abi::SCHEME_NAME)
+                .map(|(_, fd)| fd)
+        })
+    }
 }

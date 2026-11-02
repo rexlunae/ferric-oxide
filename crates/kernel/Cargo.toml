@@ -150,6 +150,10 @@ trace_crash_test = ["trace_crash"]
 # Ferric Oxide: everything the kernel logs is also kept in reserved memory that survives a warm
 # reboot, served by sys:log_previous on the next boot.
 log_persist = ["dep:ferric-trace"]
+# Ferric Oxide: this is the trace-mode kernel (`kernel.trace_mode`), the second kernel an image
+# carries for the bootloader to load with FERRIC_KERNEL=trace. Its only code of its own is the
+# `trace: trace-mode kernel` line it logs at boot, which tells a harness which kernel runs.
+trace_mode = ["trace"]
 # Ferric Oxide: the most verbose tracepoint level compiled in; with none, only errors.
 trace_level_warn = ["trace"]
 trace_level_info = ["trace_level_warn"]

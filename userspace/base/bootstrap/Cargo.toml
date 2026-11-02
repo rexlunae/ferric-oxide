@@ -21,6 +21,8 @@ redox-scheme = { version = "0.11.2", default-features = false }
 redox-path = "0.4.0"
 slab = { version = "0.4.9", default-features = false }
 arrayvec = { version = "0.7.6", default-features = false }
+# Ferric Oxide: the size of the boot environment bootstrap reads (ferric_abi::boot_env).
+ferric-abi = { path = "../../../crates/abi" }
 # Ferric Oxide: the kernel iommu scheme's number and name.
 ferric-iommu = { path = "../../../crates/iommu" }
 # Ferric Oxide: the kernel regbuf scheme's number and name.

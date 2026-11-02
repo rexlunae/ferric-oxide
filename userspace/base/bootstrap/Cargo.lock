@@ -19,6 +19,7 @@ name = "bootstrap"
 version = "0.0.0"
 dependencies = [
  "arrayvec",
+ "ferric-abi",
  "ferric-iommu",
  "ferric-pcache",
  "ferric-regbuf",
@@ -36,6 +37,10 @@ dependencies = [
  "redox_syscall",
  "slab",
 ]
+
+[[package]]
+name = "ferric-abi"
+version = "0.1.0"
 
 [[package]]
 name = "ferric-iommu"

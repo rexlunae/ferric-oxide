@@ -132,7 +132,12 @@ fn env_value<'a>(env: &'a [u8], key: &str) -> Option<&'a str> {
 
 /// Turns on the events the build-time default (`trace.boot` in the kernel's `config.toml`) and
 /// the boot environment's `FERRIC_TRACE` select. Runs on the BSP before the other CPUs start.
+/// The trace-mode kernel (`trace_mode`) first logs the line `trace: trace-mode kernel`.
 pub fn init_boot(env: &[u8]) {
+    // The harness's proof that the bootloader loaded the trace-mode kernel. Written without
+    // `info!`'s module prefix, so the log line is exactly this text.
+    #[cfg(feature = "trace_mode")]
+    crate::println!("trace: trace-mode kernel");
     let sources = [
         ("trace.boot", option_env!("FERRIC_TRACE_BOOT").unwrap_or("")),
         ("FERRIC_TRACE", env_value(env, "FERRIC_TRACE").unwrap_or("")),

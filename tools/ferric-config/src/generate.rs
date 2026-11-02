@@ -5,6 +5,11 @@
 //! - `kernel-config.toml`: the kernel's config.toml (CPU feature policy)
 //! - `trace.toml`: the initfs trace configuration bootstrap applies (`ferric_trace::config`)
 //!
+//! With `kernel.trace_mode`, `config.mk` also exports `FERRIC_TRACE_KERNEL_FEATURES`, the
+//! features `recipes/core/kernel-trace` builds the trace-mode kernel with: the kernel's own
+//! plus tracing (see [`trace_kernel_features`]). That kernel shares the kernel's
+//! `kernel-config.toml` and link arguments, and is rebuilt whenever the kernel is.
+//!
 //! Applied per-recipe fingerprints live at `build/ferric-rebuild-state.toml`
 //! under the build root, independently of the generated output directory.
 //! Every output shares the recipe tree and therefore the same rebuild baseline.
@@ -19,11 +24,27 @@ use crate::value::Value;
 
 const REBUILD_STATE: &str = "build/ferric-rebuild-state.toml";
 
+/// The kernel's recipe.
+const KERNEL_RECIPE: &str = "kernel";
+/// The trace-mode kernel's recipe (`kernel.trace_mode`), built from the kernel's options too.
+const TRACE_KERNEL_RECIPE: &str = "kernel-trace";
+/// The option that adds the trace-mode kernel.
+const TRACE_MODE_OPTION: &str = "kernel.trace_mode";
+/// The option whose default is the trace-mode kernel's tracepoint level.
+const TRACE_LEVEL_OPTION: &str = "kernel.trace_max_level";
+/// The kernel features the trace-mode kernel always has, besides each subsystem's and the
+/// level's: tracing itself, the boot log line saying which kernel runs, and the crash dump.
+const TRACE_KERNEL_FEATURES: [&str; 3] = ["trace", "trace_mode", "trace_crash"];
+/// Kernel features that cannot be combined with `trace`, which the trace-mode kernel drops.
+const CONFLICTS_WITH_TRACE: [&str; 1] = ["profiling"];
+
 #[derive(Debug, Default)]
 pub struct Output {
     pub make: Vec<(String, String)>,
     pub make_append: BTreeMap<String, Vec<String>>,
     pub kernel_features: BTreeSet<String>,
+    /// The trace-mode kernel's features, when `kernel.trace_mode` is on.
+    pub trace_kernel_features: Option<BTreeSet<String>>,
     pub kernel_config: BTreeMap<String, String>,
     /// The initfs `trace.toml`'s keys and their selections.
     pub trace_config: BTreeMap<String, Vec<String>>,
@@ -168,12 +189,54 @@ pub fn collect(schema: &Schema, r: &Resolved) -> Result<Output, Vec<Diag>> {
             "package {both} is both added and removed"
         )));
     }
+    if r.lookup(schema, TRACE_MODE_OPTION) == Some(Value::Bool(true)) {
+        out.trace_kernel_features = Some(trace_kernel_features(schema, &out.kernel_features));
+    }
+    // The trace-mode kernel is built from every option the kernel is.
+    if let Some(kernel) = prints.get(KERNEL_RECIPE).cloned() {
+        prints
+            .entry(TRACE_KERNEL_RECIPE.to_owned())
+            .or_default()
+            .push_str(&kernel);
+    }
     out.fingerprints = prints.into_iter().map(|(k, v)| (k, fnv(&v))).collect();
     if errors.is_empty() {
         Ok(out)
     } else {
         Err(errors)
     }
+}
+
+/// The trace-mode kernel's features: the image kernel's `kernel_features` without those that
+/// conflict with tracing, plus [`TRACE_KERNEL_FEATURES`], every trace subsystem and the
+/// default of `kernel.trace_max_level`.
+pub fn trace_kernel_features(
+    schema: &Schema,
+    kernel_features: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let default_level = schema
+        .get(TRACE_LEVEL_OPTION)
+        .map(|option| option.default.render())
+        .and_then(|name| {
+            ferric_trace::Level::ALL
+                .into_iter()
+                .find(|level| level.name() == name)
+        })
+        .and_then(ferric_trace::Level::kernel_feature);
+    let mut features: BTreeSet<String> = kernel_features
+        .iter()
+        .filter(|feature| !CONFLICTS_WITH_TRACE.contains(&feature.as_str()))
+        .cloned()
+        .collect();
+    let subsystems = ferric_trace::Subsystem::ALL.map(ferric_trace::Subsystem::kernel_feature);
+    features.extend(
+        TRACE_KERNEL_FEATURES
+            .into_iter()
+            .chain(subsystems)
+            .chain(default_level)
+            .map(str::to_owned),
+    );
+    features
 }
 
 /// Mirrors the FILESYSTEM_CONFIG selection in mk/config.mk.
@@ -365,11 +428,16 @@ pub fn plan(schema: &Schema, r: &Resolved, root: &Path, out_dir: &Path) -> Resul
         k if k.starts_with("FERRIC_") || k == "QEMU_CPU" => 2,
         _ => 1,
     };
+    // A variable that is both assigned and appended to is written once, with both.
+    let with_appended = |k: &str, v: &str| match out.make_append.get(k) {
+        Some(parts) => format!("{v} {}", parts.join(" ")),
+        None => v.to_owned(),
+    };
     let mut plain_vars: Vec<_> = out.make.iter().filter(|(k, _)| order(k) < 2).collect();
     plain_vars.sort_by_key(|(k, _)| order(k));
     let target_vars: Vec<_> = out.make.iter().filter(|(k, _)| order(k) == 2).collect();
     for (k, v) in &plain_vars {
-        mk.push_str(&format!("{k}?={}\n", make_escape(v)));
+        mk.push_str(&format!("{k}?={}\n", make_escape(&with_appended(k, v))));
     }
     mk.push_str("\n# The rest only applies to the configured target.\n");
     mk.push_str("ifeq ($(ARCH)|$(BOARD)|$(CONFIG_NAME),$(FERRIC_ARCH)|$(FERRIC_BOARD)|$(FERRIC_CONFIG_NAME))\n");
@@ -378,23 +446,31 @@ pub fn plan(schema: &Schema, r: &Resolved, root: &Path, out_dir: &Path) -> Resul
         fs_path.to_string_lossy()
     ));
     for (k, v) in &target_vars {
+        let v = with_appended(k, v);
         if k.starts_with("FERRIC_") {
-            mk.push_str(&format!("export {k}:={}\n", make_escape(v)));
+            mk.push_str(&format!("export {k}:={}\n", make_escape(&v)));
         } else {
-            mk.push_str(&format!("{k}?={}\n", make_escape(v)));
+            mk.push_str(&format!("{k}?={}\n", make_escape(&v)));
         }
     }
     for (k, parts) in &out.make_append {
+        if out.make.iter().any(|(assigned, _)| assigned == k) {
+            continue;
+        }
         mk.push_str(&format!("export {k}:={}\n", make_escape(&parts.join(" "))));
     }
+    let features =
+        |features: &BTreeSet<String>| features.iter().cloned().collect::<Vec<_>>().join(",");
     mk.push_str(&format!(
         "export FERRIC_KERNEL_FEATURES:={}\n",
-        out.kernel_features
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(",")
+        features(&out.kernel_features)
     ));
+    if let Some(trace_features) = &out.trace_kernel_features {
+        mk.push_str(&format!(
+            "export FERRIC_TRACE_KERNEL_FEATURES:={}\n",
+            features(trace_features)
+        ));
+    }
     if have_kernel_config {
         mk.push_str(&format!(
             "export FERRIC_KERNEL_CONFIG:={}\n",
@@ -1121,6 +1197,155 @@ mod tests {
         user.insert("kernel.trace_crash".into(), Value::Bool(true));
         let out = collect(&s, &resolve(&s, &user)).unwrap();
         assert!(!out.kernel_features.iter().any(|f| f.starts_with("trace")));
+    }
+
+    fn user(values: &[(&str, Value)]) -> BTreeMap<String, Value> {
+        values
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn no_trace_kernel_by_default() {
+        let s = real_schema();
+        let r = resolve(&s, &BTreeMap::new());
+        let generated = plan(&s, &r, &root(), Path::new("build/ferric")).unwrap();
+        let mk = file(&generated, "config.mk");
+        assert!(!mk.contains("FERRIC_TRACE_KERNEL_FEATURES"), "{mk}");
+        assert!(
+            mk.contains("export FERRIC_TARGET_FLAGS_EXCLUDE:=kernel bootloader\n"),
+            "{mk}"
+        );
+        assert!(!file(&generated, "filesystem.toml").contains("kernel-trace"));
+    }
+
+    #[test]
+    fn trace_mode_adds_a_traced_second_kernel() {
+        let s = real_schema();
+        let r = resolve(&s, &user(&[("kernel.trace_mode", Value::Bool(true))]));
+        let generated = plan(&s, &r, &root(), Path::new("build/ferric")).unwrap();
+        let mk = file(&generated, "config.mk");
+        // The normal kernel is untouched.
+        assert!(
+            mk.contains("export FERRIC_KERNEL_FEATURES:=acpi,aslr,kaslr,multi_core,prot_none,self_modifying,serial_debug,x86_kvm_pv\n"),
+            "{mk}"
+        );
+        assert!(
+            mk.contains("export FERRIC_TRACE_KERNEL_FEATURES:=acpi,aslr,kaslr,multi_core,prot_none,self_modifying,serial_debug,trace,trace_crash,trace_iommu,trace_irq,trace_level_info,trace_mm,trace_mode,trace_sched,trace_scheme,trace_syscall,x86_kvm_pv\n"),
+            "{mk}"
+        );
+        // Only for the configured target, like the kernel's own features.
+        let guard = mk.find("ifeq (").unwrap();
+        assert!(
+            mk.find("FERRIC_TRACE_KERNEL_FEATURES").unwrap() > guard,
+            "{mk}"
+        );
+        // It is a kernel, so it never gets the userspace CPU flags; the variable is written once.
+        assert!(
+            mk.contains("export FERRIC_TARGET_FLAGS_EXCLUDE:=kernel bootloader kernel-trace\n"),
+            "{mk}"
+        );
+        assert_eq!(mk.matches("FERRIC_TARGET_FLAGS_EXCLUDE").count(), 1, "{mk}");
+        // It exists only in this repository, so it always builds from source.
+        let fs = file(&generated, "filesystem.toml");
+        assert!(fs.contains("kernel-trace = \"source\"\n"), "{fs}");
+    }
+
+    #[test]
+    fn the_trace_kernel_adds_to_the_image_kernels_features() {
+        let s = real_schema();
+        // Profiling cannot be combined with tracing: only the normal kernel keeps it.
+        let r = resolve(
+            &s,
+            &user(&[
+                ("kernel.trace_mode", Value::Bool(true)),
+                ("kernel.profiling", Value::Bool(true)),
+            ]),
+        );
+        let out = collect(&s, &r).unwrap();
+        assert!(out.kernel_features.contains("profiling"));
+        let traced = out.trace_kernel_features.unwrap();
+        assert!(!traced.contains("profiling"), "{traced:?}");
+        assert!(traced.is_superset(&BTreeSet::from(TRACE_KERNEL_FEATURES.map(String::from))));
+
+        // A traced image kernel's own choices are kept, and every subsystem is added.
+        let r = resolve(
+            &s,
+            &user(&[
+                ("kernel.trace_mode", Value::Bool(true)),
+                ("kernel.trace", Value::Bool(true)),
+                ("kernel.trace_mm", Value::Bool(false)),
+                ("kernel.trace_max_level", Value::Str("debug".into())),
+                ("kernel.trace_crash_test", Value::Bool(true)),
+                ("kernel.trace_crash", Value::Bool(true)),
+            ]),
+        );
+        let out = collect(&s, &r).unwrap();
+        assert!(!out.kernel_features.contains("trace_mm"));
+        let traced = out.trace_kernel_features.unwrap();
+        assert!(traced.is_superset(&out.kernel_features), "{traced:?}");
+        for feature in [
+            "trace_mm",
+            "trace_level_debug",
+            "trace_level_info",
+            "trace_mode",
+        ] {
+            assert!(traced.contains(feature), "{feature}: {traced:?}");
+        }
+    }
+
+    #[test]
+    fn trace_kernel_features_exist_in_the_kernel_manifest() {
+        let manifest: toml::Table =
+            toml::from_str(include_str!("../../../crates/kernel/Cargo.toml")).unwrap();
+        let declared = manifest["features"].as_table().unwrap();
+        let s = real_schema();
+        let traced = trace_kernel_features(&s, &BTreeSet::new());
+        assert!(traced.contains("trace_level_info"), "{traced:?}");
+        for feature in &traced {
+            assert!(declared.contains_key(feature), "{feature}");
+        }
+        // trace_mode implies trace in the kernel, as the catalog option says.
+        let trace_mode = declared["trace_mode"].as_array().unwrap();
+        assert!(trace_mode.iter().any(|f| f.as_str() == Some("trace")));
+    }
+
+    #[test]
+    fn the_trace_kernel_rebuilds_with_the_kernel() {
+        let s = real_schema();
+        let fingerprints = |values: &[(&str, Value)]| {
+            let mut values = values.to_vec();
+            values.push(("kernel.trace_mode", Value::Bool(true)));
+            collect(&s, &resolve(&s, &user(&values)))
+                .unwrap()
+                .fingerprints
+        };
+        let before = fingerprints(&[]);
+        let numa = fingerprints(&[("kernel.numa", Value::Bool(true))]);
+        assert_ne!(before[KERNEL_RECIPE], numa[KERNEL_RECIPE]);
+        assert_ne!(before[TRACE_KERNEL_RECIPE], numa[TRACE_KERNEL_RECIPE]);
+        // Turning it on rebuilds only the trace-mode kernel.
+        let off = collect(&s, &resolve(&s, &BTreeMap::new()))
+            .unwrap()
+            .fingerprints;
+        assert_eq!(off[KERNEL_RECIPE], before[KERNEL_RECIPE]);
+        assert_ne!(off[TRACE_KERNEL_RECIPE], before[TRACE_KERNEL_RECIPE]);
+    }
+
+    #[test]
+    fn fw_cfg_env_is_a_bootloader_feature() {
+        let s = real_schema();
+        let r = resolve(&s, &user(&[("bootloader.fw_cfg_env", Value::Bool(true))]));
+        let generated = plan(&s, &r, &root(), Path::new("build/ferric")).unwrap();
+        let mk = file(&generated, "config.mk");
+        assert!(
+            mk.contains("export FERRIC_BOOTLOADER_FEATURES:=kaslr fw_cfg_env\n"),
+            "{mk}"
+        );
+        let r = resolve(&s, &BTreeMap::new());
+        let generated = plan(&s, &r, &root(), Path::new("build/ferric")).unwrap();
+        assert!(!file(&generated, "config.mk").contains("fw_cfg_env"));
     }
 
     #[test]

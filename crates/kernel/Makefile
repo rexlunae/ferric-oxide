@@ -92,11 +92,15 @@ check:
 clean:
 	rm -rf build sysroot target config.toml
 
+# Ferric Oxide: the file name the kernel is installed under in usr/lib/boot, with .all and .sym
+# beside it. recipes/core/kernel-trace installs the trace-mode kernel as kernel-trace.
+KERNEL_INSTALL_NAME?=kernel
+
 install: all
 	@mkdir -pv "$(DESTDIR)/usr/lib/boot/"
-	cp -v $(BUILD)/kernel.all "$(DESTDIR)/usr/lib/boot/"
-	cp -v $(BUILD)/kernel.sym "$(DESTDIR)/usr/lib/boot/"
-	cp -v $(BUILD)/kernel "$(DESTDIR)/usr/lib/boot/"
+	cp -v $(BUILD)/kernel.all "$(DESTDIR)/usr/lib/boot/$(KERNEL_INSTALL_NAME).all"
+	cp -v $(BUILD)/kernel.sym "$(DESTDIR)/usr/lib/boot/$(KERNEL_INSTALL_NAME).sym"
+	cp -v $(BUILD)/kernel "$(DESTDIR)/usr/lib/boot/$(KERNEL_INSTALL_NAME)"
 
 # test if booting
 # to ensure it's using this kernel, set COOKBOOK_SOURCE_IDENT env before build

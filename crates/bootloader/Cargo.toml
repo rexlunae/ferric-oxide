@@ -21,8 +21,13 @@ log = "0.4.17"
 redox_syscall = "0.5"
 spin = "0.9.5"
 
+# Ferric Oxide: the boot environment's keys and format (FERRIC_KERNEL, FERRIC_BOOT_RESOLUTION,
+# preset lines).
+ferric-abi = { path = "../abi" }
 # Ferric Oxide: kernel image KASLR (the `kaslr` feature).
 ferric-elfreloc = { path = "../elfreloc", optional = true }
+# Ferric Oxide: QEMU's fw_cfg device, for boot environment presets (the `fw_cfg_env` feature).
+ferric-fwcfg = { path = "../fwcfg", optional = true }
 ferric-hwrand = { path = "../hwrand", optional = true }
 
 [dependencies.redoxfs]
@@ -54,5 +59,9 @@ default = []
 live = []
 # Ferric Oxide: load the kernel at a random address (kernel image KASLR).
 kaslr = ["dep:ferric-elfreloc", "dep:ferric-hwrand"]
+# Ferric Oxide: under QEMU, read boot environment lines from the fw_cfg file
+# opt/org.ferric-oxide/boot-env before the resolution menu (x86_64 UEFI only; elsewhere it does
+# nothing).
+fw_cfg_env = ["dep:ferric-fwcfg"]
 serial_debug = []
 

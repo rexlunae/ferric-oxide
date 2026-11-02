@@ -68,7 +68,8 @@ pub fn main() -> ! {
         .unwrap();
     let this_thr_fd = unsafe { redox_rt::initialize_freestanding(this_thr_fd) };
 
-    let mut env_bytes = [0_u8; 4096];
+    // Ferric Oxide: the size the bootloader checks the environment against.
+    let mut env_bytes = [0_u8; ferric_abi::boot_env::BOOTSTRAP_ENV_BYTES];
     let mut envs = {
         let fd = FdGuard::new(
             redox_rt::sys::openat(
@@ -172,21 +173,15 @@ pub fn main() -> ! {
                 .remove(&GlobalSchemes::Event)
                 .expect("failed to get event fd");
             // Ferric Oxide: procmgr reports process lifecycle events to kernel.trace.
-            // The in-tree redox_syscall numbers it (GlobalSchemes::Trace); an older one lists
-            // it by name.
-            let trace = crate::proc_trace::ProcTrace::open(
-                kernel_schemes.get(GlobalSchemes::Trace).or_else(|| {
-                    kernel_schemes
-                        .1
-                        .iter()
-                        .find(|(name, _)| *name == ferric_trace::abi::SCHEME_NAME)
-                        .map(|(_, fd)| fd)
-                }),
-            );
+            let trace = crate::proc_trace::ProcTrace::open(kernel_schemes.trace());
             drop(kernel_schemes);
             crate::procmgr::run(write_fd, socket, auth, event, trace)
         },
     );
+
+    // Ferric Oxide: a kernel built without tracing hands out no trace scheme, and then
+    // bootstrap does no tracing work at all.
+    let kernel_traces = kernel_schemes.trace().is_some();
 
     let scheme_creation_cap_dup = scheme_creation_cap
         .dup(b"")
@@ -232,7 +227,9 @@ pub fn main() -> ! {
         .openat_into_upper("", O_STAT, 0)
         .expect("failed to open cwd fd");
     // Ferric Oxide: turn on the events the initfs trace.toml names, before init runs.
-    crate::initfs_trace::apply(&initfs_root_fd, &initns_fd);
+    if kernel_traces {
+        crate::initfs_trace::apply(&initfs_root_fd, &initns_fd);
+    }
     let filetable_binary_fd = init_thr_fd
         .dup_into_upper(b"filetable-binary")
         .expect("faild to create filetable-binary fd");
