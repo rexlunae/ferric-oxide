@@ -15,10 +15,10 @@ pub const OBSERVE_TRIES: usize = 8;
 ///
 /// A [`View`](super::View) starts each copy at the ring's `tail` when `tail` is ahead of it,
 /// because the `tail` it reads belongs to the reader it hands positions back to. An observer
-/// has no such reader: other readers (inside the guest) may consume the ring meanwhile, and
-/// what they consume is still there for the observer. So it starts where its own last copy
-/// ended, and tells words the producer has overwritten from words someone else has read by
-/// the producer's position alone:
+/// has no such reader: other readers (inside the guest) may consume the ring meanwhile, moving
+/// `tail` freely, and what they consume is still there for the observer until the producer
+/// overwrites it. So it starts where its own last copy ended, and tells words the producer has
+/// overwritten from words someone else has read by the producer's positions alone:
 ///
 /// - A push that starts at `head` writes the slots of positions `head - capacity` up to
 ///   `head + MAX_RECORD_WORDS - capacity` (one record at most); positions from there on hold
@@ -27,23 +27,18 @@ pub const OBSERVE_TRIES: usize = 8;
 ///   is the one written at that position: the producer stores a record's words after a
 ///   release fence, so a copy that read any word of a later push also sees (after its own
 ///   acquire fence) the `head` that push started at.
-/// - The producer also moves `tail` past the words it is about to reuse before it reuses
-///   them ([`WhenFull::OverwriteOldest`](super::WhenFull::OverwriteOldest)), and with
-///   [`WhenFull::DropNewest`](super::WhenFull::DropNewest) it reuses only words a reader
-///   moved `tail` past; so every copied word from the `tail` loaded after the copy on is
-///   whole, too.
+/// - Before a push overwrites any word, the producer moves the ring's `oldest` past the
+///   records the word belongs to, whatever any reader has consumed, and the same release
+///   fence orders that store before the overwriting ones. Only the producer stores `oldest`.
+///   So every copied word from the `oldest` loaded after the copy on is whole, too.
 ///
 /// A copy that starts at or after the lower of the two bounds is whole. One that does not was
-/// overtaken: the observer fell behind by more than the ring holds. It keeps the records
-/// from the new `tail` (a record boundary) on, when its walk lands there, and otherwise copies
-/// again from `tail`, as [`View::peek`](super::View::peek) does. What it passed over is
-/// reported as [`Observed::skipped`].
-///
-/// That recovery takes `tail` as the oldest record still whole, which holds when only the
-/// producer moves it. A reader that consumes the ring moves it to records it has read but
-/// the producer has not overwritten, and an overtaken observer then skips those too. So an
-/// observer that may fall behind should be the ring's only reader; the kernel refuses
-/// `cpu/<n>` reads and commits of its host-visible rings for that reason.
+/// overtaken: the observer fell behind by more than the ring holds. It keeps the records from
+/// the new `oldest` (a record boundary) on, when its walk lands there, and otherwise copies
+/// again from `oldest`. A copy never starts before the `oldest` loaded ahead of it, so an
+/// observer that fell behind resumes at the oldest record the ring still holds, consumed by a
+/// guest reader or not. What it passed over is reported as [`Observed::skipped`]: exactly the
+/// words the producer overwrote before the observer read them.
 ///
 /// Every load is relaxed, with acquire fences where ordering matters, because the memory may
 /// be mapped read-only, where only relaxed atomic loads are allowed.
@@ -84,8 +79,8 @@ impl Observed {
     }
 
     /// The words between the position asked for and [`Observed::start`] that were not
-    /// copied: the producer overwrote them first (or, once the observer had fallen behind,
-    /// another reader had consumed them).
+    /// copied: the producer overwrote them first. What other readers consumed is never
+    /// skipped.
     pub fn skipped(&self) -> u64 {
         self.skipped
     }
@@ -147,11 +142,22 @@ impl<W: Words> Observer<W> {
         head
     }
 
-    /// The ring's `tail`.
+    /// The ring's `tail`: what readers in the guest have consumed up to. An observer does not
+    /// depend on it.
     pub fn tail(&self) -> u64 {
         let tail = self.ring.storage.tail().load(Ordering::Relaxed);
         fence(Ordering::Acquire);
         tail
+    }
+
+    /// The ring's `oldest`: the first record the producer has not overwritten, where an
+    /// observer that fell behind resumes. The records from it up to [`Observer::head`] are what
+    /// an observer starting at 0 can still read.
+    pub fn oldest(&self) -> u64 {
+        let oldest = self.ring.storage.oldest().load(Ordering::Relaxed);
+        // Pairs with the release fence in `Ring::push`.
+        fence(Ordering::Acquire);
+        oldest
     }
 
     /// The records the producer dropped or overwrote.
@@ -179,24 +185,19 @@ impl<W: Words> Observer<W> {
     /// first record does not fit in `out`.
     pub fn observe(&self, from: u64, out: &mut [u8]) -> Result<Observed, ObserveError> {
         let capacity = self.ring.capacity() as u64;
-        let mut from_tail = false;
         for _ in 0..OBSERVE_TRIES {
             let head = self.head();
             if from > head {
                 return Err(ObserveError::Ahead { from, head });
             }
-            let start = if from_tail || from < first_whole(head, capacity) {
-                self.tail().clamp(from, head)
-            } else {
-                from
-            };
+            let start = self.oldest().clamp(from, head);
             let copy = self.ring.copy_records(start, head, out);
             // Pairs with the release fence in `Ring::push`: a copied word of a later push
-            // makes that push's `head` and `tail` visible now.
+            // makes that push's `head` and `oldest` visible now.
             fence(Ordering::Acquire);
             let head_after = self.ring.storage.head().load(Ordering::Relaxed);
-            let tail_after = self.ring.storage.tail().load(Ordering::Relaxed);
-            if start >= first_whole(head_after, capacity).min(tail_after) {
+            let oldest_after = self.ring.storage.oldest().load(Ordering::Relaxed);
+            if start >= first_whole(head_after, capacity).min(oldest_after) {
                 return copy
                     .map(|peek| Observed {
                         start,
@@ -207,15 +208,14 @@ impl<W: Words> Observer<W> {
             }
             if let Some(peek) = copy
                 .ok()
-                .and_then(|copy| keep_from(start, tail_after, out, copy))
+                .and_then(|copy| keep_from(start, oldest_after, out, copy))
             {
                 return Ok(Observed {
-                    start: tail_after,
-                    skipped: tail_after - from,
+                    start: oldest_after,
+                    skipped: oldest_after - from,
                     peek,
                 });
             }
-            from_tail = true;
         }
         let head = self.head();
         Ok(Observed {
@@ -242,7 +242,8 @@ mod tests {
     use super::*;
     use crate::EventId;
     use crate::record::{Records, WORD_BYTES};
-    use crate::ring::{SHARED_HEADER_WORDS, TAIL_WORD, WhenFull};
+    use crate::ring::tests::Hooked;
+    use crate::ring::{OLDEST_WORD, SHARED_HEADER_WORDS, TAIL_WORD, WhenFull};
     use core::sync::atomic::{AtomicBool, AtomicU64};
     use std::vec::Vec;
 
@@ -326,6 +327,118 @@ mod tests {
         assert_eq!((end, skipped), (30, 0));
     }
 
+    /// The reviewer's case: forty 3-word records into 64 words, then a reader in the guest
+    /// drains the ring. An observer that starts at 0 has been overtaken; it resumes at the
+    /// oldest record the producer has not overwritten, not at the drained `tail`, and gets
+    /// the 21 records the ring still holds.
+    #[test]
+    fn an_overtaken_observer_resumes_at_oldest_after_a_drain() {
+        let memory = words(SHARED_HEADER_WORDS + 64);
+        let ring = Ring::shared(&memory[..])
+            .expect("valid")
+            .when_full(WhenFull::OverwriteOldest);
+        let observer = Observer::new(&memory[..]).expect("a shared ring");
+        for seq in 0..40 {
+            push(&ring, seq);
+        }
+        let mut buf = [0u8; 1024];
+        assert_eq!(ring.read(&mut buf), Ok(21 * 24));
+        assert_eq!((observer.tail(), observer.head()), (120, 120));
+        // The last push overwrote up to position 56: the first record kept starts at 57.
+        assert_eq!(observer.oldest(), 57);
+        let (seqs, end, skipped) = drain(&observer, 0);
+        assert_eq!(seqs, (19..40).collect::<Vec<_>>());
+        assert_eq!((end, skipped), (120, 57));
+    }
+
+    /// Readers in the guest consume between two polls of an observer that the producer
+    /// overtakes in between: the second poll still gets every record the ring holds.
+    #[test]
+    fn consumption_between_polls_hides_nothing() {
+        let memory = words(SHARED_HEADER_WORDS + 64);
+        let ring = Ring::shared(&memory[..])
+            .expect("valid")
+            .when_full(WhenFull::OverwriteOldest);
+        let observer = Observer::new(&memory[..]).expect("a shared ring");
+        let mut buf = [0u8; 1024];
+        for seq in 0..10 {
+            push(&ring, seq);
+        }
+        let (first, from, _) = drain(&observer, 0);
+        assert_eq!(first, (0..10).collect::<Vec<_>>());
+        assert_eq!(from, 30);
+        // The guest drains, the producer laps the observer, the guest drains again.
+        ring.read(&mut buf).expect("fits");
+        for seq in 10..35 {
+            push(&ring, seq);
+            if seq % 4 == 0 {
+                ring.read(&mut buf).expect("fits");
+            }
+        }
+        ring.read(&mut buf).expect("fits");
+        assert_eq!(observer.tail(), observer.head());
+        let oldest = observer.oldest();
+        assert_eq!(oldest, 105 - 63);
+        let (seqs, end, skipped) = drain(&observer, from);
+        assert_eq!(seqs, (14..35).collect::<Vec<_>>());
+        assert_eq!((end, skipped), (105, oldest - from));
+        // With no overwrite since, a poll from the end is empty and skips nothing.
+        let (seqs, _, skipped) = drain(&observer, end);
+        assert!(seqs.is_empty());
+        assert_eq!(skipped, 0);
+    }
+
+    /// Fills a 64-word ring with 21 records, which a guest reader drains, and observes it
+    /// from 0 through words that push two more records (overwriting the first two, positions
+    /// 0..6) when data word `at` is read: the copy's start, the words skipped and the
+    /// sequence numbers copied.
+    fn overtaken_after_a_drain(at: usize) -> (u64, u64, Vec<u64>) {
+        let memory = words(SHARED_HEADER_WORDS + 64);
+        let ring = Ring::shared(&memory[..])
+            .expect("valid")
+            .when_full(WhenFull::OverwriteOldest);
+        for seq in 0..21 {
+            push(&ring, seq);
+        }
+        let mut buf = [0u8; 1024];
+        assert_eq!(ring.read(&mut buf), Ok(21 * 24));
+        let observer = Observer::new(Hooked {
+            words: &memory[..],
+            at: SHARED_HEADER_WORDS + at,
+            fired: AtomicBool::new(false),
+            // Positions 63..69 wrap to slots 63 and 0..5.
+            hook: || {
+                push(&ring, 21);
+                push(&ring, 22);
+            },
+        })
+        .expect("a shared ring");
+        let mut out = [0u8; 1024];
+        let copy = observer.observe(0, &mut out).expect("observes");
+        assert!(!copy.is_corrupt());
+        assert_eq!(memory[OLDEST_WORD].load(Ordering::Relaxed), 6);
+        assert_eq!(memory[TAIL_WORD].load(Ordering::Relaxed), 63);
+        (copy.start(), copy.skipped(), seqs(&out[..copy.len()]))
+    }
+
+    /// The producer overwrites the first two records after the copy read them: the observer
+    /// keeps the rest of the copy, from the new `oldest`, though the drained `tail` is ahead.
+    #[test]
+    fn an_overwrite_behind_the_copy_keeps_from_oldest() {
+        let (start, skipped, seqs) = overtaken_after_a_drain(10);
+        assert_eq!((start, skipped), (6, 6));
+        assert_eq!(seqs, (2..21).collect::<Vec<_>>());
+    }
+
+    /// The producer overwrites the first record while the copy reads it: the observer copies
+    /// again from the new `oldest`, and gets the new records too.
+    #[test]
+    fn an_overwrite_under_the_copy_copies_again_from_oldest() {
+        let (start, skipped, seqs) = overtaken_after_a_drain(2);
+        assert_eq!((start, skipped), (6, 6));
+        assert_eq!(seqs, (2..23).collect::<Vec<_>>());
+    }
+
     #[test]
     fn overwritten_records_are_skipped() {
         let memory = words(SHARED_HEADER_WORDS + 64);
@@ -390,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn a_scribbled_tail_cannot_send_the_observer_past_head() {
+    fn a_scribbled_counter_cannot_send_the_observer_past_head() {
         let memory = words(SHARED_HEADER_WORDS + 64);
         let ring = Ring::shared(&memory[..])
             .expect("valid")
@@ -403,6 +516,10 @@ mod tests {
         let mut buf = [0u8; 512];
         let copy = observer.observe(0, &mut buf).expect("observes");
         assert!(copy.end() <= observer.head());
+        // Nor can a scribbled `oldest`.
+        memory[OLDEST_WORD].store(u64::MAX, Ordering::Relaxed);
+        let copy = observer.observe(0, &mut buf).expect("observes");
+        assert!(copy.end() <= observer.head());
     }
 
     /// A producer on another thread overwrites the ring as fast as it can while the observer
@@ -410,7 +527,20 @@ mod tests {
     /// comes with words reported skipped.
     #[test]
     fn a_racing_producer_never_tears_a_copy() {
-        const RECORDS: u64 = 200_000;
+        race(false);
+    }
+
+    /// As `a_racing_producer_never_tears_a_copy`, with a reader in the guest draining the
+    /// ring on a third thread, moving `tail` past records the observer has not read: it
+    /// still gets every record the producer did not overwrite first.
+    #[test]
+    fn a_racing_producer_and_consumer_never_tear_a_copy() {
+        race(true);
+    }
+
+    fn race(consume: bool) {
+        // Miri explores weak-memory orderings too, slowly: fewer records keep it short.
+        const RECORDS: u64 = if cfg!(miri) { 2_000 } else { 200_000 };
         let memory = words(SHARED_HEADER_WORDS + 256);
         let ring = Ring::shared(&memory[..])
             .expect("valid")
@@ -424,24 +554,35 @@ mod tests {
                 }
                 done.store(true, Ordering::Release);
             });
+            if consume {
+                scope.spawn(|| {
+                    let mut buf = [0u8; 64 * WORD_BYTES];
+                    while !done.load(Ordering::Acquire) {
+                        ring.read(&mut buf).expect("fits");
+                    }
+                });
+            }
             let mut buf = [0u8; 256 * WORD_BYTES];
             let (mut from, mut last) = (0, None::<u64>);
-            let mut skipped_since_last = false;
             loop {
                 let finished = done.load(Ordering::Acquire);
                 let copy = observer.observe(from, &mut buf).expect("observes");
                 assert!(!copy.is_corrupt(), "never torn");
                 assert!(copy.start() >= from);
-                skipped_since_last |= copy.skipped() > 0;
-                for seq in seqs(&buf[..copy.len()]) {
+                assert_eq!(copy.skipped(), copy.start() - from);
+                let copied = seqs(&buf[..copy.len()]);
+                if let Some(&first) = copied.first() {
+                    // Three words a record: the skip is exactly the records missing.
+                    assert_eq!(
+                        first * 3,
+                        copy.start(),
+                        "the copy starts at its first record"
+                    );
+                }
+                for seq in copied {
                     if let Some(prev) = last {
                         assert!(seq > prev, "in order: {prev} then {seq}");
-                        assert!(
-                            skipped_since_last || seq == prev + 1,
-                            "a gap without a skip: {prev} then {seq}"
-                        );
                     }
-                    skipped_since_last = false;
                     last = Some(seq);
                 }
                 from = copy.end();

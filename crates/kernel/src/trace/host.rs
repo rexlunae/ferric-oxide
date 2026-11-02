@@ -12,11 +12,11 @@
 //!
 //! A host that maps the guest's RAM (QEMU `memory-backend-file,share=on`) finds the region
 //! by that address, or by scanning for the directory, and follows the rings without ever
-//! writing guest memory (`ferric-trace follow`). The host is the host rings' only reader:
-//! reading or committing them through `kernel.trace/cpu/<n>` fails with `EBUSY`
-//! (`scheme::trace`), because a guest consumer would move the `tail` an overtaken host
-//! observer relies on, and mapping them fails, because the region's pages are not frames the
-//! frame allocator can hand to a grant.
+//! writing guest memory (`ferric-trace follow`). Readers in the guest drain host rings
+//! through `kernel.trace/cpu/<n>` as they drain any other (`scheme::trace`), and what they
+//! consume stays visible to the host: an overtaken host observer resumes at the ring's
+//! `oldest` position, which only the producer moves, not at `tail`. Mapping host rings fails,
+//! because the region's pages are not frames the frame allocator can hand to a grant.
 //!
 //! Since the kernel can refuse the request, the `kernel.trace/host` file ([`line()`]) is what
 //! says whether there are host rings: tests and scripts in the guest decide from it.
@@ -96,14 +96,6 @@ fn boot_cpu_count() -> usize {
 /// Whether [`reserve`] took a region.
 pub fn is_reserved() -> bool {
     REGION.is_completed()
-}
-
-/// Whether CPU `cpu`'s ring is a host ring, in the region: one the host follows and nothing
-/// in the guest may consume. A CPU past the region's rings has an ordinary ring.
-pub fn is_host_ring(cpu: usize) -> bool {
-    REGION
-        .get()
-        .is_some_and(|host| host.layout.entry(cpu).is_some())
 }
 
 /// The `kernel.trace/host` line for the region: where it is, its rings and their size, or

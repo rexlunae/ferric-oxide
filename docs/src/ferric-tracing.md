@@ -718,9 +718,14 @@ are overwritten and counted (see [Crash dump](#crash-dump) and
 [Host-visible rings](#host-visible-rings), whose rings have the size the boot
 environment gives).
 The ring sits in kernel-allocated pages in the shared layout of
-`ferric_trace::ring`: a 4 KiB header page (magic `FOTRACE1`, layout version,
-data length, and `head`, `tail` and `lost` on cache lines of their own), then
-the data pages.
+`ferric_trace::ring`: a 4 KiB header page (magic `FOTRACE1`, layout version
+2, data length, and `head`, `tail`, `lost` and `oldest` on cache lines of
+their own), then the data pages. `oldest` is the first record whose words the
+kernel has not overwritten. Only the kernel stores it, moving it record by
+record before it writes over older records, whether a reader has consumed them
+or not. The records from `oldest` up to `head` are therefore always whole and
+never span more than one ring's capacity. Version 2 added `oldest`, and readers
+refuse other versions.
 
 ### Timestamps
 
@@ -1230,18 +1235,24 @@ next, the CPU count, the clock and its tick length (what a capture's `clock`
 file holds), then each ring's offset from the directory and length. The kernel
 writes the magic last, with release ordering.
 
-The host is the host rings' only reader. Reading `kernel.trace/cpu/<n>` in the
-guest (`ferric-trace capture`), or writing `commit` to it, fails with `EBUSY`
-for a CPU that has a host ring (a CPU the region has no ring for keeps an
-ordinary, readable one): a drain or a commit moves the ring's `tail`, which an observer that fell more than a ring behind takes as the oldest
-record still whole, so it would skip records the ring still holds. Mapping
-them fails with `EINVAL`, because the region's pages are not frames a mapping
-can hold ([#378](https://github.com/rexlunae/ferric-oxide/issues/378)). Use
-`follow` on the host instead, or boot without `FERRIC_TRACE_HOST`. Guest
-tests decide from `kernel.trace/host`, not from the boot environment:
-`ferric-trace-test` runs only `trace-host-busy` (reading and committing CPU
-0's ring fail with `EBUSY`) when it holds a line, and the smoke script skips
-`trace-capture`.
+Readers in the guest drain host rings like any other. Reading
+`kernel.trace/cpu/<n>` (`ferric-trace capture`, the trace tests and
+benchmarks) and writing `commit` to it work as for an ordinary ring. The host
+still sees everything they consume. A host observer never relies on `tail`.
+When it falls more than a ring behind, it resumes at the ring's `oldest`
+word, which only the kernel moves, so a guest reader's drain cannot hide
+records from it. Each reader therefore gets every record the kernel did not
+overwrite before that reader read it. Mapping host rings fails with `EINVAL`,
+because the region's pages are not frames a mapping can hold
+([#378](https://github.com/rexlunae/ferric-oxide/issues/378)), so
+`ferric-trace capture --via map` does not work on them. `--via auto` and
+`--via read` do. Guest tests decide from `kernel.trace/host`, not from the
+boot environment. When the file holds a line, `ferric-trace-test` first runs
+`trace-host-read`, which checks that a read of CPU 0's ring returns records
+and that `commit` is accepted. It then runs its other steps but skips the
+three that map the rings: `trace-mmap`, `trace-mapping` and `trace-clock`.
+The smoke script skips `trace-capture`, which captures through the mappings,
+when `ferric-trace-test host-rings` exits 0.
 
 ### Following from the host
 
@@ -1265,10 +1276,12 @@ ferric-trace follow --guest-ram /dev/shm/guest-ram --phys 0x2a00000 --out run/tr
 privately from a read-only descriptor (`crates/guest-ram`), so even a stray
 store could only change its own copy of a page, and follows each ring with
 `ferric_trace::ring::Observer`. The observer keeps its own position in the
-ring and copies from there to `head`; it judges from `head` whether the kernel
-overwrote words it copied, retries from the oldest record still whole when it
-did, and reports the words it skipped. It needs only relaxed loads and fences,
-which are sound on memory mapped like this.
+ring and copies from there to `head`. It judges from `head` and `oldest`
+whether the kernel overwrote words it copied, and when it did, it keeps or
+copies again from `oldest`, the oldest record still whole. It reports the words
+it skipped, which are exactly those the kernel overwrote before it read them.
+What guest readers consumed is never skipped. It needs only relaxed loads and
+fences, which are sound on memory mapped like this.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -1791,7 +1804,10 @@ native clock calibration or the Phase S adoption criteria.
   the next driver, so the rings it drains are not yet anyone else's. The smoke script then runs
   `ferric-trace capture --via map` (through the mapping, which fails if a
   ring does not map) and `ferric-trace text` on the result, and prints
-  `FERRIC_TEST_PASS trace-capture` if both succeed. When `/scheme` lists no
+  `FERRIC_TEST_PASS trace-capture` if both succeed. With
+  [host-visible rings](#host-visible-rings), which cannot be mapped yet, it
+  prints `FERRIC_TEST_SKIP trace-capture` (it asks
+  `ferric-trace-test host-rings`). When `/scheme` lists no
   `kernel.trace` it prints `FERRIC_TEST_SKIP trace-capture` instead, as on the
   `trace-overhead` job's baseline image, which requires that skip.
 - **Overhead.** `ferric-trace-bench` and the `trace-overhead` job (see

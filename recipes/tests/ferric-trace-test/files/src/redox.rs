@@ -49,6 +49,9 @@ const TESTED: [&Event; 5] = [
     &SCHEME_CANCEL,
 ];
 
+/// The argument that runs [`host_rings_status`] instead of the test.
+const HOST_RINGS_COMMAND: &str = "host-rings";
+
 /// How much one read of a CPU's ring asks for (the scheme's maximum).
 const READ_LEN: usize = 64 * 1024;
 
@@ -843,36 +846,64 @@ fn host_rings() -> Result<bool, Failure> {
         })
 }
 
-/// `trace-host-busy`: reading CPU 0's host ring, and committing it, fail with `EBUSY`, so
-/// nothing in the guest moves the `tail` a host observer relies on.
-fn host_rings_are_busy() -> Result<(), Failure> {
-    const STEP: &str = "trace-host-busy";
+/// `trace-host-read`: CPU 0's host ring drains in the guest as any ring does: a read
+/// returns whole records of known events (`sched.switch` has been on since boot), and
+/// `commit` of a position already consumed is accepted. What the guest consumes stays
+/// visible to the host, which follows the ring's `oldest`, not `tail`.
+fn host_rings_read() -> Result<(), Failure> {
+    const STEP: &str = "trace-host-read";
     let path = path(&format!("{}/0", abi::CPU_DIR));
-    let busy = |what: &str, result: std::io::Result<usize>| match result {
-        Err(err) if err.raw_os_error() == Some(syscall::EBUSY) => Ok(()),
-        Err(err) => Err(check(
-            STEP,
-            format!("{what} of {path}: {err}, expected EBUSY"),
-        )),
-        Ok(len) => Err(check(
-            STEP,
-            format!("{what} of {path} returned {len}, expected EBUSY"),
-        )),
-    };
     let mut file = File::options()
         .read(true)
         .write(true)
         .open(&path)
         .map_err(io_failure(STEP, &path))?;
-    busy("a read", file.read(&mut vec![0u8; READ_LEN]))?;
-    busy(
-        "a commit",
-        file.write(abi::CpuCommand::Commit(0).to_string().as_bytes()),
-    )
+    let mut buf = vec![0u8; READ_LEN];
+    let len = file.read(&mut buf).map_err(io_failure(STEP, &path))?;
+    if len == 0 {
+        return Err(check(STEP, format!("a read of {path} found no records")));
+    }
+    let mut entries = Vec::new();
+    decode(STEP, 0, buf.get(..len).unwrap_or_default(), &mut entries)?;
+    file.write_all(CpuCommand::Commit(0).to_string().as_bytes())
+        .map_err(io_failure(STEP, &path))?;
+    println!(
+        "FERRIC_TEST_PASS {STEP} ({} records in {len} bytes, commit accepted)",
+        entries.len()
+    );
+    Ok(())
+}
+
+/// The reason the steps that map the rings give for skipping on host-ring boots.
+const HOST_RINGS_UNMAPPABLE: &str = "host-visible rings cannot be mapped (#378)";
+
+/// Runs `check`, a step named `step` that maps the rings, when `rings` can be mapped, and
+/// skips it otherwise.
+fn mapping_step(
+    rings: Rings,
+    step: &str,
+    check: impl FnOnce() -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    match rings {
+        Rings::Mappable => check(),
+        Rings::Host => {
+            println!("FERRIC_TEST_SKIP {step}: {HOST_RINGS_UNMAPPABLE}");
+            Ok(())
+        }
+    }
+}
+
+/// What kind of rings the kernel has, for the steps that map them.
+#[derive(Clone, Copy)]
+enum Rings {
+    /// Rings in frames of their own, which `mmap` of `cpu/<n>` maps.
+    Mappable,
+    /// Host-visible rings (`kernel.trace/host`), which cannot be mapped yet.
+    Host,
 }
 
 /// The steps; returns the first failure.
-fn run() -> Result<(), Failure> {
+fn run(rings: Rings) -> Result<(), Failure> {
     check_initfs()?;
     let list = listing("trace-boot")?;
     if !is_on("trace-boot", &list, &SCHED_SWITCH)? {
@@ -993,17 +1024,20 @@ fn run() -> Result<(), Failure> {
     }
     println!("FERRIC_TEST_PASS trace-disable");
 
-    check_mmap(&cpus)?;
-    println!("FERRIC_TEST_PASS trace-mmap");
+    mapping_step(rings, "trace-mmap", || {
+        check_mmap(&cpus)?;
+        println!("FERRIC_TEST_PASS trace-mmap");
+        Ok(())
+    })?;
 
     check_fault(&cpus)?;
-    mapping::check_mapping(&cpus)?;
+    mapping_step(rings, "trace-mapping", || mapping::check_mapping(&cpus))?;
     journal::check_journal(&cpus)?;
     futex::check_futex(&cpus)?;
     lifecycle::check_lifecycle(&cpus)?;
     proc::check_proc(&cpus)?;
     check_filter(&cpus)?;
-    clock::check(&cpus)?;
+    mapping_step(rings, "trace-clock", || clock::check(&cpus))?;
     cap::check_cap()
 }
 
@@ -1094,8 +1128,10 @@ fn check_filter(cpus: &[u32]) -> Result<(), Failure> {
 
 /// Runs the test.
 pub fn main() -> ExitCode {
-    if std::env::args().nth(1).as_deref() == Some(lifecycle::CHILD_ARG) {
-        return ExitCode::from(lifecycle::CHILD_STATUS);
+    match std::env::args().nth(1).as_deref() {
+        Some(lifecycle::CHILD_ARG) => return ExitCode::from(lifecycle::CHILD_STATUS),
+        Some(HOST_RINGS_COMMAND) => return host_rings_status(),
+        _ => {}
     }
     // A child of `trace-cap`, run as another user with a capability on its stdin.
     if let Some(access) = std::env::args()
@@ -1140,17 +1176,24 @@ pub fn main() -> ExitCode {
     }
 }
 
-/// The steps without a mode argument: [`run`], or with host-visible rings, whose only reader
-/// is the host, `trace-host-busy` instead, since `run` drains and maps the rings in the guest.
+/// The steps without a mode argument: [`run`], after `trace-host-read` when the kernel has
+/// host-visible rings, which skips the steps that map them.
 fn default_steps() -> Result<(), Failure> {
     if !host_rings()? {
-        return run();
+        return run(Rings::Mappable);
     }
-    host_rings_are_busy()?;
-    println!("FERRIC_TEST_PASS trace-host-busy");
-    println!(
-        "FERRIC_TEST_SKIP trace: the kernel's rings are host-visible ({}), with one reader, the host",
-        path(abi::HOST_PATH)
-    );
-    Ok(())
+    host_rings_read()?;
+    run(Rings::Host)
+}
+
+/// `ferric-trace-test host-rings`: exits 0 when the kernel reports host-visible rings in
+/// `kernel.trace/host`, and 1 otherwise (no `kernel.trace` scheme, an empty file, or one
+/// that cannot be read or parsed), printing nothing, for scripts.
+fn host_rings_status() -> ExitCode {
+    let host = matches!(has_scheme(abi::SCHEME_NAME), Ok(true)) && matches!(host_rings(), Ok(true));
+    if host {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
