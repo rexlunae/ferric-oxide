@@ -464,12 +464,14 @@ catalog defaults plus `kernel.trace_mode = true` and
   and leave room in the guest's RAM for it (4 CPUs take 256 MiB).
 - **`ferric-smoke` in normal mode**: 55 passed, 32 skipped, 0 failed (the
   trace tests skip: the normal kernel has no `kernel.trace` scheme).
-- **`ferric-smoke` in trace mode**: `trace-boot` failed because this profile
-  sets no `trace.boot`, and `trace-capture` failed because it maps the rings
-  in the guest (`capture --via map`), which host rings refuse (see
-  [Host-visible rings](ferric-tracing.md#host-visible-rings)). CI's smoke
-  profile has `kernel.trace` and `trace.boot = "sched"` in its normal kernel
-  and no host rings, so neither applies there.
+- **`ferric-smoke` in trace mode**, with `--boot-env FERRIC_TRACE=sched`
+  (the smoke tests expect `sched.switch` on from boot, as CI's `trace.boot`
+  gives them) and `--trace-ring-kib 16384`: 74 passed, 34 skipped, 0 failed.
+  The guest's own trace tests drained the host rings while `follow` captured
+  them from the host with nothing lost. Only the steps that map the rings in
+  the guest (`trace-mmap`, `trace-mapping`, `trace-clock`, `trace-capture`)
+  skip, because host rings cannot be mapped
+  ([#378](https://github.com/rexlunae/ferric-oxide/issues/378)).
 
 These parts have not run against a real guest yet: `--input usb`, the
 `vtd`/`amdvi` IOMMU options, and `report --a/--b` on runs of different images.
