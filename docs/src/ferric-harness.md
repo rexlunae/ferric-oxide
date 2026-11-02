@@ -91,7 +91,7 @@ covers every module.
 | --- | --- |
 | `up <image> [options]` | Starts QEMU and the supervisor, and returns once the guest runs. Prints the run directory and QEMU's PID |
 | `run <image> [--scenario <toml>] [options]` | `up`, the scenario (or waiting for power-off), `down` and the report in one process. Exits 0 when the verdict passes |
-| `status [--json]` | The run's state: uptime, serial counters, milestones, test counts, crash, host rings. After the run ends, it prints the verdict from `report.json` instead |
+| `status [--json]` | The run's state: uptime, serial counters, milestones, test counts, crash, host rings. After the run ends, it prints the verdict from `report.json` instead and exits as `down` does (see below for the JSON) |
 | `shot [--out f.png]` | A QMP `screendump` as PNG, kept as `<run>/shots/shot-<n>-<t>ms.png`. `--out` also copies it to `f.png` |
 | `text [--save f.png] [--json]` | Reads the text of the console on the screen (see [Screen](#screen)). `--save` also copies the screenshot to `f.png` |
 | `type <text>` | Types on a US-layout keyboard. `\n` is Enter |
@@ -107,6 +107,15 @@ covers every module.
 | `stats` | Samples thread CPU time and KVM statistics now, and prints them as JSON |
 | `down [--timeout s]` | Presses the ACPI power button, waits (20 seconds by default, `--powerdown-timeout` at `up`) and then makes QEMU quit. Writes the report and exits 0 when the verdict passes |
 | `report <run>... [--a <run>... --b <run>...] [--json]` | Prints runs side by side, and a paired A/B comparison of two groups |
+
+`status --json` prints one object. While the supervisor runs, it holds `name`,
+`run_dir`, `image`, `mode`, `qemu_pid`, `running` (whether QEMU still runs),
+`uptime_ms`, `milestones`, `tests` (passed, skipped, failed), `crash`,
+`kernel_trace_lines`, `serial`, `host_rings`, `tracing`, `stop`, `verdict`
+(`null` until the run ends, then `pass` or `fail`) and `expect_cursor`. Once the
+run has ended, it holds `name`, `run_dir`, `running` (`false`) and `verdict`
+with the same meaning, the verdict's `checks` as in `report.json`, and `report`,
+the path of `report.json`; the `report` key tells the two apart.
 
 Exit status: 0 for success, 1 for a failed verdict, an `expect` or
 `wait-screen` timeout, or a guest that has gone, and 2 for other errors (bad

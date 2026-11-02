@@ -1033,6 +1033,7 @@ fn cli_up_commands_down_report() {
     let out = run_args(&["status", "--json"]);
     let status: Value = serde_json::from_slice(&out.stdout).expect("status json");
     assert_eq!(status["running"], true);
+    assert_eq!(status["verdict"], Value::Null);
     let out = run_args(&["down"]);
     assert!(
         out.status.success(),
@@ -1049,6 +1050,17 @@ fn cli_up_commands_down_report() {
     }
     let out = run_args(&["status"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("not running"));
+    // An ended run's JSON keeps the live shape's shared keys and adds the checks.
+    let out = run_args(&["status", "--json"]);
+    assert!(out.status.success());
+    let ended: Value = serde_json::from_slice(&out.stdout).expect("ended status json");
+    for key in ["name", "run_dir"] {
+        assert_eq!(ended[key], status[key], "{key}");
+    }
+    assert_eq!(ended["running"], false);
+    assert_eq!(ended["verdict"], "pass");
+    assert!(ended["checks"].as_array().is_some_and(|c| !c.is_empty()));
+    assert_eq!(ended["report"], json!(run.join("report.json")));
     let out = harness(&["report", &run_s]);
     assert!(out.status.success());
     let table = String::from_utf8_lossy(&out.stdout);

@@ -25,7 +25,7 @@ use ferric_harness::scenario::{self, Scenario};
 use ferric_harness::serial::Eol;
 use ferric_harness::session::{Finish, Session, Since};
 use ferric_harness::trace;
-use ferric_harness::verdict::Outcome;
+use ferric_harness::verdict::{Check, Outcome};
 
 /// Boot Ferric Oxide images in QEMU under a supervisor: serial console, screenshots and
 /// text, keyboard and pointer, boot environment, trace mode and measurements.
@@ -805,6 +805,32 @@ fn run(image: &Path, scenario_path: Option<&Path>, options: &UpOptions) -> Resul
     Ok(verdict_exit(report.map(|r| r.verdict.result)))
 }
 
+/// `status --json` for a run that has ended: the keys it shares with a live run's
+/// [`Status`](ferric_harness::session::Status) (`name`, `run_dir`, `running`, `verdict`)
+/// with the same types, plus the verdict's checks and the report's path.
+#[derive(serde::Serialize)]
+struct EndedStatus<'a> {
+    name: &'a str,
+    run_dir: &'a Path,
+    running: bool,
+    verdict: Outcome,
+    checks: &'a [Check],
+    report: PathBuf,
+}
+
+impl<'a> EndedStatus<'a> {
+    fn new(run_dir: &'a Path, report: &'a Report) -> Self {
+        Self {
+            name: &report.run.name,
+            run_dir,
+            running: false,
+            verdict: report.verdict.result,
+            checks: &report.verdict.checks,
+            report: run_dir.join("report.json"),
+        }
+    }
+}
+
 fn status(run_dir: &Path, json: bool) -> Result<ExitCode, Error> {
     match control::request(run_dir, &Request::Status) {
         Ok(Output::Status(status)) => {
@@ -855,8 +881,12 @@ fn status(run_dir: &Path, json: bool) -> Result<ExitCode, Error> {
         }
         Err(Error::NotRunning(dir)) => {
             let report = Report::load(&dir).map_err(|_| Error::NotRunning(dir.clone()))?;
-            println!("{}: not running", report.run.name);
-            print_verdict(&report.verdict);
+            if json {
+                println!("{}", to_json(&EndedStatus::new(&dir, &report)));
+            } else {
+                println!("{}: not running", report.run.name);
+                print_verdict(&report.verdict);
+            }
             Ok(verdict_exit(Some(report.verdict.result)))
         }
         Err(e) => Err(e),
