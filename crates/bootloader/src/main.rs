@@ -7,11 +7,14 @@ extern crate alloc;
 #[macro_use]
 extern crate uefi_std as std;
 
-use alloc::{format, string::String, vec::Vec};
+use alloc::{format, string::String, vec, vec::Vec};
 use core::{
     cmp,
     fmt::{self, Write},
     mem, ptr, slice, str,
+};
+use ferric_abi::boot_env::{
+    self, EnvBuf, FERRIC_BOOT_RESOLUTION, FERRIC_KERNEL, Kernel, Resolution,
 };
 use redoxfs::{Disk, Node, TreeData};
 
@@ -23,6 +26,9 @@ mod os;
 
 mod arch;
 mod editor;
+// Ferric Oxide: boot environment presets from QEMU's fw_cfg device.
+#[cfg(all(feature = "fw_cfg_env", target_arch = "x86_64", target_os = "uefi"))]
+mod fw_cfg;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod kaslr;
 mod logger;
@@ -92,9 +98,10 @@ struct SliceWriter<'a> {
     i: usize,
 }
 
-impl<'a> Write for SliceWriter<'a> {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        for b in s.bytes() {
+impl SliceWriter<'_> {
+    /// Ferric Oxide: appends `bytes`, as far as they fit.
+    fn write_bytes(&mut self, bytes: &[u8]) -> fmt::Result {
+        for &b in bytes {
             if let Some(slice_b) = self.slice.get_mut(self.i) {
                 *slice_b = b;
                 self.i += 1;
@@ -103,6 +110,65 @@ impl<'a> Write for SliceWriter<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Ferric Oxide: what has been written so far.
+    fn written(&self) -> &[u8] {
+        &self.slice[..self.i]
+    }
+}
+
+impl<'a> Write for SliceWriter<'a> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.write_bytes(s.as_bytes())
+    }
+}
+
+/// Ferric Oxide: room for the preset lines, a whole preset file plus the `FERRIC_KERNEL` line
+/// the menu's 't' key may add.
+const PRESET_CAPACITY: usize = boot_env::MAX_PRESET_BYTES + 64;
+
+/// What the resolution menu decides besides each output's mode.
+struct Menu<'a> {
+    /// Copy the whole file system into memory and boot from that ('l').
+    live: bool,
+    /// Open the environment editor once the modes are chosen ('e').
+    edit_env: bool,
+    /// Ferric Oxide: `FERRIC_BOOT_RESOLUTION`; `auto` skips the menu.
+    resolution: Resolution,
+    /// Ferric Oxide: whether the image has the trace-mode kernel, which 't' selects.
+    trace_kernel: bool,
+    /// Ferric Oxide: the preset environment lines, written after the bootloader's own keys.
+    /// 't' sets or removes `FERRIC_KERNEL` here.
+    preset: EnvBuf<'a>,
+}
+
+impl Menu<'_> {
+    /// Ferric Oxide: the kernel the preset selects, for the menu to show. An invalid value
+    /// shows as the normal kernel; it stops the boot once the environment is final.
+    fn kernel(&self) -> Kernel {
+        Kernel::from_env(self.preset.as_bytes()).unwrap_or_default()
+    }
+
+    /// Ferric Oxide: switches between the trace-mode kernel and the normal one.
+    fn toggle_trace_kernel(&mut self) {
+        if self.kernel() == Kernel::Trace {
+            self.preset.remove(FERRIC_KERNEL);
+        } else if let Err(err) = self
+            .preset
+            .set(FERRIC_KERNEL, Kernel::Trace.name().as_bytes())
+        {
+            log::warn!("{FERRIC_KERNEL} not changed: {err}");
+        }
+    }
+
+    /// Ferric Oxide: the menu line for 't'.
+    fn print_trace_kernel(&self) {
+        if self.kernel() == Kernel::Trace {
+            println!("Press t to disable the trace kernel");
+        } else {
+            println!("Press t to  enable the trace kernel");
+        }
     }
 }
 
@@ -133,12 +199,7 @@ pub struct KernelArgs {
     bootstrap_size: u64,
 }
 
-fn select_mode(
-    os: &impl Os,
-    output_i: usize,
-    live: &mut bool,
-    edit_env: &mut bool,
-) -> Option<OsVideoMode> {
+fn select_mode(os: &impl Os, output_i: usize, menu: &mut Menu<'_>) -> Option<OsVideoMode> {
     let mut modes = Vec::new();
     for mode in os.video_modes(output_i) {
         let mut aspect_w = mode.width;
@@ -180,12 +241,35 @@ fn select_mode(
     }
     println!();
 
+    // Ferric Oxide: FERRIC_BOOT_RESOLUTION=auto takes the mode the menu would highlight first,
+    // without waiting for a key.
+    if menu.resolution == Resolution::Auto {
+        let mode = modes
+            .iter()
+            .find(|(mode, _text)| mode.id == selected)
+            .map(|(mode, _text)| *mode);
+        if let Some(mode) = mode {
+            println!(
+                "{}={}: {}x{}",
+                FERRIC_BOOT_RESOLUTION,
+                Resolution::Auto.name(),
+                mode.width,
+                mode.height
+            );
+        }
+        return mode;
+    }
+
     println!("Arrow keys and enter select mode");
     let live_mode = os.get_text_position();
-    if *live {
+    if menu.live {
         println!("Press l to disable live mode");
     } else {
         println!("Press l to  enable live mode");
+    }
+    let trace_line = os.get_text_position();
+    if menu.trace_kernel {
+        menu.print_trace_kernel();
     }
     println!("Press e to edit boot environment");
     println!();
@@ -274,18 +358,23 @@ fn select_mode(
                 break;
             }
             OsKey::Char('l') => {
-                *live = !*live;
+                menu.live = !menu.live;
                 os.set_text_position(live_mode.0, live_mode.1);
-                if *live {
+                if menu.live {
                     println!("Press l to disable live mode");
                 } else {
                     println!("Press l to  enable live mode");
                 }
             }
+            OsKey::Char('t') if menu.trace_kernel => {
+                menu.toggle_trace_kernel();
+                os.set_text_position(trace_line.0, trace_line.1);
+                menu.print_trace_kernel();
+            }
             OsKey::Char('e') => {
                 if let Some(mode_i) = modes.iter().position(|x| x.0.id == selected) {
                     if let Some((mode, _text)) = modes.get(mode_i) {
-                        *edit_env = true;
+                        menu.edit_env = true;
                         mode_opt = Some(*mode);
                     }
                 }
@@ -438,6 +527,50 @@ fn load_to_memory<O: Os>(
     })
 }
 
+/// Ferric Oxide: whether the file system has `path`. A read error is logged and counts as
+/// missing.
+fn file_exists<D: Disk>(fs: &mut redoxfs::FileSystem<D>, path: &str) -> bool {
+    let found = fs.tx(|tx| {
+        let mut node = redoxfs::TreePtr::root();
+        for component in path.split('/') {
+            match tx.find_node(node, component) {
+                Ok(found) => node = found.ptr(),
+                Err(err) if err.errno == syscall::ENOENT => return Ok(false),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(true)
+    });
+    found.unwrap_or_else(|err| {
+        log::warn!("cannot look for {path}: {err}");
+        false
+    })
+}
+
+/// Ferric Oxide: the kernel `FERRIC_KERNEL` selects in the final boot environment `env`, given
+/// whether the image has the trace-mode kernel.
+///
+/// # Panics
+/// When the value is not a kernel's name, or names the trace-mode kernel in an image without
+/// it: the boot stops rather than load a kernel nobody asked for.
+fn selected_kernel(env: &[u8], have_trace_kernel: bool) -> Kernel {
+    let kernel = Kernel::from_env(env).unwrap_or_else(|err| {
+        let value = boot_env::value(env, FERRIC_KERNEL).unwrap_or_default();
+        panic!(
+            "{FERRIC_KERNEL}={}: {err}; not booting",
+            str::from_utf8(value).unwrap_or("(not UTF-8)")
+        )
+    });
+    if kernel == Kernel::Trace && !have_trace_kernel {
+        panic!(
+            "{FERRIC_KERNEL}={}: {} is not in this image (kernel.trace_mode builds it); not booting another kernel",
+            kernel.name(),
+            kernel.path()
+        );
+    }
+    kernel
+}
+
 fn elf_entry(data: &[u8]) -> (u64, bool) {
     match (data[4], data[5]) {
         // 32-bit, little endian
@@ -503,14 +636,29 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
     println!(": {} MiB", fs.header.size() / MIBI as u64);
     println!();
 
+    // Ferric Oxide: preset boot environment lines (QEMU's fw_cfg, with the fw_cfg_env
+    // feature), read before the menu because they can choose the resolution and the kernel.
+    let mut preset_storage = vec![0; PRESET_CAPACITY];
+    let mut menu = Menu {
+        live: cfg!(feature = "live"),
+        edit_env: false,
+        resolution: Resolution::Menu,
+        trace_kernel: file_exists(&mut fs, Kernel::Trace.path()),
+        preset: EnvBuf::new(&mut preset_storage),
+    };
+    #[cfg(all(feature = "fw_cfg_env", target_arch = "x86_64", target_os = "uefi"))]
+    fw_cfg::load_preset(&mut menu.preset);
+    menu.resolution = Resolution::from_env(menu.preset.as_bytes()).unwrap_or_else(|err| {
+        log::warn!("{FERRIC_BOOT_RESOLUTION} ignored: {err}");
+        Resolution::Menu
+    });
+
     let mut mode_opts = Vec::new();
-    let mut live = cfg!(feature = "live");
-    let mut edit_env = false;
     for output_i in 0..os.video_outputs() {
         if output_i > 0 {
             os.clear_text();
         }
-        mode_opts.push(select_mode(os, output_i, &mut live, &mut edit_env));
+        mode_opts.push(select_mode(os, output_i, &mut menu));
     }
 
     let stack_size = 128 * KIBI;
@@ -519,7 +667,7 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
         panic!("Failed to allocate memory for stack");
     }
 
-    let live_opt = if live {
+    let live_opt = if menu.live {
         let size = fs.header.size();
 
         print!("live: 0/{} MiB", size / MIBI as u64);
@@ -558,8 +706,84 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
         None
     };
 
+    let max_env_size = 64 * KIBI;
+    let env_base = os.alloc_zeroed_page_aligned(max_env_size);
+    if env_base.is_null() {
+        panic!("Failed to allocate memory for stack");
+    }
+
+    // Ferric Oxide: the environment is written, and edited, before the kernel is loaded,
+    // because FERRIC_KERNEL in it chooses the kernel. Only the framebuffer keys, which need the
+    // page tables, come after.
+    let mut w = SliceWriter {
+        slice: unsafe { slice::from_raw_parts_mut(env_base, max_env_size) },
+        i: 0,
+    };
+
+    // Sample before the final UEFI memory-map snapshot; the counter-based
+    // offset stays valid even if loading the kernel or the environment editor
+    // delays kernel entry.
+    #[cfg(target_arch = "aarch64")]
+    if let Some(clock) = os.boot_time() {
+        writeln!(w, "{}={clock}", ferric_boot_time::ENV_KEY)
+            .expect("clock handoff fits the freshly allocated 64 KiB environment");
+    }
+
+    match hwdesc {
+        OsHwDesc::Acpi(addr, size) => {
+            writeln!(w, "RSDP_ADDR={addr:016x}").unwrap();
+            writeln!(w, "RSDP_SIZE={size:016x}").unwrap();
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        OsHwDesc::DeviceTree(addr, size) => {
+            writeln!(w, "DTB_ADDR={addr:016x}").unwrap();
+            writeln!(w, "DTB_SIZE={size:016x}").unwrap();
+        }
+        OsHwDesc::NotFound => {}
+    }
+
+    if let Some(live) = live_opt {
+        writeln!(w, "DISK_LIVE_ADDR={:016x}", live.as_ptr() as usize).unwrap();
+        writeln!(w, "DISK_LIVE_SIZE={:016x}", live.len()).unwrap();
+        writeln!(w, "REDOXFS_BLOCK={:016x}", 0).unwrap();
+    } else {
+        writeln!(w, "REDOXFS_BLOCK={:016x}", fs.block).unwrap();
+    }
+    write!(w, "REDOXFS_UUID=").unwrap();
+    for i in 0..fs.header.uuid().len() {
+        if i == 4 || i == 6 || i == 8 || i == 10 {
+            write!(w, "-").unwrap();
+        }
+
+        write!(w, "{:>02x}", fs.header.uuid()[i]).unwrap();
+    }
+    writeln!(w).unwrap();
+    if let Some(password) = password_opt {
+        writeln!(
+            w,
+            "REDOXFS_PASSWORD_ADDR={:016x}",
+            password.as_ptr() as usize
+        )
+        .unwrap();
+        writeln!(w, "REDOXFS_PASSWORD_SIZE={:016x}", password.len()).unwrap();
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let boot_hartid = os::efi_get_boot_hartid()
+            .expect("Could not retrieve boot hart id from EFI implementation!");
+        writeln!(w, "BOOT_HART_ID={:016x}", boot_hartid).unwrap();
+    }
+    // Ferric Oxide: the preset lines go where the editor adds lines, so it shows them.
+    w.write_bytes(menu.preset.as_bytes())
+        .expect("a preset of at most a few KiB fits the freshly allocated 64 KiB environment");
+    if menu.edit_env {
+        editor::edit_env(os, env_base, &mut w.i, max_env_size);
+    }
+    let kernel_choice = selected_kernel(w.written(), menu.trace_kernel);
+
     let (kernel, kernel_entry) = {
-        let kernel = load_to_memory(os, &mut fs, "usr/lib/boot/kernel", Filetype::Elf);
+        let kernel = load_to_memory(os, &mut fs, kernel_choice.path(), Filetype::Elf);
         let (kernel_entry, kernel_64bit) = elf_entry(kernel);
         unsafe {
             KERNEL_64BIT = kernel_64bit;
@@ -584,13 +808,6 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
         (memory.len() as u64, memory.as_mut_ptr() as u64)
     };
 
-    let max_env_size = 64 * KIBI;
-    let mut env_size = max_env_size;
-    let env_base = os.alloc_zeroed_page_aligned(env_size);
-    if env_base.is_null() {
-        panic!("Failed to allocate memory for stack");
-    }
-
     // Select the final video modes before taking the UEFI memory-map snapshot
     // used to build the AArch64 page tables. SetMode may change the framebuffer
     // address and its cacheability descriptors.
@@ -600,105 +817,38 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
         }
     }
 
-    // Sample before the final UEFI memory-map snapshot; the counter-based
-    // offset stays valid even if the environment editor delays kernel entry.
-    #[cfg(target_arch = "aarch64")]
-    let boot_time = os.boot_time();
-
     let page_phys = unsafe { paging_create(os, kernel.as_ptr() as u64, kernel.len() as u64) }
         .expect("Failed to set up paging");
 
-    {
-        let mut w = SliceWriter {
-            slice: unsafe { slice::from_raw_parts_mut(env_base, max_env_size) },
-            i: 0,
-        };
-
-        #[cfg(target_arch = "aarch64")]
-        if let Some(clock) = boot_time {
-            writeln!(w, "{}={clock}", ferric_boot_time::ENV_KEY)
-                .expect("clock handoff fits the freshly allocated 64 KiB environment");
-        }
-
-        match hwdesc {
-            OsHwDesc::Acpi(addr, size) => {
-                writeln!(w, "RSDP_ADDR={addr:016x}").unwrap();
-                writeln!(w, "RSDP_SIZE={size:016x}").unwrap();
-            }
-            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-            OsHwDesc::DeviceTree(addr, size) => {
-                writeln!(w, "DTB_ADDR={addr:016x}").unwrap();
-                writeln!(w, "DTB_SIZE={size:016x}").unwrap();
-            }
-            OsHwDesc::NotFound => {}
-        }
-
-        if let Some(live) = live_opt {
-            writeln!(w, "DISK_LIVE_ADDR={:016x}", live.as_ptr() as usize).unwrap();
-            writeln!(w, "DISK_LIVE_SIZE={:016x}", live.len()).unwrap();
-            writeln!(w, "REDOXFS_BLOCK={:016x}", 0).unwrap();
-        } else {
-            writeln!(w, "REDOXFS_BLOCK={:016x}", fs.block).unwrap();
-        }
-        write!(w, "REDOXFS_UUID=").unwrap();
-        for i in 0..fs.header.uuid().len() {
-            if i == 4 || i == 6 || i == 8 || i == 10 {
-                write!(w, "-").unwrap();
-            }
-
-            write!(w, "{:>02x}", fs.header.uuid()[i]).unwrap();
-        }
-        writeln!(w).unwrap();
-        if let Some(password) = password_opt {
-            writeln!(
-                w,
-                "REDOXFS_PASSWORD_ADDR={:016x}",
-                password.as_ptr() as usize
-            )
-            .unwrap();
-            writeln!(w, "REDOXFS_PASSWORD_SIZE={:016x}", password.len()).unwrap();
-        }
-
-        #[cfg(target_arch = "riscv64")]
-        {
-            let boot_hartid = os::efi_get_boot_hartid()
-                .expect("Could not retrieve boot hart id from EFI implementation!");
-            writeln!(w, "BOOT_HART_ID={:016x}", boot_hartid).unwrap();
-        }
-        if edit_env {
-            editor::edit_env(os, env_base, &mut w.i, max_env_size);
-        }
-
-        for output_i in 0..os.video_outputs() {
-            if let Some(mode) = mode_opts[output_i] {
-                if output_i == 0 {
-                    let virt = unsafe {
-                        paging_framebuffer(
-                            os,
-                            page_phys,
-                            mode.base,
-                            (mode.stride * mode.height * 4) as u64,
-                        )
-                    }
-                    .expect("Failed to map framebuffer");
-
-                    writeln!(w, "FRAMEBUFFER_ADDR={:016x}", mode.base).unwrap();
-                    writeln!(w, "FRAMEBUFFER_VIRT={virt:016x}").unwrap();
-                    writeln!(w, "FRAMEBUFFER_WIDTH={:016x}", mode.width).unwrap();
-                    writeln!(w, "FRAMEBUFFER_HEIGHT={:016x}", mode.height).unwrap();
-                    writeln!(w, "FRAMEBUFFER_STRIDE={:016x}", mode.stride).unwrap();
-                } else {
-                    writeln!(
-                        w,
-                        "FRAMEBUFFER{}={:#x},{},{},{}",
-                        output_i, mode.base, mode.width, mode.height, mode.stride,
+    for output_i in 0..os.video_outputs() {
+        if let Some(mode) = mode_opts[output_i] {
+            if output_i == 0 {
+                let virt = unsafe {
+                    paging_framebuffer(
+                        os,
+                        page_phys,
+                        mode.base,
+                        (mode.stride * mode.height * 4) as u64,
                     )
-                    .unwrap();
                 }
+                .expect("Failed to map framebuffer");
+
+                writeln!(w, "FRAMEBUFFER_ADDR={:016x}", mode.base).unwrap();
+                writeln!(w, "FRAMEBUFFER_VIRT={virt:016x}").unwrap();
+                writeln!(w, "FRAMEBUFFER_WIDTH={:016x}", mode.width).unwrap();
+                writeln!(w, "FRAMEBUFFER_HEIGHT={:016x}", mode.height).unwrap();
+                writeln!(w, "FRAMEBUFFER_STRIDE={:016x}", mode.stride).unwrap();
+            } else {
+                writeln!(
+                    w,
+                    "FRAMEBUFFER{}={:#x},{},{},{}",
+                    output_i, mode.base, mode.width, mode.height, mode.stride,
+                )
+                .unwrap();
             }
         }
-        env_size = w.i;
     }
+    let env_size = w.i;
 
     #[allow(static_mut_refs)]
     (

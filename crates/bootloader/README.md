@@ -43,6 +43,25 @@ In this source code, some interesting files for entry points are:
   - `aarch64`: [src/os/uefi/arch/aarch64.rs](src/os/uefi/arch/aarch64.rs)
   - `riscv64gc`: [src/os/uefi/arch/riscv64/mod.rs](src/os/uefi/arch/riscv64/mod.rs)
 
+## Ferric Oxide additions
+
+- **Kernel image KASLR** (`kaslr` feature, `kernel.kaslr_image`): the kernel is
+  relocated to a random address before it runs ([src/kaslr.rs](src/kaslr.rs)).
+- **Kernel choice**: `FERRIC_KERNEL=trace` in the boot environment loads
+  `usr/lib/boot/kernel-trace` (`kernel.trace_mode`) instead of
+  `usr/lib/boot/kernel`, and `t` in the resolution menu toggles it when the image
+  has that kernel. The environment is written, and edited, before a kernel is
+  loaded. `FERRIC_BOOT_RESOLUTION=auto` skips the resolution menu.
+- **Boot environment lines from QEMU** (`fw_cfg_env` feature,
+  `bootloader.fw_cfg_env`, x86_64 UEFI): the fw_cfg file
+  `opt/org.ferric-oxide/boot-env` is merged into the environment before the
+  menu ([src/fw_cfg.rs](src/fw_cfg.rs), protocol in `crates/fwcfg`, format in
+  `ferric_abi::boot_env`).
+
+`BOOTLOADER_FEATURES="kaslr fw_cfg_env"` passes Cargo features to the Makefile.
+See the book's [Trace mode](../../docs/src/ferric-tracing.md#trace-mode) and
+[Setting the boot environment](../../docs/src/ferric-tracing.md#setting-the-boot-environment).
+
 ## Debugging
 
 ### QEMU
