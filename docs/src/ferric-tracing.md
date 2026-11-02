@@ -1216,7 +1216,9 @@ rings and their size:
 
 ```text
 phys 0x2a00000 cpus 4 kib 4096
-``` The region stays in use for the whole boot, and the boot-time
+```
+
+The region stays in use for the whole boot, and the boot-time
 allocator gives up the rest of any free area too small for the region on its
 way to one large enough, which the kernel logs (`reserved: <n> KiB of free RAM
 left unused ...`). Rings that fit in the first free area avoid that.
