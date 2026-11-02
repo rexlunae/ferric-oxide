@@ -82,7 +82,12 @@ pub fn run(args: FollowArgs) -> Result<(), FollowCmdError> {
     let ram = GuestRam::open(&args.guest_ram, layout)?;
     let stop = Arc::new(AtomicBool::new(false));
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
-        signal_hook::flag::register(signal, Arc::clone(&stop)).map_err(FollowCmdError::Signals)?;
+        // The first signal asks for a clean stop; a second one, if that stop hangs (on a
+        // RAM file that stopped answering, say), exits at once with the usual status.
+        let status = 128 + signal;
+        signal_hook::flag::register_conditional_shutdown(signal, status, Arc::clone(&stop))
+            .and_then(|_| signal_hook::flag::register(signal, Arc::clone(&stop)))
+            .map_err(FollowCmdError::Signals)?;
     }
     let options = Options {
         phys: args.phys,

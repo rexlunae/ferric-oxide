@@ -1113,9 +1113,11 @@ live t_s=12.0 records=48211 rate=4031 lost=0 syscall.enter=20012/1673 syscall.ex
 `follow` stops on SIGINT or SIGTERM, after `--duration`, when the RAM file is
 removed, or when the guest boots again (the directory's magic or boot value
 changes, or a ring starts over), and in every case reads the rings a last time,
-writes `stats.end` and removes `INCOMPLETE`. Stopped before it found the
-directory, it fails and leaves only `INCOMPLETE` in the directory. One run
-follows one boot.
+writes `stats.end` and removes `INCOMPLETE`. A second SIGINT or SIGTERM ends
+it at once (status 130 or 143), for a stop that hangs. If the `--live` lines
+cannot be written (a closed pipe), it saves the capture the same way and then
+fails. Stopped before it found the directory, it fails and leaves only
+`INCOMPLETE` in the directory. One run follows one boot.
 
 Limits:
 

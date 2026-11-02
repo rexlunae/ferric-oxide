@@ -65,6 +65,9 @@ pub const HOST_CLOCK_EVERY: Duration = Duration::from_millis(100);
 /// How often to look for the directory again while scanning finds none.
 const SCAN_EVERY: Duration = Duration::from_millis(500);
 
+/// The name [`FollowError::Io`] gives the `--live` output.
+const LIVE_OUTPUT: &str = "<live output>";
+
 /// The bytes read from a ring at a time.
 const READ_BYTES: usize = 1 << 20;
 
@@ -274,9 +277,10 @@ pub fn find_directory(
 /// [`FollowError::OutputExists`] or [`FollowError::Io`] for an unusable `out`;
 /// [`FollowError::NotFound`] when it stops before finding the directory (the capture
 /// directory then holds only `INCOMPLETE`); the errors of [`find_directory`];
-/// [`FollowError::Ring`] for a ring the directory lists that is not one; and
+/// [`FollowError::Ring`] for a ring the directory lists that is not one;
 /// [`FollowError::Io`] when a capture file cannot be written, after which the capture keeps
-/// what was saved, marked `INCOMPLETE`.
+/// what was saved, marked `INCOMPLETE`; and [`FollowError::Io`] when a live line cannot be
+/// written, after the capture is saved as on a stop.
 pub fn run(
     ram: &GuestRam,
     out: &Path,
@@ -300,10 +304,12 @@ pub fn run(
         if let Some(line) = live
             .as_mut()
             .and_then(|live| live.line(now, follower.lost_records()))
+            && let Err(source) = writeln!(live_out, "{line}").and_then(|()| live_out.flush())
         {
-            writeln!(live_out, "{line}")
-                .and_then(|()| live_out.flush())
-                .map_err(io_error(Path::new("<stdout>")))?;
+            // Nobody reads the live lines any more (a closed pipe, say): save the capture
+            // as on any other stop before saying so.
+            follower.finish(StopReason::Stopped)?;
+            return Err(io_error(Path::new(LIVE_OUTPUT))(source));
         }
         if stop.load(Ordering::Relaxed) {
             break StopReason::Stopped;
@@ -1007,6 +1013,50 @@ mod tests {
             run(&ram, &out, &options, &stop, &mut live),
             Err(FollowError::OutputExists { .. })
         ));
+    }
+
+    /// Live output that nobody reads.
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_closed_live_output_stops_the_follow_with_the_capture_saved() {
+        let mut guest = Guest::new(RamLayout::q35(4 * MIB), 2 * MIB, 1, 4);
+        let timestamps = guest.push(0, &SYSCALL_EXIT, 6);
+        guest.sync();
+        let ram = guest.map();
+        let out_dir = tempfile::tempdir().expect("a directory");
+        let out = out_dir.path().join("trace");
+        let options = Options {
+            live: true,
+            ..Options::default()
+        };
+        // The first live line comes after a second.
+        let err = run(
+            &ram,
+            &out,
+            &options,
+            &AtomicBool::new(false),
+            &mut ClosedPipe,
+        )
+        .expect_err("the live line fails");
+        assert!(
+            matches!(&err, FollowError::Io { path, source }
+                if path == Path::new(LIVE_OUTPUT) && source.kind() == ErrorKind::BrokenPipe),
+            "{err:?}"
+        );
+        assert!(!out.join(INCOMPLETE).exists());
+        assert!(out.join(STATS_END).exists());
+        assert_eq!(captured(&out)[&0], timestamps);
     }
 
     #[test]
