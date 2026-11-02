@@ -87,12 +87,13 @@ impl Region {
     /// large. Called during memory setup, before the frame allocator takes over the memory
     /// the boot-time allocator has not handed out: what it hands out stays used for good,
     /// and the physical map already covers it. Free areas the allocator passes over to find
-    /// the run stay unused too.
+    /// the run stay unused too, which it logs.
     ///
     /// # Errors
     ///
     /// [`ReserveError::Unaligned`] when `bytes` is not a whole number of pages, and
-    /// [`ReserveError::NoMemory`] when no free run is that large; nothing is taken then.
+    /// [`ReserveError::NoMemory`] when no free run is that large; nothing is taken then, and
+    /// the boot-time allocator is left as it was.
     #[cfg(feature = "trace_host")]
     pub fn from_boot_allocator(
         allocator: &mut rmm::BumpAllocator<RmmA>,
@@ -104,9 +105,20 @@ impl Region {
             .checked_div(PAGE_SIZE)
             .filter(|&pages| pages > 0 && bytes.is_multiple_of(PAGE_SIZE))
             .ok_or(ReserveError::Unaligned)?;
-        let base = allocator
-            .allocate(rmm::FrameCount::new(pages))
+        let count = rmm::FrameCount::new(pages);
+        // Ask first: a request no area holds would use up every area on the way to failing,
+        // leaving the frame allocator no memory at all.
+        let skipped = allocator
+            .skipped_before_fit(count)
             .ok_or(ReserveError::NoMemory)?;
+        if skipped > 0 {
+            crate::info!(
+                "reserved: {} KiB of free RAM left unused to fit {} KiB in one run",
+                skipped / 1024,
+                bytes / 1024
+            );
+        }
+        let base = allocator.allocate(count).ok_or(ReserveError::NoMemory)?;
         Ok(Self {
             base: base.data(),
             words: bytes.div_ceil(size_of::<AtomicU64>()),

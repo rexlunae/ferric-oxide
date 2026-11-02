@@ -1026,11 +1026,13 @@ start), the kernel:
 trace: host rings at phys 0x2a00000, 4 CPUs x 4096 KiB
 ```
 
-A value that is not such a size, or a region the allocator cannot provide, is
-logged (`trace: FERRIC_TRACE_HOST="..." ignored: ...`) and leaves host rings
-off; the kernel then traces as without `trace_host`. The region stays in use
-for the whole boot, and the boot-time allocator gives up the rest of any free
-area too small for the region on its way to one large enough.
+A value that is not such a size, or a region no free area of RAM holds in one
+run, is logged (`trace: FERRIC_TRACE_HOST="..." ignored: ...`) and leaves host
+rings off, with all of memory still free; the kernel then traces as without
+`trace_host`. The region stays in use for the whole boot, and the boot-time
+allocator gives up the rest of any free area too small for the region on its
+way to one large enough, which the kernel logs (`reserved: <n> KiB of free RAM
+left unused ...`). Rings that fit in the first free area avoid that.
 
 The directory format is `ferric_trace::host` (`crates/trace/src/host.rs`):
 64-bit words in the CPU's byte order, the magic `FOTRDIR1`, a version, the
