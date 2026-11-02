@@ -641,8 +641,10 @@ impl<S: Storage> Ring<S> {
     }
 
     /// Moves `tail` past the oldest whole records until `words` more fit before `head`, and
-    /// counts them as lost. Only the producer may call this.
-    fn make_room(&self, head: u64, words: u64) {
+    /// counts them as lost. Returns the record boundary it moved `tail` to, the first at or
+    /// after [`Ring::overwrite_end`], or `None` when a consumer had already moved `tail` that
+    /// far. Only the producer may call this.
+    fn make_room(&self, head: u64, words: u64) -> Option<u64> {
         let needed = self.overwrite_end(head, words);
         let mut tail = self.storage.tail().load(Ordering::Acquire);
         while tail < needed {
@@ -657,20 +659,29 @@ impl<S: Storage> Ring<S> {
             ) {
                 Ok(_) => {
                     self.storage.lost().fetch_add(dropped, Ordering::Relaxed);
-                    return;
+                    return Some(pos);
                 }
                 Err(now) => tail = now,
             }
         }
+        None
     }
 
     /// Moves `oldest` past the records a record of `words` words written at `head` overwrites,
-    /// wherever `tail` is. Only the producer may call this.
-    fn advance_oldest(&self, head: u64, words: u64) {
+    /// wherever `tail` is. `walked` is where [`Ring::make_room`] just moved `tail`, if it did:
+    /// record boundaries form one chain, so its walk ended at the same first boundary at or
+    /// after [`Ring::overwrite_end`] as a walk from `oldest` would, and the headers are not
+    /// read twice. Only the producer may call this.
+    fn advance_oldest(&self, head: u64, words: u64, walked: Option<u64>) {
         let needed = self.overwrite_end(head, words);
         // Only the producer stores `oldest`, so a relaxed load sees its own last store.
         let oldest = self.storage.oldest().load(Ordering::Relaxed);
         if oldest >= needed {
+            return;
+        }
+        if let Some(pos) = walked {
+            // The release fence in `Ring::push` orders this store before the overwrites.
+            self.storage.oldest().store(pos, Ordering::Relaxed);
             return;
         }
         // The producer keeps `oldest` within a ring of `head`; one further behind (or past
@@ -708,20 +719,21 @@ impl<S: Storage> Ring<S> {
         // Only the producer stores `head`, so a relaxed load sees its own last store.
         let head = self.storage.head().load(Ordering::Relaxed);
         let tail = self.storage.tail().load(Ordering::Acquire);
+        let mut walked = None;
         if head.wrapping_sub(tail).saturating_add(words) > self.capacity() as u64 {
             match self.when_full {
                 WhenFull::DropNewest => {
                     self.count_lost();
                     return Err(PushError::Full);
                 }
-                WhenFull::OverwriteOldest => self.make_room(head, words),
+                WhenFull::OverwriteOldest => walked = self.make_room(head, words),
             }
         }
         // Only an overwriting ring maintains `oldest`: a ring that drops new records never
         // writes over words no reader has taken, so its `tail` already bounds what it reuses,
         // and the push stays as cheap as before.
         if self.when_full == WhenFull::OverwriteOldest {
-            self.advance_oldest(head, words);
+            self.advance_oldest(head, words, walked);
         }
         // Pairs with the acquire fences in `Ring::peek_checked` and `Observer::observe`: a
         // reader that sees one of the stores below then sees a `tail` at least this one (the
@@ -1677,8 +1689,10 @@ mod tests {
         assert_eq!((oldest(&ring), ring.lost()), (16, 0));
     }
 
-    /// A scribbled `oldest`, more than a ring behind `head`, is no record boundary: the
-    /// producer passes everything before `head` instead of walking from it.
+    /// A scribbled `oldest`, more than a ring behind `head`, is no record boundary and is never
+    /// walked from. When `make_room` just walked `tail`, its boundary is used (exact); when a
+    /// reader had moved `tail` ahead, so there was no walk, the producer passes everything
+    /// before `head`.
     #[test]
     fn a_scribbled_oldest_is_not_walked() {
         let ring = Ring::new(words(16))
@@ -1689,8 +1703,34 @@ mod tests {
         }
         assert_eq!(oldest(&ring), 16);
         ring.storage.oldest.store(1, Ordering::Relaxed);
+        // Four-word records: the first boundary at or after 32 + 4 - 16.
         ring.push(EventId::new(1), 8, &[8, 8]).expect("room");
-        assert_eq!(oldest(&ring), 32);
+        assert_eq!(oldest(&ring), 20);
+
+        let mut buf = [0u8; 256];
+        while ring.read(&mut buf).expect("fits") > 0 {}
+        ring.storage.oldest.store(1, Ordering::Relaxed);
+        ring.push(EventId::new(1), 9, &[9, 9]).expect("room");
+        assert_eq!(oldest(&ring), 36, "everything before head");
+    }
+
+    /// When `make_room` walks `tail`, `oldest` lands on the same boundary without a second
+    /// walk, as a walk from `oldest` would.
+    #[test]
+    fn oldest_takes_the_boundary_make_room_walked_to() {
+        let ring = Ring::new(words(32))
+            .expect("valid")
+            .when_full(WhenFull::OverwriteOldest);
+        for i in 0..100u64 {
+            let args = (i % 7) as usize;
+            ring.push(EventId::new(1), i, &[i; 8][..args])
+                .expect("room");
+            assert_eq!(
+                oldest(&ring),
+                ring.storage.tail.load(Ordering::Relaxed),
+                "push {i}"
+            );
+        }
     }
 
     #[test]
