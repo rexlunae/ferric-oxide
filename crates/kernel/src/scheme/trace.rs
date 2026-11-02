@@ -16,9 +16,10 @@
 //! - `cpu/<n>`: reading drains whole records from CPU n's ring; 0 bytes when it is empty, and
 //!   `EINVAL` when the buffer cannot hold the next record, and `EAGAIN` while another reader
 //!   is reading that CPU. Records are consumed only once the copy to the caller succeeded.
-//!   With host-visible rings (`trace_host`) the host is those rings' only reader: reading or
-//!   committing them fails with `EBUSY`. A CPU the host region has no ring for keeps an
-//!   ordinary, readable one.
+//!   Host-visible rings (`trace_host`) are read and committed here like any other: what a
+//!   reader in the guest consumes stays visible to the host, which follows the producer's
+//!   `oldest` position, not `tail` (`ferric_trace::ring::Observer`). They cannot be mapped
+//!   (`EINVAL`): the region's pages are not frames a grant can hold.
 //!   `mmap` of the descriptor (`PROT_READ`, `MAP_SHARED`, the whole `CPU_MAP_BYTES` from offset
 //!   0) maps the ring itself read-only, header page and data; writing `commit <end>` then
 //!   consumes it up to `end`, under the same one-reader lock as a read.
@@ -345,28 +346,9 @@ fn filter_command(event: &str, filter: &str, len: usize) -> Result<usize> {
     }
 }
 
-/// Ferric Oxide: `EBUSY` for a host-visible ring, which has one reader, the host. A drain or a
-/// `commit` here would move `tail`, which a host observer that fell more than a ring behind
-/// takes as the oldest record still whole, and hide records the ring still holds from it.
-/// Rings of CPUs the host region has none for are ordinary, and stay readable.
-#[cfg(feature = "trace_host")]
-fn refuse_host_ring(cpu: LogicalCpuId) -> Result<()> {
-    if trace::host::is_host_ring(cpu.get() as usize) {
-        return Err(Error::new(syscall::error::EBUSY));
-    }
-    Ok(())
-}
-
-/// Without `trace_host` no ring is a host ring.
-#[cfg(not(feature = "trace_host"))]
-fn refuse_host_ring(_cpu: LogicalCpuId) -> Result<()> {
-    Ok(())
-}
-
 /// Runs a command written to `cpu/<n>`: `commit <end>` consumes the mapped ring up to `end`,
 /// which must be a record boundary the kernel can check (`Ring::commit_to`).
 fn cpu_command(cpu: LogicalCpuId, buf: UserSliceRo) -> Result<usize> {
-    refuse_host_ring(cpu)?;
     let (bytes, len) = command_bytes(buf)?;
     let CpuCommand::Commit(end) = CpuCommand::parse(&bytes).map_err(|_| Error::new(EINVAL))? else {
         return Err(Error::new(EINVAL));
@@ -478,7 +460,6 @@ impl KernelScheme for TraceScheme {
                 buf.copy_common_bytes_from_slice(data.get(start..).unwrap_or(&[]))
             }
             Handle::Cpu(cpu) => {
-                refuse_host_ring(cpu)?;
                 let Some(ring) = trace::ring(cpu) else {
                     return Ok(0);
                 };
