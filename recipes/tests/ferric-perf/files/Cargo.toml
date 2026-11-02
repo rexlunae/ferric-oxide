@@ -1,0 +1,21 @@
+[package]
+name = "ferric-perf"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Process, context-switch, pipe, logging and file microbenchmarks for Ferric Oxide"
+
+# Builds on its own, outside any workspace above it.
+[workspace]
+
+[dependencies]
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+# The fio-style latency histogram the disk benchmark and `ferric-trace counts` report with.
+ferric-iobench = { path = "../../../../crates/iobench" }
+# fork, execve, waitpid and mmap; posix_spawn is declared in src/sys.rs, since the crate
+# does not bind it for Redox.
+libc = "0.2"
+thiserror = "2"
+
+[profile.release]
+debug = false

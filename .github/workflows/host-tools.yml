@@ -46,6 +46,7 @@ on:
       - "recipes/tests/ferric-time-test/**"
       - "recipes/tests/ferric-trace-test/**"
       - "recipes/tests/ferric-xstate-test/**"
+      - "recipes/tests/ferric-perf/**"
       - ".github/workflows/host-tools.yml"
       - ".gitmodules"
       - ".github/actions/prepare-cargo-git/**"
@@ -135,6 +136,17 @@ jobs:
       - name: Trace clock capture checks
         run: |
           manifest=recipes/tests/ferric-trace-test/files/Cargo.toml
+          cargo fmt --check --manifest-path "$manifest"
+          cargo test --locked --manifest-path "$manifest"
+          cargo clippy --locked --manifest-path "$manifest" --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path "$manifest" --all-targets --target x86_64-unknown-redox -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --manifest-path "$manifest" --target x86_64-unknown-redox
+      # ferric-perf: the process, pipe, logging and file microbenchmarks. Its timing and
+      # statistics have unit tests, and the benchmarks themselves are POSIX, so the CLI tests
+      # run every one briefly on the host; the Redox build is checked with Clippy and Rustdoc.
+      - name: Process and IPC benchmark checks
+        run: |
+          manifest=recipes/tests/ferric-perf/files/Cargo.toml
           cargo fmt --check --manifest-path "$manifest"
           cargo test --locked --manifest-path "$manifest"
           cargo clippy --locked --manifest-path "$manifest" --all-targets -- -D warnings
