@@ -39,7 +39,10 @@
 //! latency irq irq=all count=1 open=1 unmatched=0 min_ns=1100 mean_ns=1100 p50_ns=1100 p90_ns=1100 p99_ns=1100 max_ns=1100
 //! ```
 //!
-//! `name` is the call's name where `redox_syscall` defines the number; `opcode` is the
+//! `name` is the call's name where `redox_syscall` defines the number. That is the crates.io
+//! release this tool links, which lacks numbers only the in-tree kernel's copy
+//! (`crates/kernel/syscall`) has, such as `SYS_OPENAT_INTO2` (`nr=0x101003da`), the call
+//! relibc opens files with; those lines carry the number alone. `opcode` is the
 //! `schemev2::Opcode` name, or the number for one it does not know. `open` counts intervals
 //! that started in the capture and had not ended by its last record (a call still blocked, an
 //! unanswered request), and the `all` line's `unmatched` counts ends whose start the capture

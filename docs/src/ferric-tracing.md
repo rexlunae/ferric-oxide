@@ -1000,6 +1000,11 @@ latency irq irq=11 count=1 open=0 min_ns=1100 mean_ns=1100 p50_ns=1100 p90_ns=11
 | `wake_run` | The `wait` of `sched.wake_run`: from `unblock` making a context runnable to it running | `cpu`, the CPU it ran on | `sched.wake_run` (`trace_sched`) |
 | `irq` | `irq.deliver` to the `irq.ack` that ended it: the one with the same IRQ, CPU and count, or of a later count when another interrupt of the IRQ arrived before the driver acknowledged this one (the kernel refuses an acknowledgement of a count that is no longer current) | `irq` | `irq` |
 
+System call names come from the crates.io `redox_syscall` release the tool
+links, not from the kernel's in-tree copy (`crates/kernel/syscall`), so a number
+only the kernel's copy defines has no `name`: notably `SYS_OPENAT_INTO2`
+(`nr=0x101003da`), which relibc opens files with.
+
 The pairing of system calls and requests is the one the OpenTelemetry export
 uses (`tools/ferric-trace/src/spans.rs`). For interrupts, a delivery that woke no
 handle is not counted, and when several handles share an IRQ, the first
