@@ -12,9 +12,11 @@
 //!
 //! A host that maps the guest's RAM (QEMU `memory-backend-file,share=on`) finds the region
 //! by that address, or by scanning for the directory, and follows the rings without ever
-//! writing guest memory (`ferric-trace follow`). Readers in the guest still drain the same
-//! rings through `kernel.trace/cpu/<n>`; they cannot map them, because the region's pages are
-//! not frames the frame allocator can hand to a grant.
+//! writing guest memory (`ferric-trace follow`). The host is the host rings' only reader:
+//! reading or committing them through `kernel.trace/cpu/<n>` fails with `EBUSY`
+//! (`scheme::trace`), because a guest consumer would move the `tail` an overtaken host
+//! observer relies on, and mapping them fails, because the region's pages are not frames the
+//! frame allocator can hand to a grant.
 //!
 //! The CPU count comes from the MADT, as for the APs `acpi::madt` starts; the region is sized
 //! for that many CPUs, and a CPU beyond it (none, normally) gets an ordinary ring.

@@ -816,6 +816,42 @@ fn check_fault(cpus: &[u32]) -> Result<(), Failure> {
 }
 
 /// The steps; returns the first failure.
+/// Whether the boot environment asked for host-visible rings (`FERRIC_TRACE_HOST`).
+fn host_rings() -> bool {
+    std::fs::read_to_string("/scheme/sys/env").is_ok_and(|env| {
+        env.lines()
+            .any(|line| line.starts_with("FERRIC_TRACE_HOST="))
+    })
+}
+
+/// `trace-host-busy`: reading CPU 0's host ring, and committing it, fail with `EBUSY`, so
+/// nothing in the guest moves the `tail` a host observer relies on.
+fn host_rings_are_busy() -> Result<(), Failure> {
+    const STEP: &str = "trace-host-busy";
+    let path = path(&format!("{}/0", abi::CPU_DIR));
+    let busy = |what: &str, result: std::io::Result<usize>| match result {
+        Err(err) if err.raw_os_error() == Some(syscall::EBUSY) => Ok(()),
+        Err(err) => Err(check(
+            STEP,
+            format!("{what} of {path}: {err}, expected EBUSY"),
+        )),
+        Ok(len) => Err(check(
+            STEP,
+            format!("{what} of {path} returned {len}, expected EBUSY"),
+        )),
+    };
+    let mut file = File::options()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(io_failure(STEP, &path))?;
+    busy("a read", file.read(&mut vec![0u8; READ_LEN]))?;
+    busy(
+        "a commit",
+        file.write(abi::CpuCommand::Commit(0).to_string().as_bytes()),
+    )
+}
+
 fn run() -> Result<(), Failure> {
     check_initfs()?;
     let list = listing("trace-boot")?;
@@ -1062,6 +1098,24 @@ pub fn main() -> ExitCode {
             println!("FERRIC_TEST_FAIL trace-boot: cannot list /scheme: {err}");
             return ExitCode::FAILURE;
         }
+    }
+    // With host-visible rings the host is their only reader, so the steps below, which drain
+    // and map the rings in the guest, do not apply; `trace-host-busy` checks that they are
+    // refused instead.
+    if host_rings() {
+        return match host_rings_are_busy() {
+            Ok(()) => {
+                println!("FERRIC_TEST_PASS trace-host-busy");
+                println!(
+                    "FERRIC_TEST_SKIP trace: host-visible rings (FERRIC_TRACE_HOST) have one reader, the host"
+                );
+                ExitCode::SUCCESS
+            }
+            Err(failure) => {
+                println!("FERRIC_TEST_FAIL {failure}");
+                ExitCode::FAILURE
+            }
+        };
     }
     // `ferric-trace-test crash` runs the crash-dump step alone (see `crash`).
     let steps = match std::env::args().nth(1).as_deref() {
