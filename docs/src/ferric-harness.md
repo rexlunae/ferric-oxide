@@ -12,20 +12,21 @@ None of this adds code to the guest. Screen and input go through QMP, and text
 goes over the serial port that QEMU already emulates. A normal boot under the
 harness runs the same guest code as a boot without it.
 
-The harness is in progress. Two parts depend on work that is not in this tree
-yet:
+Two parts need image options that are off by default:
 
-- the bootloader's fw_cfg boot environment (feature option
-  `bootloader.fw_cfg_env`) and its `FERRIC_KERNEL` and `FERRIC_BOOT_RESOLUTION`
-  keys;
-- the trace-mode kernel (`kernel.trace_mode`, `usr/lib/boot/kernel-trace`), its
-  host-visible rings (`trace_host`, `FERRIC_TRACE_HOST`) and
-  `ferric-trace follow`, which reads those rings from guest RAM.
+- the default boot environment delivery, fw_cfg, needs a bootloader built with
+  `bootloader.fw_cfg_env`, which reads the file and its `FERRIC_KERNEL` and
+  `FERRIC_BOOT_RESOLUTION` keys
+  ([#380](https://github.com/rexlunae/ferric-oxide/pull/380)). Other
+  bootloaders ignore the file; use `--boot-env-via keys` with them;
+- `--mode trace` needs an image with the trace-mode kernel (`kernel.trace_mode`,
+  `usr/lib/boot/kernel-trace`, #380), which has the host-visible rings
+  (`FERRIC_TRACE_HOST`), and a host `ferric-trace` whose `follow` subcommand
+  reads those rings from guest RAM
+  ([#381](https://github.com/rexlunae/ferric-oxide/pull/381)).
 
-The harness implements its side of these interfaces. Until the other parts
-land, use `--boot-env-via keys` to pass a boot environment, and expect
-`--mode trace` to fail. The [limits](#limits) section lists what has run
-against real images.
+Both have run against real images on KVM. The [limits](#limits) section lists
+what has run and what has not.
 
 ## The supervisor model
 
@@ -434,8 +435,9 @@ Clippy and Rustdoc for the crate.
 ## Limits
 
 These runs were made on 1 November 2026 with KVM, QEMU 10.2.1 and OVMF, on 4
-vCPUs, against images built from main before this work. Their bootloaders have
-no fw_cfg support, and their kernels were built with `kernel.trace`.
+vCPUs, against images built from main before #380 and #381 were merged. Their
+bootloaders have no fw_cfg support, and their kernels were built with
+`kernel.trace`.
 
 - **`ferric-smoke`, headless, 2 GiB RAM** (`run --display none --smoke`). The
   guest booted, ran the smoke tests (163 passed, 19 skipped, 0 failed), printed
@@ -458,7 +460,7 @@ no fw_cfg support, and their kernels were built with `kernel.trace`.
   ([#372](https://github.com/rexlunae/ferric-oxide/issues/372)). The harness
   saw the panic, stopped the run and failed the `crash` check.
 
-On 2 November 2026 the same host ran images built from this branch, with the
+On 2 November 2026 the same host ran images that include #380 and #381, with the
 catalog defaults plus `kernel.trace_mode = true` and
 `bootloader.fw_cfg_env = true` (so the normal kernel has no `kernel.trace`):
 
