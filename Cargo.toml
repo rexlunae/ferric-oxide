@@ -26,6 +26,7 @@ default-members = [
     "crates/fox-store",
     "crates/fat-types",
     "crates/fspath",
+    "crates/guest-ram",
     "crates/heap",
     "crates/iobench",
     "crates/iommu",
@@ -80,6 +81,7 @@ members = [
     "crates/fox-store",
     "crates/fat-types",
     "crates/fspath",
+    "crates/guest-ram",
     "crates/hwrand",
     "crates/heap",
     "crates/iobench",
@@ -155,6 +157,9 @@ semver = "1.0.27"
 # for ferric-boot-time (which the kernel and bootloader also build); host crates
 # that need the clock or formatting add the feature themselves.
 time = { version = "0.3.44", default-features = false }
+# Memory maps, file seeks and the monotonic clock for the host trace follower
+# (ferric-guest-ram, ferric-trace-cli); each crate turns on what it uses.
+rustix = { version = "1.1", default-features = false, features = ["std"] }
 
 [profile.release.package.ferric-config]
 opt-level = 2

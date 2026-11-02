@@ -1,0 +1,16 @@
+[package]
+name = "ferric-guest-ram"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Maps a QEMU guest's RAM file for reading and finds guest-physical addresses in it (the q35 layout)"
+publish = false
+
+[dependencies]
+thiserror = { workspace = true, features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["fs", "mm"] }
+
+[dev-dependencies]
+tempfile.workspace = true

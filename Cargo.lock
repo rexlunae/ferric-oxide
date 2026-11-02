@@ -1372,6 +1372,15 @@ name = "ferric-fspath"
 version = "0.1.0"
 
 [[package]]
+name = "ferric-guest-ram"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "ferric-heap"
 version = "0.1.0"
 dependencies = [
@@ -1510,6 +1519,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "ferric-amdvi",
+ "ferric-guest-ram",
  "ferric-iobench",
  "ferric-procinfo",
  "ferric-trace",
@@ -1518,8 +1528,10 @@ dependencies = [
  "object",
  "redox_syscall 0.9.4",
  "rustc-demangle",
+ "rustix",
  "serde",
  "serde_json",
+ "signal-hook",
  "tempfile",
  "thiserror 2.0.17",
 ]
