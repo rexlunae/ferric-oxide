@@ -21,6 +21,7 @@
 
 use core::sync::atomic::AtomicU64;
 
+use ferric_abi::boot_env::FERRIC_TRACE_HOST;
 use ferric_trace::host::{self, Published, RegionLayout, RingSize, DIRECTORY_WORDS};
 use rmm::BumpAllocator;
 use spin::Once;
@@ -28,8 +29,6 @@ use spin::Once;
 use crate::{cpu_set::MAX_CPU_COUNT, memory::RmmA, reserved::Region};
 
 /// The boot environment key that turns host rings on, with the ring size in KiB.
-const ENV_KEY: &str = "FERRIC_TRACE_HOST";
-
 /// The region [`reserve`] took and its layout.
 struct HostRegion {
     region: Region,
@@ -48,13 +47,13 @@ static PUBLISHED: Once<()> = Once::new();
 /// memory. A value that is not a ring size, or a region that does not fit, is logged and
 /// leaves host rings off.
 pub fn reserve(env: &[u8], allocator: &mut BumpAllocator<RmmA>) {
-    let Some(value) = super::env_value(env, ENV_KEY) else {
+    let Some(value) = super::env_value(env, FERRIC_TRACE_HOST) else {
         return;
     };
     let size = match RingSize::parse(value) {
         Ok(size) => size,
         Err(err) => {
-            crate::warn!("trace: {ENV_KEY}={value:?} ignored: {err}");
+            crate::warn!("trace: {FERRIC_TRACE_HOST}={value:?} ignored: {err}");
             return;
         }
     };
@@ -62,7 +61,7 @@ pub fn reserve(env: &[u8], allocator: &mut BumpAllocator<RmmA>) {
     let layout = match RegionLayout::new(cpus, size) {
         Ok(layout) => layout,
         Err(err) => {
-            crate::warn!("trace: {ENV_KEY}={value:?} ignored: {err}");
+            crate::warn!("trace: {FERRIC_TRACE_HOST}={value:?} ignored: {err}");
             return;
         }
     };
@@ -72,7 +71,7 @@ pub fn reserve(env: &[u8], allocator: &mut BumpAllocator<RmmA>) {
         }
         Err(err) => {
             crate::warn!(
-                "trace: {ENV_KEY}={value:?} ignored: {cpus} CPUs x {} KiB: {err}",
+                "trace: {FERRIC_TRACE_HOST}={value:?} ignored: {cpus} CPUs x {} KiB: {err}",
                 size.kib()
             );
         }
