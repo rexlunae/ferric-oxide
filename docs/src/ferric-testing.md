@@ -542,7 +542,7 @@ whose names start with those words, and `ferric-perf --list` lists them.
 | `pipe-rtt-1b` | One thread writes a byte into a pipe and reads it back: the pipe's system calls without a wake-up or switch |
 | `pipe-throughput` | Reading 4 MiB that a writer thread sends in 64 KiB writes; adds `bytes` and `mib_s` |
 | `write-null`, `write-log` | One 70-byte line written to `/scheme/null` (`zerod`), or to `/scheme/log`, the standard output and error init gives services; adds `bytes` and `mib_s` |
-| `file-create`, `file-stat`, `file-unlink` | Creating (`O_CREAT \| O_EXCL`, then closing) an empty file in `/tmp/ferric-perf/files` (RedoxFS: `/tmp` is a directory of the root file system), getting a file's metadata by path, removing a file |
+| `file-create`, `file-stat`, `file-unlink` | Creating (`O_CREAT \| O_EXCL`, then closing) an empty file in a new scratch directory, `/tmp/ferric-perf/ferric-perf-<pid>-files` (`--dir` sets the parent; a name a killed run left gets a `.<n>` suffix, and nothing already there is touched; RedoxFS: `/tmp` is a directory of the root file system), getting a file's metadata by path, removing a file |
 | `mmap-map`, `mmap-touch`, `mmap-unmap` | `mmap` of a 32 MiB file (`PROT_READ`, `MAP_PRIVATE`, as `ld.so` maps objects), reading one byte of every 4 KiB page of the new mapping, `munmap`; the first two add `bytes` and `mib_s` |
 
 The static spawn target is `/usr/bin/ferric-perf-true`, an empty Rust program
