@@ -84,6 +84,11 @@ depends = "target.arch == 'x86_64'"
 help = "Kernel tracepoints (Phase T): which are compiled in, and which are on from boot."
 
 [[menu]]
+id = "bootloader"
+title = "Bootloader"
+help = "Build-time options of the UEFI bootloader (crates/bootloader)."
+
+[[menu]]
 id = "drivers"
 title = "Drivers"
 help = "Build-time options of the user-space drivers in the base package."
@@ -981,7 +986,8 @@ rebuild = ["kernel"]
 help = """
 Events to turn on before the other CPUs start: a list of "all", subsystem
 names (syscall, sched) or event names (sched.switch), separated by commas.
-FERRIC_TRACE= in the boot environment (press e in the bootloader) adds to it."""
+FERRIC_TRACE= in the boot environment (typed into the bootloader's editor after
+pressing e, or from QEMU with bootloader.fw_cfg_env) adds to it."""
 
 [[option]]
 id = "kernel.trace_initfs_enable"
@@ -1067,6 +1073,35 @@ For testing only: writing `panic` to /scheme/kernel.trace/crash (as root)
 panics the kernel on purpose, and the panic handler resets the machine once
 the dump is written, so the next boot can read it back. CI's crash-dump image
 turns it on; never turn it on elsewhere."""
+
+[[option]]
+id = "kernel.trace_mode"
+menu = "kernel.tracing"
+type = "bool"
+title = "Trace-mode kernel (a second kernel, with tracing)"
+default = false
+depends = "target.arch == 'x86_64'"
+rebuild = ["kernel-trace"]
+help = """
+Also build a trace-mode kernel and install it as usr/lib/boot/kernel-trace,
+beside the image's kernel. It has the image kernel's features plus tracing:
+kernel.trace with every subsystem's tracepoints at kernel.trace_max_level's
+default level, and kernel.trace_crash; kernel.profiling, which cannot be
+combined with tracing, is left out. It logs "trace: trace-mode kernel" at boot.
+
+The bootloader loads it when the boot environment has FERRIC_KERNEL=trace (from
+QEMU with bootloader.fw_cfg_env, or typed into its editor), or when t is
+pressed in its resolution menu, where the key appears once the image has the
+trace-mode kernel. Every other boot loads the normal kernel: with kernel.trace
+off it has no tracing code at all, and user space does no tracing work for it.
+Events are turned on in the trace-mode kernel with FERRIC_TRACE= or at run
+time. Off by default; costs a second kernel build."""
+
+[[option.effect]]
+when = "value"
+source_packages = ["kernel-trace"]
+# A kernel: never built with the userspace CPU baseline (cpu.flags_exclude).
+make_append = { FERRIC_TARGET_FLAGS_EXCLUDE = "kernel-trace" }
 
 [[option]]
 id = "kernel.log_persist"
@@ -1340,6 +1375,34 @@ other "auto" CPU options it acts as "never" without kernel.self_modifying. Off
 by default because CI cannot test it: KVM on the runners does not expose CET and
 QEMU's emulator does not implement it."""
 choices = ["always", "auto", "never"]
+
+# ---------------------------------------------------------------- bootloader
+
+[[option]]
+id = "bootloader.fw_cfg_env"
+menu = "bootloader"
+type = "bool"
+title = "Boot environment lines from QEMU (fw_cfg)"
+default = false
+depends = "target.arch == 'x86_64'"
+rebuild = ["bootloader"]
+help = """
+Under QEMU, have the bootloader read boot environment lines from the fw_cfg
+file opt/org.ferric-oxide/boot-env before its resolution menu, as if they were
+typed into its environment editor, which still shows them. QEMU passes the file
+with -fw_cfg name=opt/org.ferric-oxide/boot-env,file=<path>. A harness can so
+choose the trace-mode kernel (FERRIC_KERNEL=trace, kernel.trace_mode), skip the
+menu (FERRIC_BOOT_RESOLUTION=auto) or turn trace events on (FERRIC_TRACE=...)
+without a keyboard, also on boots without a display, where the menu and the
+editor never appear. The file holds KEY=VALUE lines and # comments, at most
+4 KiB; keep it much smaller, since bootstrap reads less than 4 KiB of the whole
+boot environment. The bootloader probes the fw_cfg I/O ports only when CPUID
+reports a hypervisor, and reads on only when they answer with QEMU's signature,
+so on other machines it does nothing."""
+
+[[option.effect]]
+when = "value"
+make_append = { FERRIC_BOOTLOADER_FEATURES = "fw_cfg_env" }
 
 # ---------------------------------------------------------------- image
 
