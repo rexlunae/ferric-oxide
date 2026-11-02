@@ -1124,7 +1124,12 @@ shared file (memory-backend-file,share=on), `ferric-trace follow` on the host
 reads them as the guest runs, without any guest code, interrupt or exit, and
 saves a capture directory. Without FERRIC_TRACE_HOST the kernel behaves as
 with kernel.trace alone. Readers in the guest can still drain host rings but
-not map them."""
+not map them.
+
+This option puts host rings in the image's normal kernel, which needs
+kernel.trace. The trace-mode kernel (kernel.trace_mode) always has them,
+without this option or kernel.trace, so the normal kernel can stay free of
+tracing code."""
 
 [[option]]
 id = "kernel.log_persist"
