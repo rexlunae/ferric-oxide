@@ -1270,7 +1270,7 @@ It writes the [capture directory format](#reading-a-capture-on-the-host), so
 | File | Content |
 | --- | --- |
 | `INCOMPLETE` | Present until `follow` stops cleanly |
-| `clock` | The trace clock, from the directory. When it is the TSC and the kernel does not know its rate, `follow` measures the rate against host time once it stops (over at least 1 s of samples) and writes the period, so `counts`, `latency` and `perfetto` need no `--tsc-mhz` |
+| `clock` | The trace clock, from the directory. When it is the TSC and the kernel does not know its rate, `follow` measures the rate against host time once it stops and writes the period, so `counts`, `latency` and `perfetto` need no `--tsc-mhz`. It measures from one CPU's first and latest `host-clock` samples, the CPU whose samples span the most host time (at least 1 s), never from a pair taken on two CPUs: an idle CPU's newest record can be much older than the time it was read at |
 | `cpu<n>` | CPU n's records, appended as they are read |
 | `stats.start` | Per CPU, the words in the ring when following began and the records the kernel had dropped or overwritten by then |
 | `stats.end` | Per CPU, the words left unread, and the records lost: those of `stats.start` plus `follow`'s own losses |
