@@ -24,9 +24,10 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
+use ferric_abi::boot_env::Kernel;
 use serde::{Deserialize, Serialize};
 
-use crate::bootenv::{BootEnvVia, FW_CFG_NAME};
+use crate::bootenv::{BootEnvVia, FW_CFG_FILE};
 use crate::error::Error;
 use crate::rundir::RunDir;
 
@@ -42,18 +43,18 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// The `FERRIC_KERNEL` value that selects this mode's kernel.
-    pub const fn kernel_value(self) -> &'static str {
+    /// The kernel this mode boots; its name is the `FERRIC_KERNEL` value that selects it.
+    pub const fn kernel(self) -> Kernel {
         match self {
-            Mode::Normal => "normal",
-            Mode::Trace => "trace",
+            Mode::Normal => Kernel::Normal,
+            Mode::Trace => Kernel::Trace,
         }
     }
 }
 
 impl fmt::Display for Mode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.kernel_value())
+        f.write_str(self.kernel().name())
     }
 }
 
@@ -508,7 +509,7 @@ pub fn plan(
     if with_fw_cfg {
         push(&[
             "-fw_cfg",
-            &format!("name={FW_CFG_NAME},file={}", escape_value(&run.boot_env())),
+            &format!("name={FW_CFG_FILE},file={}", escape_value(&run.boot_env())),
         ]);
     }
     args.extend(config.qemu_args.iter().cloned());

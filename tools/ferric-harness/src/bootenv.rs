@@ -4,7 +4,7 @@
 //! own lines in one of two ways:
 //!
 //! - **fw_cfg** (default): the lines are written to `<run>/boot-env` and QEMU exposes the
-//!   file to the guest as the fw_cfg file [`FW_CFG_NAME`]. A bootloader built with
+//!   file to the guest as the fw_cfg file [`FW_CFG_FILE`]. A bootloader built with
 //!   `bootloader.fw_cfg_env` merges it before the resolution menu, and with
 //!   `FERRIC_BOOT_RESOLUTION=auto` skips the menu. Older bootloaders ignore it.
 //! - **keys**: the harness answers the resolution menu with `e`, types each line into the
@@ -14,27 +14,18 @@
 //! `--mode trace` adds `FERRIC_KERNEL=trace` (load `usr/lib/boot/kernel-trace`) and
 //! `FERRIC_TRACE_HOST=<KiB per CPU>` (allocate host-visible rings).
 //!
-//! The key names are those of `ferric_abi::boot_env`; they are spelled out here because that
-//! module is being added in parallel with this crate, and should be used from there once
-//! both have landed.
+//! The key names, the fw_cfg file name, the size limit and the key rule are those of
+//! [`ferric_abi::boot_env`], the definitions the bootloader and kernel use.
 
+use ferric_abi::boot_env::{
+    self, FERRIC_BOOT_RESOLUTION, FERRIC_KERNEL, FERRIC_TRACE_HOST, Kernel, MAX_PRESET_BYTES,
+    Resolution,
+};
 use thiserror::Error;
 
 use crate::machine::{Display, Mode};
 
-/// The fw_cfg file name the bootloader reads.
-pub const FW_CFG_NAME: &str = "opt/org.ferric-oxide/boot-env";
-/// Largest boot-env file the bootloader accepts.
-pub const MAX_BYTES: usize = 4096;
-
-/// Selects the kernel: `normal` (the default) or `trace`.
-pub const FERRIC_KERNEL: &str = "FERRIC_KERNEL";
-/// `auto` chooses the best video mode without showing the resolution menu.
-pub const FERRIC_BOOT_RESOLUTION: &str = "FERRIC_BOOT_RESOLUTION";
-/// Trace events to turn on at boot (see `docs/src/ferric-tracing.md`).
-pub const FERRIC_TRACE: &str = "FERRIC_TRACE";
-/// KiB per CPU of host-visible trace rings.
-pub const FERRIC_TRACE_HOST: &str = "FERRIC_TRACE_HOST";
+pub use ferric_abi::boot_env::FW_CFG_FILE;
 
 /// How the boot environment reaches the bootloader.
 #[derive(
@@ -103,7 +94,8 @@ impl BootEnv {
     /// # Errors
     ///
     /// Any [`BootEnvError`]: a malformed entry, a ring size that is not a power of two, a
-    /// `FERRIC_KERNEL` that contradicts the mode, or a file over [`MAX_BYTES`].
+    /// `FERRIC_KERNEL` that contradicts the mode, or a file over
+    /// [`MAX_PRESET_BYTES`].
     pub fn for_run(
         user: &[(String, String)],
         mode: Mode,
@@ -116,14 +108,14 @@ impl BootEnv {
             if !trace_ring_kib.is_power_of_two() {
                 return Err(BootEnvError::RingSize(trace_ring_kib));
             }
-            env.set(FERRIC_KERNEL, "trace")?;
+            env.set(FERRIC_KERNEL, Kernel::Trace.name())?;
             env.set(FERRIC_TRACE_HOST, &trace_ring_kib.to_string())?;
         }
         if display == Display::Std && via == BootEnvVia::FwCfg {
-            env.set(FERRIC_BOOT_RESOLUTION, "auto")?;
+            env.set(FERRIC_BOOT_RESOLUTION, Resolution::Auto.name())?;
         }
         for (key, value) in user {
-            if key == FERRIC_KERNEL && value != mode.kernel_value() {
+            if key == FERRIC_KERNEL && Kernel::parse(value.as_bytes()) != Ok(mode.kernel()) {
                 return Err(BootEnvError::KernelConflict {
                     value: value.clone(),
                     mode,
@@ -132,10 +124,10 @@ impl BootEnv {
             env.set(key, value)?;
         }
         let bytes = env.render().len();
-        if bytes > MAX_BYTES {
+        if bytes > MAX_PRESET_BYTES {
             return Err(BootEnvError::TooLarge {
                 bytes,
-                max: MAX_BYTES,
+                max: MAX_PRESET_BYTES,
             });
         }
         Ok(env)
@@ -202,19 +194,17 @@ pub fn parse_assignment(text: &str) -> Result<(String, String), BootEnvError> {
     Ok((key.to_owned(), value.to_owned()))
 }
 
+/// Checks one entry with the rule the bootloader and kernel read the environment by
+/// ([`boot_env::Line::parse`]); a value must also stay on its line.
 fn validate(key: &str, value: &str) -> Result<(), BootEnvError> {
-    let key_ok = key
-        .bytes()
-        .next()
-        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
-        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-    if !key_ok {
-        return Err(BootEnvError::Key(key.to_owned()));
-    }
     if value.contains(['\n', '\r', '\0']) {
         return Err(BootEnvError::Value(key.to_owned()));
     }
-    Ok(())
+    let line = format!("{key}={value}");
+    match boot_env::Line::parse(line.as_bytes()) {
+        boot_env::Line::Assignment(entry) if entry.key() == key => Ok(()),
+        _ => Err(BootEnvError::Key(key.to_owned())),
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +294,28 @@ mod tests {
             BootEnv::for_run(
                 &[kv("FERRIC_KERNEL", "normal")],
                 Mode::Trace,
+                4096,
+                Display::None,
+                BootEnvVia::FwCfg
+            ),
+            Err(BootEnvError::KernelConflict { .. })
+        ));
+        // The kernel is named as the bootloader reads it: blanks around it do not matter,
+        // and a name it does not know contradicts any mode.
+        assert!(
+            BootEnv::for_run(
+                &[kv("FERRIC_KERNEL", " trace ")],
+                Mode::Trace,
+                4096,
+                Display::None,
+                BootEnvVia::FwCfg
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            BootEnv::for_run(
+                &[kv("FERRIC_KERNEL", "debug")],
+                Mode::Normal,
                 4096,
                 Display::None,
                 BootEnvVia::FwCfg
