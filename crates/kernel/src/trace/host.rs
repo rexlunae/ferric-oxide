@@ -28,7 +28,6 @@ use spin::Once;
 
 use crate::{cpu_set::MAX_CPU_COUNT, memory::RmmA, reserved::Region};
 
-/// The boot environment key that turns host rings on, with the ring size in KiB.
 /// The region [`reserve`] took and its layout.
 struct HostRegion {
     region: Region,
