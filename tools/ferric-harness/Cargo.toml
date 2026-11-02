@@ -32,4 +32,6 @@ time = { workspace = true, features = ["std", "formatting"] }
 toml = { workspace = true, features = ["parse", "serde", "std"] }
 
 [dev-dependencies]
+# A pseudo-terminal for the `serial send --secret` echo tests.
+rustix = { version = "1", features = ["pty", "termios", "process"] }
 tempfile.workspace = true

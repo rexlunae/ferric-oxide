@@ -510,20 +510,31 @@ struct NoEcho<'a> {
 impl<'a> NoEcho<'a> {
     fn on(stdin: &'a std::io::Stdin) -> Self {
         use rustix::termios::{LocalModes, OptionalActions, isatty, tcgetattr, tcsetattr};
-        let saved = isatty(stdin)
-            .then(|| tcgetattr(stdin).ok())
-            .flatten()
-            .filter(|saved| {
-                let mut quiet = saved.clone();
-                quiet.local_modes.remove(LocalModes::ECHO);
-                tcsetattr(stdin, OptionalActions::Now, &quiet).is_ok()
-            });
-        let signals = saved.clone().and_then(restore_on_signal);
-        Self {
+        let none = Self {
             stdin,
-            saved,
-            signals,
+            saved: None,
+            signals: None,
+        };
+        let Some(saved) = isatty(stdin).then(|| tcgetattr(stdin).ok()).flatten() else {
+            return none;
+        };
+        // The signal watcher comes first: without it a signal would end the process with echo
+        // off, so if it cannot be started, echo stays on.
+        let Some(signals) = restore_on_signal(saved.clone()) else {
+            eprintln!("ferric-harness: cannot catch interrupts, so the secret is echoed");
+            return none;
+        };
+        let mut quiet = saved.clone();
+        quiet.local_modes.remove(LocalModes::ECHO);
+        let mut guard = Self {
+            stdin,
+            saved: None,
+            signals: Some(signals),
+        };
+        if tcsetattr(stdin, OptionalActions::Now, &quiet).is_ok() {
+            guard.saved = Some(saved);
         }
+        guard
     }
 
     /// Whether echo was turned off (standard input is a terminal that allowed it).
