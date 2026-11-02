@@ -18,7 +18,7 @@
 //! observer relies on, and mapping them fails, because the region's pages are not frames the
 //! frame allocator can hand to a grant.
 //!
-//! Since the kernel can refuse the request, the `kernel.trace/host` file ([`line`]) is what
+//! Since the kernel can refuse the request, the `kernel.trace/host` file ([`line()`]) is what
 //! says whether there are host rings: tests and scripts in the guest decide from it.
 //!
 //! The CPU count comes from the MADT, as for the APs `acpi::madt` starts; the region is sized
