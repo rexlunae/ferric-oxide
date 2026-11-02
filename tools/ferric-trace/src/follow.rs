@@ -136,7 +136,8 @@ pub struct CpuSummary {
     pub bytes: u64,
     /// The records saved.
     pub records: u64,
-    /// The records lost before following began, a lower bound: the larger of the kernel's
+    /// The records lost before following began (before the first poll, which [`run`] makes
+    /// right after [`Follower::start`]), a lower bound: the larger of the kernel's
     /// count (records it overwrote before any reader took them, and records it dropped
     /// without writing) and the records estimated in [`CpuSummary::lost_words_before`],
     /// which also holds records a guest reader consumed before they were overwritten, which
@@ -700,6 +701,11 @@ impl<'a> Follower<'a> {
         if reason != StopReason::Rebooted {
             self.poll(monotonic_ns(), None)?;
         }
+        // A guest that booted again before any poll finished leaves `stats.start` to write
+        // here, from what the follower saw: nothing copied, so the kernel's count alone.
+        if !self.start_written {
+            self.write_start()?;
+        }
         let mut end = String::new();
         let mut cpus = Vec::with_capacity(self.cpus.len());
         for state in &mut self.cpus {
@@ -1251,6 +1257,30 @@ mod tests {
         let summary = follower.finish(StopReason::Rebooted).expect("finishes");
         assert_eq!(summary.cpus[0].records, 5);
         assert_eq!(captured(&out)[&0].len(), 5);
+    }
+
+    /// A reboot before the first poll still leaves both snapshots.
+    #[test]
+    fn a_reboot_before_the_first_poll_still_writes_stats_start() {
+        let mut guest = Guest::new(RamLayout::q35(4 * MIB), MIB, 1, 4);
+        guest.push(0, &SYSCALL_EXIT, 5);
+        guest.sync();
+        let ram = guest.map();
+        let out_dir = tempfile::tempdir().expect("a directory");
+        let out = out_dir.path().join("trace");
+        create_output(&out).expect("created");
+        let (phys, directory) = find_directory(&ram, Some(MIB))
+            .expect("reads")
+            .expect("found");
+        let mut follower = Follower::start(&ram, phys, &directory, &out).expect("starts");
+        guest.generation += 1;
+        guest.publish();
+        guest.sync();
+        assert_eq!(follower.poll(1, None).expect("polls"), Poll::Rebooted);
+        follower.finish(StopReason::Rebooted).expect("finishes");
+        assert_eq!(stats(&out.join(STATS_START)).len(), 1);
+        assert_eq!(stats(&out.join(STATS_END)).len(), 1);
+        assert!(!out.join(INCOMPLETE).exists());
     }
 
     #[test]
