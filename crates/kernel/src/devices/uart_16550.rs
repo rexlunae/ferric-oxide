@@ -2,6 +2,7 @@
 
 use core::convert::TryInto;
 
+use super::uart_tx::{tx_burst, PortKind, TxCredit};
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::syscall::io::Pio;
 use crate::syscall::io::{Io, MmioPtr, ReadOnly};
@@ -43,6 +44,10 @@ pub struct SerialPort<T: Io> {
     line_sts: ReadOnly<T>,
     /// Modem status
     modem_sts: ReadOnly<T>,
+    /// Ferric Oxide: how the port is reached, which decides whether its FIFO depth is known.
+    kind: PortKind,
+    /// Ferric Oxide: when `send` reads the line status ([`super::uart_tx`]).
+    tx: TxCredit,
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -56,6 +61,8 @@ impl SerialPort<Pio<u8>> {
             modem_ctrl: Pio::new(base + 4),
             line_sts: ReadOnly::new(Pio::new(base + 5)),
             modem_sts: ReadOnly::new(Pio::new(base + 6)),
+            kind: PortKind::PortIo,
+            tx: TxCredit::new(),
         }
     }
 }
@@ -76,6 +83,8 @@ where
                 modem_ctrl: MmioPtr::new(ptr.add(4)),
                 line_sts: ReadOnly::new(MmioPtr::new(ptr.add(5))),
                 modem_sts: ReadOnly::new(MmioPtr::new(ptr.add(6))),
+                kind: PortKind::Mmio,
+                tx: TxCredit::new(),
             }
         }
     }
@@ -86,6 +95,7 @@ where
     T::Value: From<u8> + TryInto<u8>,
 {
     pub fn init(&mut self) -> Result<(), ()> {
+        let burst;
         unsafe {
             //TODO: Cleanup
             // FIXME: Fix UB if unaligned
@@ -104,6 +114,13 @@ where
 
             // Enable and clear FIFOs with 14-byte threshold
             self.fifo_ctrl.write(0xC7.into());
+            // Ferric Oxide: with a working transmit FIFO of known depth, `send` fills it
+            // whenever the line status says it is empty instead of reading the status before
+            // every byte; see `uart_tx`.
+            let iir: u8 = (self.fifo_ctrl.read() & 0xFF.into())
+                .try_into()
+                .unwrap_or(0);
+            burst = tx_burst(self.kind, iir);
 
             // IRQs enabled, RTS/DSR set
             self.modem_ctrl.write(0x0B.into());
@@ -134,6 +151,9 @@ where
             // Enable receive interrupt
             self.int_en.write(0x01.into());
         }
+        // The loopback test wrote to the transmitter; `set_burst` waits for it to empty before
+        // the next byte.
+        self.tx.set_burst(burst);
 
         Ok(())
     }
@@ -152,8 +172,14 @@ where
         }
     }
 
+    /// Sends one byte, first waiting for the transmitter to empty when the bytes written since
+    /// it last did could fill it.
     pub fn send(&mut self, data: u8) {
-        while !self.line_sts().contains(LineStsFlags::OUTPUT_EMPTY) {}
+        if self.tx.must_poll() {
+            while !self.line_sts().contains(LineStsFlags::OUTPUT_EMPTY) {}
+            self.tx.emptied();
+        }
+        self.tx.sent();
         self.data.write(data.into())
     }
 
