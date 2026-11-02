@@ -4,8 +4,11 @@
 //! When the initfs has `lib/trace.toml` (ferric-config's `kernel.trace_initfs_*` options put it
 //! there), bootstrap parses it and writes its `enable` and `disable` commands to
 //! `/scheme/kernel.trace/events`, as `echo "enable ..."` would. The kernel logs each change.
-//! Nothing here is fatal: a missing file is the normal case, and a bad file, a kernel without
-//! `kernel.trace` or a refused command is logged and boot goes on.
+//!
+//! Bootstrap calls [`apply`] only when the kernel handed it the trace scheme. A kernel built
+//! without tracing (the normal kernel of an image with `kernel.trace_mode`) has none, and then
+//! the file is not even opened. Nothing here is fatal: a missing file is the normal case, and a
+//! bad file or a refused command is logged and boot goes on.
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
