@@ -99,6 +99,27 @@ fn exports_perfetto_json() {
     );
 }
 
+/// `tests/fixtures/latency` is a capture written byte by byte from the record format's
+/// description (`ferric_trace::record`), not with this crate's encoder, with an HPET clock of
+/// 10 ns per tick. CPU 0: context 3/7 makes a `write` (ticks 200 to 500) whose scheme request
+/// (scheme 2, `Write`) blocks it from 210 until the daemon on CPU 1 answers at 400; IRQ 11 is
+/// delivered at 300 and acknowledged on CPU 1 at 410; 3/7 runs again after a 20-tick wait,
+/// makes two `yield`s of 10 and 5 ticks and a `futex` still running at the end. CPU 1 starts
+/// with a `read` exit whose enter is not in the capture, and ends with a delivery that woke no
+/// handle and one of IRQ 1 that nobody acknowledged.
+#[test]
+fn prints_latency_histograms_of_a_fixture_capture() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let output = ferric_trace()
+        .arg("latency")
+        .arg(fixtures.join("latency"))
+        .output()
+        .expect("runs");
+    assert!(output.status.success(), "{output:?}");
+    let expected = fs::read_to_string(fixtures.join("latency.expected")).expect("expected output");
+    assert_eq!(String::from_utf8(output.stdout).expect("utf-8"), expected);
+}
+
 #[test]
 fn prints_text() {
     let dir = capture();

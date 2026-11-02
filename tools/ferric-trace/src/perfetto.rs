@@ -48,7 +48,6 @@ use ferric_trace::kernel::{
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
-use syscall::schemev2::Opcode;
 
 use crate::capture::{Capture, Entry};
 use crate::describe;
@@ -564,10 +563,7 @@ impl Converter {
 
 /// A scheme opcode's name (`Write`), or `op <n>` for a number `schemev2::Opcode` does not know.
 pub(crate) fn opcode_name(raw: u64) -> String {
-    u8::try_from(raw)
-        .ok()
-        .and_then(Opcode::try_from_raw)
-        .map_or_else(|| format!("op {raw}"), |op| format!("{op:?}"))
+    describe::opcode(raw).map_or_else(|| format!("op {raw}"), |op| format!("{op:?}"))
 }
 
 /// An event without arguments at `ts`.

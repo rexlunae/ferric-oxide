@@ -103,7 +103,7 @@ impl EventCounts {
 }
 
 /// Ticks of a capture's clock, as nanoseconds.
-fn ticks_to_ns(ticks: u64, rate: TickRate) -> u64 {
+pub(crate) fn ticks_to_ns(ticks: u64, rate: TickRate) -> u64 {
     (ticks as f64 / rate.get() * 1000.0).round() as u64
 }
 

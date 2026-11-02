@@ -16,6 +16,7 @@ use ferric_trace_cli::capture::{Capture, CaptureError};
 use ferric_trace_cli::counts;
 use ferric_trace_cli::crash::CrashReport;
 use ferric_trace_cli::flamegraph::{Folded, Symbolizer};
+use ferric_trace_cli::latency::Latencies;
 use ferric_trace_cli::profile::{self, Run};
 use ferric_trace_cli::{drain, otlp, perfetto, svg, text};
 
@@ -105,6 +106,19 @@ enum Cmd {
         /// nanoseconds; repeat to ask for more events
         #[arg(long = "gap")]
         gap: Vec<String>,
+        /// The TSC frequency of the traced machine in MHz, as for `perfetto`
+        #[arg(long, default_value = "1000")]
+        tsc_mhz: perfetto::TscMhz,
+    },
+    /// Print latency histograms as `key=value` lines: system calls by number, scheme requests
+    /// by scheme and opcode, sched.wake_run waits, and interrupt delivery to acknowledgement
+    Latency {
+        /// Capture files (`cpu<n>`, `cpu<n>.bin`) or directories holding them
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        /// Read a capture marked INCOMPLETE (one that failed or was killed) anyway
+        #[arg(long)]
+        partial: bool,
         /// The TSC frequency of the traced machine in MHz, as for `perfetto`
         #[arg(long, default_value = "1000")]
         tsc_mhz: perfetto::TscMhz,
@@ -296,6 +310,23 @@ fn run(cli: Cli) -> Result<(), CliError> {
             let stdout = io::stdout();
             let mut out = BufWriter::new(stdout.lock());
             counts::write(&capture, &gap, &losses, tsc_mhz, &mut out)
+                .and_then(|()| out.flush())
+                .map_err(|source| CliError::Write {
+                    path: PathBuf::from("<stdout>"),
+                    source,
+                })
+        }
+        Cmd::Latency {
+            inputs,
+            partial,
+            tsc_mhz,
+        } => {
+            let capture = loader(partial)(&inputs)?;
+            let rate = perfetto::TickRate::for_clock(capture.clock(), tsc_mhz);
+            let stdout = io::stdout();
+            let mut out = BufWriter::new(stdout.lock());
+            Latencies::new(&capture, rate)
+                .write(&mut out)
                 .and_then(|()| out.flush())
                 .map_err(|source| CliError::Write {
                     path: PathBuf::from("<stdout>"),

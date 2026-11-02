@@ -19,6 +19,8 @@
 //! - [`counts`] prints how many records each event produced and their rates, and, with
 //!   `--gap`, the gaps between a CPU's consecutive records of an event, as `key=value`
 //!   lines the scheduler baseline protocol reads (`ferric-trace counts`).
+//! - [`latency`] prints histograms of how long system calls, scheme requests, wake-ups and
+//!   interrupts took, as `key=value` lines (`ferric-trace latency`).
 //! - [`tsc`] measures the TSC frequency against the monotonic clock, the value a TSC capture's
 //!   `--tsc-mhz` needs (the `ferric-trace tsc-mhz` command).
 //! - [`describe`] puts the records whose arguments are codes (page fault flags, interrupt
@@ -28,7 +30,8 @@
 //!   Google's "Trace Event Format" document; Perfetto's JSON importer accepts the subset used
 //!   here.
 //! - [`spans`] pairs a capture's records into system call and scheme request spans on the
-//!   contexts that made them, and [`otlp`] exports those as OpenTelemetry (OTLP/JSON) traces.
+//!   contexts that made them, and interrupt deliveries with their acknowledgements;
+//!   [`otlp`] exports the spans as OpenTelemetry (OTLP/JSON) traces.
 //!
 //! # Examples
 //!
@@ -58,6 +61,7 @@ pub mod crash;
 pub mod describe;
 pub mod drain;
 pub mod flamegraph;
+pub mod latency;
 pub mod otlp;
 pub mod perfetto;
 pub mod profile;

@@ -25,11 +25,16 @@
 //!
 //! A span still open at the end of the capture has no [`end`](Span::end);
 //! [`Spans::last_seen`] gives its context's last record, where an export can end it.
+//!
+//! Interrupts are not a context's spans: the CPU that takes one and the driver that
+//! acknowledges it are unrelated contexts. [`Interrupt::pair`] pairs each `irq.deliver` with
+//! the `irq.ack` of the same IRQ, CPU and count, the span a driver took to handle it.
 
 use std::collections::HashMap;
 
 use ferric_trace::kernel::{
-    SCHED_SWITCH, SCHEME_CANCEL, SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER, SYSCALL_EXIT,
+    IRQ_ACK, IRQ_DELIVER, SCHED_SWITCH, SCHEME_CANCEL, SCHEME_REQUEST, SCHEME_RESPONSE,
+    SYSCALL_ENTER, SYSCALL_EXIT,
 };
 
 use crate::capture::{Capture, Entry};
@@ -99,6 +104,51 @@ pub struct Spans {
     pub spans: Vec<Span>,
     /// Each context's last record.
     last_seen: HashMap<Context, usize>,
+}
+
+/// An interrupt's handling: from the `irq.deliver` that woke its `irq:` handles to the
+/// `irq.ack` a driver wrote for it. Records are indices into [`Capture::entries`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Interrupt {
+    /// The IRQ number.
+    pub irq: u64,
+    /// The CPU the interrupt was counted for (the record's argument, which is not always the
+    /// CPU whose ring holds the record).
+    pub cpu: u64,
+    /// The `irq.deliver` record.
+    pub deliver: usize,
+    /// The matching `irq.ack` record, or `None` when the capture ends before it.
+    pub ack: Option<usize>,
+}
+
+impl Interrupt {
+    /// The interrupts of `capture`, in delivery order.
+    ///
+    /// A delivery is matched with the next `irq.ack` of the same IRQ, CPU and count, as the
+    /// event's documentation says: a later interrupt of the IRQ raises the count. A delivery
+    /// that woke no handle is left out, since nothing will acknowledge it, and so is an
+    /// acknowledgement whose delivery is not in the capture.
+    pub fn pair(capture: &Capture) -> Vec<Self> {
+        let mut interrupts = Vec::new();
+        let mut waiting: HashMap<(u64, u64, u64), usize> = HashMap::new();
+        for (index, entry) in capture.entries().iter().enumerate() {
+            let id = entry.event.id();
+            if id == IRQ_DELIVER.id() && entry.arg(4) != 0 {
+                waiting.insert((entry.arg(0), entry.arg(1), entry.arg(3)), interrupts.len());
+                interrupts.push(Self {
+                    irq: entry.arg(0),
+                    cpu: entry.arg(1),
+                    deliver: index,
+                    ack: None,
+                });
+            } else if id == IRQ_ACK.id()
+                && let Some(at) = waiting.remove(&(entry.arg(0), entry.arg(1), entry.arg(2)))
+            {
+                interrupts[at].ack = Some(index);
+            }
+        }
+        interrupts
+    }
 }
 
 /// The pairing state.
@@ -467,6 +517,42 @@ mod tests {
             .find(|s| matches!(s.kind, SpanKind::Request { .. }))
             .expect("the request");
         assert_eq!(request.end, Some(5));
+    }
+
+    #[test]
+    fn interrupts_pair_by_irq_cpu_and_count() {
+        let capture = capture(&[
+            bytes(&[
+                // IRQ 11 for CPU 0, count 5, one handle woken.
+                (&IRQ_DELIVER, 100, &[11, 0, 1, 5, 1]),
+                // No handle woke: nobody will acknowledge it.
+                (&IRQ_DELIVER, 110, &[12, 0, 1, 9, 0]),
+                // Count 6 of the same IRQ, never acknowledged.
+                (&IRQ_DELIVER, 300, &[11, 0, 1, 6, 1]),
+            ]),
+            bytes(&[
+                // An acknowledgement of a count that was not delivered in the capture.
+                (&IRQ_ACK, 150, &[11, 0, 4]),
+                (&IRQ_ACK, 200, &[11, 0, 5]),
+            ]),
+        ]);
+        assert_eq!(
+            Interrupt::pair(&capture),
+            [
+                Interrupt {
+                    irq: 11,
+                    cpu: 0,
+                    deliver: 0,
+                    ack: Some(3),
+                },
+                Interrupt {
+                    irq: 11,
+                    cpu: 0,
+                    deliver: 4,
+                    ack: None,
+                },
+            ]
+        );
     }
 
     #[test]
