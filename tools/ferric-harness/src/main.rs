@@ -472,10 +472,11 @@ fn verdict_exit(outcome: Option<Outcome>) -> ExitCode {
 /// # Errors
 ///
 /// [`Error::SecretInput`] when standard input cannot be read, or ends before a line (no
-/// secret is sent then, rather than an empty one).
+/// secret is sent then, rather than an empty one), or is a terminal whose echo cannot be
+/// turned off safely ([`NoEcho::on`]): the secret is then not read at all, rather than shown.
 fn read_secret() -> Result<String, Error> {
     let stdin = std::io::stdin();
-    let echo = NoEcho::on(&stdin);
+    let echo = NoEcho::on(&stdin)?;
     let mut line = String::new();
     let read = stdin.read_line(&mut line).map_err(Error::SecretInput)?;
     let quiet = echo.active();
@@ -508,33 +509,38 @@ struct NoEcho<'a> {
 }
 
 impl<'a> NoEcho<'a> {
-    fn on(stdin: &'a std::io::Stdin) -> Self {
+    /// Turns echo off when `stdin` is a terminal, after starting the thread that restores it
+    /// on a signal; does nothing otherwise.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SecretInput`] when `stdin` is a terminal and its settings cannot be read, the
+    /// signals cannot be caught, or echo cannot be turned off. The caller then reads no
+    /// secret: one typed with echo on would show on the screen and stay in its scrollback.
+    fn on(stdin: &'a std::io::Stdin) -> Result<Self, Error> {
         use rustix::termios::{LocalModes, OptionalActions, isatty, tcgetattr, tcsetattr};
-        let none = Self {
-            stdin,
-            saved: None,
-            signals: None,
-        };
-        let Some(saved) = isatty(stdin).then(|| tcgetattr(stdin).ok()).flatten() else {
-            return none;
-        };
+        if !isatty(stdin) {
+            return Ok(Self {
+                stdin,
+                saved: None,
+                signals: None,
+            });
+        }
+        let saved = tcgetattr(stdin).map_err(|errno| Error::SecretInput(errno.into()))?;
         // The signal watcher comes first: without it a signal would end the process with echo
-        // off, so if it cannot be started, echo stays on.
-        let Some(signals) = restore_on_signal(saved.clone()) else {
-            eprintln!("ferric-harness: cannot catch interrupts, so the secret is echoed");
-            return none;
-        };
-        let mut quiet = saved.clone();
-        quiet.local_modes.remove(LocalModes::ECHO);
+        // off.
+        let signals = restore_on_signal(saved.clone()).map_err(Error::SecretInput)?;
         let mut guard = Self {
             stdin,
             saved: None,
             signals: Some(signals),
         };
-        if tcsetattr(stdin, OptionalActions::Now, &quiet).is_ok() {
-            guard.saved = Some(saved);
-        }
-        guard
+        let mut quiet = saved.clone();
+        quiet.local_modes.remove(LocalModes::ECHO);
+        tcsetattr(stdin, OptionalActions::Now, &quiet)
+            .map_err(|errno| Error::SecretInput(errno.into()))?;
+        guard.saved = Some(saved);
+        Ok(guard)
     }
 
     /// Whether echo was turned off (standard input is a terminal that allowed it).
@@ -544,12 +550,16 @@ impl<'a> NoEcho<'a> {
 }
 
 /// Starts the thread that restores `saved` and then ends the process when SIGINT, SIGTERM or
-/// SIGHUP arrives; `None` when the signals cannot be caught (echo still comes back on drop).
+/// SIGHUP arrives.
+///
+/// # Errors
+///
+/// When the signals cannot be caught or the thread cannot be started.
 fn restore_on_signal(
     saved: rustix::termios::Termios,
-) -> Option<(signal_hook::iterator::Handle, thread::JoinHandle<()>)> {
+) -> std::io::Result<(signal_hook::iterator::Handle, thread::JoinHandle<()>)> {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-    let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP]).ok()?;
+    let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP])?;
     let handle = signals.handle();
     let thread = thread::Builder::new()
         .name("secret-signals".to_owned())
@@ -568,9 +578,8 @@ fn restore_on_signal(
                     std::process::exit(128 + signal);
                 }
             }
-        })
-        .ok()?;
-    Some((handle, thread))
+        })?;
+    Ok((handle, thread))
 }
 
 impl Drop for NoEcho<'_> {
