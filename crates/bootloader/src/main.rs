@@ -849,6 +849,15 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
         }
     }
     let env_size = w.i;
+    // Ferric Oxide: bootstrap stops the boot on an environment this large; say why while the
+    // console still shows it.
+    if env_size >= boot_env::BOOTSTRAP_ENV_BYTES {
+        log::warn!(
+            "the boot environment has {env_size} bytes, bootstrap reads under {}: the boot will \
+             stop there; shorten the preset or the edits",
+            boot_env::BOOTSTRAP_ENV_BYTES
+        );
+    }
 
     #[allow(static_mut_refs)]
     (

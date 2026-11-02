@@ -191,11 +191,12 @@ There are two ways to add lines:
   number, and a file over 4096 bytes or not UTF-8 is ignored with a warning.
   Keep it much smaller than that limit: bootstrap reads less than 4 KiB of the
   whole environment, the bootloader's keys included, and stops the boot when
-  it is larger. The bootloader only touches the fw_cfg I/O ports (`0x510` and
-  `0x511`) when CPUID reports a hypervisor, and reads past the signature only
-  when it is QEMU's, so on hardware the feature does nothing. The reader is
-  the `ferric-fwcfg` crate (`crates/fwcfg`), written from QEMU's fw_cfg
-  specification.
+  it is larger (`ferric_abi::boot_env::BOOTSTRAP_ENV_BYTES`; the bootloader
+  warns before it hands such an environment over). The bootloader only
+  touches the fw_cfg I/O ports (`0x510` and `0x511`) when CPUID reports a
+  hypervisor, and reads past the signature only when it is QEMU's, so on
+  hardware the feature does nothing. The reader is the `ferric-fwcfg` crate
+  (`crates/fwcfg`), written from QEMU's fw_cfg specification.
 
 When a key is assigned more than once, the first assignment counts, for the
 bootloader as for the kernel and relibc's `getenv`.

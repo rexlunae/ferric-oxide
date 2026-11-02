@@ -433,9 +433,14 @@ pub mod boot_env {
     pub const FW_CFG_FILE: &str = "opt/org.ferric-oxide/boot-env";
     /// The largest preset file the bootloader reads, in bytes; a larger one is ignored.
     ///
-    /// Bootstrap reads less than 4 KiB of the whole environment, the bootloader's own keys
-    /// included, so a preset close to this size stops the boot there: keep presets short.
+    /// The whole environment, the bootloader's own keys included, must stay below
+    /// [`BOOTSTRAP_ENV_BYTES`], so a preset close to this size stops the boot in bootstrap:
+    /// keep presets short.
     pub const MAX_PRESET_BYTES: usize = 4096;
+    /// The size of the buffer bootstrap reads the boot environment into. Bootstrap stops the
+    /// boot when the environment fills it, so the environment the bootloader hands over must
+    /// be shorter; the bootloader warns when it is not.
+    pub const BOOTSTRAP_ENV_BYTES: usize = 4096;
 
     /// A kernel the bootloader can load, chosen by [`FERRIC_KERNEL`].
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -853,6 +858,7 @@ pub mod boot_env {
             // QEMU's fw_cfg file names hold at most 55 bytes.
             assert!(FW_CFG_FILE.len() < 56);
             assert_eq!(MAX_PRESET_BYTES, 4096);
+            assert_eq!(BOOTSTRAP_ENV_BYTES, 4096);
         }
 
         #[test]

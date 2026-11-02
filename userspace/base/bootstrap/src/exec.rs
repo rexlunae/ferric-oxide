@@ -68,7 +68,8 @@ pub fn main() -> ! {
         .unwrap();
     let this_thr_fd = unsafe { redox_rt::initialize_freestanding(this_thr_fd) };
 
-    let mut env_bytes = [0_u8; 4096];
+    // Ferric Oxide: the size the bootloader checks the environment against.
+    let mut env_bytes = [0_u8; ferric_abi::boot_env::BOOTSTRAP_ENV_BYTES];
     let mut envs = {
         let fd = FdGuard::new(
             redox_rt::sys::openat(
