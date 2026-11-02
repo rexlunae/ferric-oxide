@@ -48,6 +48,14 @@
 //! boot, which the generation tells apart) does not pass. [`Directory::read`] checks the
 //! rest.
 //!
+//! # What the guest sees
+//!
+//! The kernel can refuse `FERRIC_TRACE_HOST` (a value that is not a [`RingSize`], or no free
+//! RAM that holds the region) and keep ordinary rings, so the boot environment does not say
+//! whether the rings are host rings. The `kernel.trace` scheme's
+//! [`HOST_PATH`](crate::abi::HOST_PATH) file does: empty without host rings, else one
+//! [`HostRingsLine`] with where the region is, its rings and their size.
+//!
 //! # Examples
 //!
 //! Lay out a region for two CPUs, publish its directory and read it back:
@@ -730,6 +738,81 @@ impl fmt::Display for ClockSampleLine {
     }
 }
 
+/// The line of the `kernel.trace` scheme's [`HOST_PATH`](crate::abi::HOST_PATH) file when the
+/// kernel has host rings: `phys 0x<hex> cpus <n> kib <k>`. The file is empty without them.
+///
+/// # Examples
+///
+/// ```
+/// use ferric_trace::host::{HostRingsLine, RegionLayout, RingSize};
+///
+/// let layout = RegionLayout::new(4, RingSize::from_kib(4096).expect("a power of two"))
+///     .expect("fits");
+/// let line = HostRingsLine::new(0x1_0000_0000, &layout);
+/// assert_eq!(line.to_string(), "phys 0x100000000 cpus 4 kib 4096\n");
+/// assert_eq!(HostRingsLine::parse(&line.to_string()), Ok(line));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostRingsLine {
+    /// The region's physical address, where its directory is.
+    pub phys: u64,
+    /// The number of host rings, one per CPU from CPU 0.
+    pub cpus: u32,
+    /// Each ring's data size in KiB ([`RingSize::kib`]).
+    pub kib: u32,
+}
+
+impl HostRingsLine {
+    /// The line for a region at `phys` laid out by `layout`.
+    pub const fn new(phys: u64, layout: &RegionLayout) -> Self {
+        Self {
+            phys,
+            // `RegionLayout::new` holds the count to MAX_RINGS, which fits.
+            cpus: layout.cpus() as u32,
+            kib: layout.ring_size().kib(),
+        }
+    }
+
+    /// Parses a line, with or without its `\n`.
+    ///
+    /// # Errors
+    ///
+    /// [`LineError::Fields`] for the wrong fields, and [`LineError::Number`] for an address
+    /// that is not `0x` and hexadecimal digits or a count that is not a decimal number.
+    pub fn parse(line: &str) -> Result<Self, LineError> {
+        let [phys_tag, phys, cpus_tag, cpus, kib_tag, kib] = crate::abi::fields(line)?;
+        if (phys_tag, cpus_tag, kib_tag) != ("phys", "cpus", "kib") {
+            return Err(LineError::Fields);
+        }
+        Ok(Self {
+            phys: hex(phys)?,
+            cpus: crate::abi::number(cpus)?,
+            kib: crate::abi::number(kib)?,
+        })
+    }
+}
+
+/// A `0x`-prefixed hexadecimal field.
+fn hex(field: &str) -> Result<u64, LineError> {
+    let digits = field.strip_prefix("0x").ok_or(LineError::Number)?;
+    // `from_str_radix` takes a leading `+`; the field does not.
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(LineError::Number);
+    }
+    u64::from_str_radix(digits, 16).map_err(|_| LineError::Number)
+}
+
+impl fmt::Display for HostRingsLine {
+    /// The line, with its `\n`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "phys {:#x} cpus {} kib {}",
+            self.phys, self.cpus, self.kib
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,5 +1036,49 @@ mod tests {
             ClockSampleLine::parse("host_ns x cpu 2 head 3 timestamp 4"),
             Err(LineError::Number)
         );
+    }
+
+    #[test]
+    fn host_rings_lines_round_trip() {
+        let layout = RegionLayout::new(3, RingSize::from_kib(64).expect("valid")).expect("fits");
+        let line = HostRingsLine::new(0x0123_4000, &layout);
+        assert_eq!(
+            line,
+            HostRingsLine {
+                phys: 0x0123_4000,
+                cpus: 3,
+                kib: 64
+            }
+        );
+        let text = line.to_string();
+        assert_eq!(text, "phys 0x1234000 cpus 3 kib 64\n");
+        assert_eq!(HostRingsLine::parse(&text), Ok(line));
+        assert_eq!(HostRingsLine::parse(text.trim_end()), Ok(line));
+        let max = HostRingsLine {
+            phys: u64::MAX,
+            cpus: u32::MAX,
+            kib: MAX_RING_KIB,
+        };
+        assert_eq!(HostRingsLine::parse(&max.to_string()), Ok(max));
+    }
+
+    #[test]
+    fn bad_host_rings_lines_are_refused() {
+        for (line, error) in [
+            ("", LineError::Fields),
+            ("phys 0x1000 cpus 2", LineError::Fields),
+            ("phys 0x1000 cpus 2 kib 64 more", LineError::Fields),
+            ("phys 0x1000 cpu 2 kib 64", LineError::Fields),
+            ("phys  0x1000 cpus 2 kib 64", LineError::Fields),
+            ("phys 4096 cpus 2 kib 64", LineError::Number),
+            ("phys 0x cpus 2 kib 64", LineError::Number),
+            ("phys 0x+10 cpus 2 kib 64", LineError::Number),
+            ("phys 0xg cpus 2 kib 64", LineError::Number),
+            ("phys 0x10000000000000000 cpus 2 kib 64", LineError::Number),
+            ("phys 0x1000 cpus two kib 64", LineError::Number),
+            ("phys 0x1000 cpus 2 kib -64", LineError::Number),
+        ] {
+            assert_eq!(HostRingsLine::parse(line), Err(error), "{line:?}");
+        }
     }
 }

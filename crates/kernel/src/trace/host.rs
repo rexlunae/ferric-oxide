@@ -18,13 +18,16 @@
 //! observer relies on, and mapping them fails, because the region's pages are not frames the
 //! frame allocator can hand to a grant.
 //!
+//! Since the kernel can refuse the request, the `kernel.trace/host` file ([`line`]) is what
+//! says whether there are host rings: tests and scripts in the guest decide from it.
+//!
 //! The CPU count comes from the MADT, as for the APs `acpi::madt` starts; the region is sized
 //! for that many CPUs, and a CPU beyond it (none, normally) gets an ordinary ring.
 
 use core::sync::atomic::AtomicU64;
 
 use ferric_abi::boot_env::FERRIC_TRACE_HOST;
-use ferric_trace::host::{self, Published, RegionLayout, RingSize, DIRECTORY_WORDS};
+use ferric_trace::host::{self, HostRingsLine, Published, RegionLayout, RingSize, DIRECTORY_WORDS};
 use rmm::BumpAllocator;
 use spin::Once;
 
@@ -101,6 +104,14 @@ pub fn is_host_ring(cpu: usize) -> bool {
     REGION
         .get()
         .is_some_and(|host| host.layout.entry(cpu).is_some())
+}
+
+/// The `kernel.trace/host` line for the region: where it is, its rings and their size, or
+/// `None` when [`reserve`] took none (no `FERRIC_TRACE_HOST`, or a refused one).
+pub fn line() -> Option<HostRingsLine> {
+    REGION
+        .get()
+        .map(|host| HostRingsLine::new(host.region.base() as u64, &host.layout))
 }
 
 /// The number of rings in the region, 0 without one.
