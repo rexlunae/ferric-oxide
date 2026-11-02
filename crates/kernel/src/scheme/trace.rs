@@ -13,6 +13,8 @@
 //! - `cpu/<n>`: reading drains whole records from CPU n's ring; 0 bytes when it is empty, and
 //!   `EINVAL` when the buffer cannot hold the next record, and `EAGAIN` while another reader
 //!   is reading that CPU. Records are consumed only once the copy to the caller succeeded.
+//!   With host-visible rings (`trace_host`) the host is the rings' only reader, and reading
+//!   fails with `EBUSY`.
 //!   `mmap` of the descriptor (`PROT_READ`, `MAP_SHARED`, the whole `CPU_MAP_BYTES` from offset
 //!   0) maps the ring itself read-only, header page and data; writing `commit <end>` then
 //!   consumes it up to `end`, under the same one-reader lock as a read.
@@ -428,6 +430,14 @@ impl KernelScheme for TraceScheme {
                 buf.copy_common_bytes_from_slice(data.get(start..).unwrap_or(&[]))
             }
             Handle::Cpu(cpu) => {
+                // Ferric Oxide: host-visible rings have one reader, the host. A drain here
+                // would move `tail`, which a host observer that fell more than a ring behind
+                // takes as the oldest record still whole, and hide records the ring still
+                // holds from it.
+                #[cfg(feature = "trace_host")]
+                if trace::host::is_reserved() {
+                    return Err(Error::new(syscall::error::EBUSY));
+                }
                 let Some(ring) = trace::ring(cpu) else {
                     return Ok(0);
                 };

@@ -425,6 +425,9 @@ pub struct Follower<'a> {
     generation: u64,
     cpus: Vec<CpuState<'a>>,
     host_clock: BufWriter<File>,
+    /// The host clock a [`HOST_CLOCK`] sample is taken with, after its ring was read:
+    /// [`monotonic_ns`], or a test's own.
+    read_clock: fn() -> u64,
     buf: Vec<u8>,
 }
 
@@ -474,12 +477,14 @@ impl<'a> Follower<'a> {
             generation: directory.generation(),
             cpus,
             host_clock,
+            read_clock: monotonic_ns,
             buf: vec![0; READ_BYTES],
         })
     }
 
     /// Reads every ring until it is drained (or [`POLL_BYTES`] were read from it) and saves
-    /// what it read; `now_ns` is the host time for the [`HOST_CLOCK`] samples. Counts each
+    /// what it read; `now_ns`, the host time the poll began, decides when each CPU is due a
+    /// [`HOST_CLOCK`] sample, which is stamped once its ring has been read. Counts each
     /// record in `live` when given.
     ///
     /// # Errors
@@ -565,6 +570,9 @@ impl<'a> Follower<'a> {
             }
         }
         state.file.flush().map_err(io_error(&state.path))?;
+        // After the copy, so the host time is no earlier than the newest record read: a
+        // sample says the host had read up to `head` by then.
+        let read_ns = (self.read_clock)();
         if let Some(timestamp) = newest
             && state.last_sample_ns.is_none_or(|last| {
                 now_ns.saturating_sub(last) >= HOST_CLOCK_EVERY.as_nanos() as u64
@@ -572,7 +580,7 @@ impl<'a> Follower<'a> {
         {
             state.last_sample_ns = Some(now_ns);
             let line = ClockSampleLine {
-                host_ns: now_ns,
+                host_ns: read_ns,
                 cpu: state.summary.cpu,
                 head: state.pos,
                 timestamp,
@@ -678,6 +686,9 @@ mod tests {
     use ferric_trace::ring::{Ring, Shared, WhenFull};
     use std::collections::BTreeMap;
     use std::os::unix::fs::FileExt;
+
+    /// The host time a test's follower reads after each ring, for its samples.
+    static READ_NS: AtomicU64 = AtomicU64::new(0);
 
     const MIB: u64 = 1 << 20;
 
@@ -851,6 +862,8 @@ mod tests {
         assert_eq!(phys, 3 * MIB);
         create_output(&out).expect("created");
         let mut follower = Follower::start(&ram, phys, &directory, &out).expect("starts");
+        follower.read_clock = || READ_NS.load(Ordering::Relaxed);
+        READ_NS.store(1_500, Ordering::Relaxed);
         assert_eq!(follower.poll(1_000, None).expect("polls"), Poll::Read);
 
         // Phase 2: past the end of CPU 0's 512 words, but never a ring ahead of the reader.
@@ -862,6 +875,7 @@ mod tests {
         // Phase 3: two rings' worth without a poll: the oldest are overwritten.
         let overwritten = pairs(&mut guest, 0, 100);
         guest.sync();
+        READ_NS.store(300_000_700, Ordering::Relaxed);
         assert_eq!(follower.poll(300_000_000, None).expect("polls"), Poll::Read);
         let summary = follower.finish(StopReason::Duration).expect("finishes");
 
@@ -930,7 +944,9 @@ mod tests {
             *overwritten.last().expect("records")
         );
         assert_eq!(cpu0_samples[1].head, 220 + 330 + 1100);
-        assert_eq!(cpu0_samples[1].host_ns, 300_000_000);
+        // Stamped after the read, not when the poll began.
+        assert_eq!(cpu0_samples[0].host_ns, 1_500);
+        assert_eq!(cpu0_samples[1].host_ns, 300_000_700);
         assert_eq!(samples.iter().filter(|s| s.cpu == 1).count(), 1);
     }
 

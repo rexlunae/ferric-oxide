@@ -1217,10 +1217,13 @@ next, the CPU count, the clock and its tick length (what a capture's `clock`
 file holds), then each ring's offset from the directory and length. The kernel
 writes the magic last, with release ordering.
 
-Readers in the guest still drain the same rings through `kernel.trace/cpu/<n>`
-(`ferric-trace capture`), and what they consume does not change what the host
-reads. They cannot map them: the region's pages are not frames a mapping can
-hold, so `mmap` fails with `EINVAL` and `capture --via auto` reads instead.
+The host is the rings' only reader. Reading `kernel.trace/cpu/<n>` in the
+guest (`ferric-trace capture`) fails with `EBUSY`: a drain moves the ring's
+`tail`, which an observer that fell more than a ring behind takes as the oldest
+record still whole, so it would skip records the ring still holds. Mapping
+them fails with `EINVAL`, because the region's pages are not frames a mapping
+can hold ([#378](https://github.com/rexlunae/ferric-oxide/issues/378)). Use
+`follow` on the host instead, or boot without `FERRIC_TRACE_HOST`.
 
 ### Following from the host
 
@@ -1254,7 +1257,7 @@ which are sound on memory mapped like this.
 | `--guest-ram <file>` | — | The guest's RAM file |
 | `--out <dir>` | — | The capture directory; it must not exist |
 | `--phys <hex>` | scan | The directory's address from the kernel's line. Without it, `follow` scans the pages of the file that hold data (it asks the file system with `SEEK_DATA`, so it does not allocate the file's holes) for the magic, and takes a page only if its address field is where it was found, so a copy of the directory elsewhere is not taken for it |
-| `--ram-mib <n>` | the file's size | The guest's RAM, for q35's placement of it: RAM below 2.75 GiB lies below 4 GiB; larger RAM keeps 2 GiB there and continues at 4 GiB, which the file holds right after the first 2 GiB |
+| `--ram-mib <n>` | the file's size | The guest's RAM, for q35's placement of it: RAM below 2.75 GiB lies below 4 GiB; larger RAM keeps 2 GiB there and continues at 4 GiB, which the file holds right after the first 2 GiB. Checked against QEMU 10.2.1 on 2 November 2026 by writing markers into the shared file and reading the guest-physical addresses with the monitor's `xp`, for 2560, 2816 (the threshold), 4096 and 8192 MiB |
 | `--interval-ms <n>` | 10 | Time between polls |
 | `--live` | off | One line a second on standard output, see below |
 | `--duration <s>` | until stopped | Stop after following this long |
