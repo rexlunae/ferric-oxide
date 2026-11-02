@@ -103,6 +103,9 @@ fn a_quick_run_prints_every_line_and_passes() {
         let max: u64 = fields["max_ns"].parse().expect("integer");
         assert!(min <= max, "{name}");
     }
+    // The clock line carries the clock's resolution.
+    let res: u64 = lines["perf-clock"]["res_ns"].parse().expect("integer");
+    assert!(res >= 1);
     // Throughput lines carry their bytes per iteration.
     assert_eq!(lines["perf-pipe-throughput"]["bytes"], "4194304");
     assert_eq!(lines["perf-write-log"]["bytes"], "70");

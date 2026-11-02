@@ -67,6 +67,7 @@ fn write(
         name,
         latency,
         bytes: Some(LINE.len() as u64),
+        extra: Vec::new(),
     }])
 }
 

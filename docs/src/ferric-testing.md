@@ -505,7 +505,7 @@ whose names start with those words, and `ferric-perf --list` lists them.
 
 | Line (`FERRIC_BENCH perf-…`) | One sample |
 | --- | --- |
-| `clock` | Two consecutive readings of the monotonic clock: the overhead included in every other sample |
+| `clock` | Two consecutive readings of the monotonic clock: the overhead included in every other sample; adds `res_ns`, the clock's resolution from `clock_getres` |
 | `spawn-fork-exec-static`, `-dynamic` | `fork`, `execve` of an empty program in the child, and `waitpid` until it exits |
 | `spawn-posix-spawn-static`, `-dynamic` | relibc's `posix_spawn` of the same program, which builds the child without copying the parent, and `waitpid` |
 | `spawn-ion` | `ion -c true` through `posix_spawn`: a shell started to run one builtin |
@@ -513,8 +513,8 @@ whose names start with those words, and `ferric-perf --list` lists them.
 | `pipe-rtt-1b` | One thread writes a byte into a pipe and reads it back: the pipe's system calls without a wake-up or switch |
 | `pipe-throughput` | Reading 4 MiB that a writer thread sends in 64 KiB writes; adds `bytes` and `mib_s` |
 | `write-null`, `write-log` | One 70-byte line written to `/scheme/null` (`zerod`), or to `/scheme/log`, the standard output and error init gives services; adds `bytes` and `mib_s` |
-| `file-create`, `file-stat`, `file-unlink` | Creating (`O_CREAT \| O_EXCL`, then closing) an empty file in `/tmp/ferric-perf`, getting a file's metadata by path, removing a file |
-| `mmap-map`, `mmap-touch`, `mmap-unmap` | `mmap` of a 32 MiB file (`PROT_READ`, `MAP_PRIVATE`, as `ld.so` maps objects), reading one byte of every 4 KiB page, `munmap`; the first two add `bytes` and `mib_s` |
+| `file-create`, `file-stat`, `file-unlink` | Creating (`O_CREAT \| O_EXCL`, then closing) an empty file in `/tmp/ferric-perf/files` (RedoxFS: `/tmp` is a directory of the root file system), getting a file's metadata by path, removing a file |
+| `mmap-map`, `mmap-touch`, `mmap-unmap` | `mmap` of a 32 MiB file (`PROT_READ`, `MAP_PRIVATE`, as `ld.so` maps objects), reading one byte of every 4 KiB page of the new mapping, `munmap`; the first two add `bytes` and `mib_s` |
 
 The static spawn target is `/usr/bin/ferric-perf-true`, an empty Rust program
 linked like the other test programs; the recipe builds the same program a second
@@ -539,11 +539,20 @@ FERRIC_BENCH perf-spawn-posix-spawn-static iters=200 mean_ns=… median_ns=… p
 - **`mean_ns`**, **`min_ns`** and **`max_ns`** are exact. **`median_ns`** and
   **`p99_ns`** come from `ferric_iobench`'s fio-layout histogram (the middle of the
   bucket the rank falls in, within 1/64 of the true value), the same percentiles
-  `ferric-iobench` and `ferric-trace counts` report.
+  `ferric-iobench` and `ferric-trace counts` report. The rank is the nearest rank,
+  rounded up: the median of an even count is the lower middle sample, and with
+  fewer than 100 samples (the `mmap` lines always, the spawn and `write-log` lines
+  when their budget runs out) `p99_ns` is the slowest sample, the same as `max_ns`.
 - Each sample is timed with two clock reads, so it includes one `clock` sample.
   On Redox a clock read is a system call; subtract `perf-clock`'s median before
   comparing operations that take only a few microseconds, such as `pipe-rtt-1b`
-  and `write-null`.
+  and `write-null`. `perf-clock`'s `res_ns` is the resolution of the kernel's
+  clock source: 1 for the KVM clock or the TSC, the HPET's period (about 10 ns
+  under QEMU), or 838 for the PIT fallback. Under QEMU an HPET read is a VM exit,
+  so the `clock` cost itself depends on the source; compare runs only with the
+  same source. With `kernel.time.one_shot` the kernel log names it at boot
+  (`time: clock source ...`); otherwise it is the KVM clock with `x86_kvm_pv`
+  under KVM, else the HPET, else the PIT.
 - The run ends with `FERRIC_TEST_PASS perf`. A benchmark that fails prints
   `FERRIC_TEST_FAIL perf-<group>: <cause>`, the others still run, and the run ends
   with `FERRIC_TEST_FAIL perf: …` and exit status 1. `boot-smoke.sh` fails a boot
@@ -552,7 +561,10 @@ FERRIC_BENCH perf-spawn-posix-spawn-static iters=200 mean_ns=… median_ns=… p
 Read the lines in pairs as well as one at a time:
 
 - `pingpong-thread` minus `pipe-rtt-1b` is roughly the cost of two wake-ups and
-  the context switches between two threads; `pingpong-process` adds the switch
+  the context switches between two threads. The scheduler places the two sides:
+  on one CPU a round trip is two direct switches, on two CPUs it is four switches
+  through the idle contexts plus the wake-up IPIs, so compare runs with the same
+  number of vCPUs. `pingpong-process` adds the switch
   between address spaces (CR3 loads, and IBPB barriers when `kernel.cpu.ibpb` is
   on), so compare it under `kernel.cpu.kpti` and `kernel.cpu.ibpb` settings.
 - `write-log` minus `write-null` is what the log path costs per line: `logd`
@@ -560,8 +572,15 @@ Read the lines in pairs as well as one at a time:
 - `spawn-*-dynamic` minus `spawn-*-static` is the dynamic linker's share of
   starting a process, and `spawn-fork-exec-*` minus `spawn-posix-spawn-*` is the
   cost of copying the parent's address space with `fork`.
-- `mmap-map`'s `mib_s` on Redox is the rate at which RedoxFS reads the mapped range,
-  since it reads the whole range when the mapping is made.
+- The `mmap` lines split the work differently on Redox and on Linux, so compare
+  their sum across systems. On Redox, RedoxFS reads the file into a buffer of its
+  own on the first mapping (the untimed warm-up) and keeps it while the file is
+  unchanged, and the kernel maps every page of a private file mapping
+  copy-on-write from that buffer before `mmap` returns: a timed `mmap-map` is a
+  request to RedoxFS plus mapping 8192 pages, `mmap-touch` takes no page faults
+  (only TLB misses), and `mmap-unmap` removes the 8192 pages. On Linux, `mmap`
+  only reserves the range and `mmap-touch` takes the page faults. None of the
+  timed samples reads the file.
 
 For a comparison between two kernels, configurations or commits, boot each image
 several times on the same idle host, alternating which boots first, and compare

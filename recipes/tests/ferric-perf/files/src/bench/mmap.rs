@@ -4,18 +4,29 @@
 //! of it read-only and private (`PROT_READ`, `MAP_PRIVATE`), as `ld.so` maps the objects it
 //! loads, reads one byte of every 4 KiB page, and unmaps it, timing the three phases apart:
 //!
-//! - `mmap-map`: the `mmap` call. RedoxFS reads the whole mapped range when the mapping is
-//!   made, so on Redox this is mostly reading the file; its `mib_s` is that rate.
-//! - `mmap-touch`: the first read of every page, so the page faults.
+//! - `mmap-map`: the `mmap` call.
+//! - `mmap-touch`: the first read of every page of the new mapping.
 //! - `mmap-unmap`: the `munmap` call.
+//!
+//! Where the work falls differs between systems, so compare the sum of the three across them:
+//!
+//! - On Redox, the kernel asks RedoxFS for the range, and RedoxFS reads it into a buffer of
+//!   its own the first time and keeps that buffer, unmapped, while the file does not change.
+//!   The kernel then maps every page of the range copy-on-write from that buffer before
+//!   `mmap` returns. So the untimed warm-up mapping reads the file; each timed `mmap-map` is a
+//!   request to RedoxFS and the kernel mapping 8192 pages (32 MiB), `mmap-touch` takes no
+//!   page faults (it is the TLB misses of reading mapped memory), and `mmap-unmap` removes
+//!   the 8192 pages and tells RedoxFS.
+//! - On Linux, `mmap` only reserves the range and `mmap-touch` takes a page fault per page
+//!   (served from the page cache).
 //!
 //! The sum of the bytes read is checked against what was written.
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Write;
 use std::time::Duration;
 
-use super::file::scratch;
+use super::file::Scratch;
 use super::{BenchError, Config, Measurement, Op, file_error};
 use crate::measure::{Monotonic, Plan, measure};
 use crate::sys::Mapping;
@@ -36,9 +47,8 @@ const FILL: u8 = 0x5a;
 
 /// The `mmap` group.
 pub fn run(config: &Config) -> Result<Vec<Measurement>, BenchError> {
-    let dir = config.dir.join("mmap");
-    scratch(&dir)?;
-    let path = dir.join("large");
+    let scratch = Scratch::new(config.dir.join("mmap"))?;
+    let path = scratch.path().join("large");
     let mib = usize::try_from(config.mmap_mib).unwrap_or(usize::MAX);
     let len = mib.saturating_mul(1 << 20);
     {
@@ -70,23 +80,26 @@ pub fn run(config: &Config) -> Result<Vec<Measurement>, BenchError> {
     })?
     .phases;
     drop(file);
-    fs::remove_dir_all(&dir).map_err(file_error(Op::Remove, &dir))?;
+    scratch.remove()?;
     let bytes = Some(len as u64);
     Ok(vec![
         Measurement {
             name: "mmap-map",
             latency: map,
             bytes,
+            extra: Vec::new(),
         },
         Measurement {
             name: "mmap-touch",
             latency: touch,
             bytes,
+            extra: Vec::new(),
         },
         Measurement {
             name: "mmap-unmap",
             latency: unmap,
             bytes: None,
+            extra: Vec::new(),
         },
     ])
 }

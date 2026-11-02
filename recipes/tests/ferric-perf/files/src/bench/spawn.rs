@@ -142,5 +142,6 @@ fn run(
         name,
         latency,
         bytes: None,
+        extra: Vec::new(),
     }])
 }

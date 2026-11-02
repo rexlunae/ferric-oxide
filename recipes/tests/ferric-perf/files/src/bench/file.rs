@@ -33,20 +33,72 @@ const STAT_PLAN: Plan = Plan {
     budget: Duration::from_secs(1),
 };
 
-/// Removes `dir` if it exists and creates it empty.
-pub fn scratch(dir: &Path) -> Result<(), BenchError> {
-    match fs::remove_dir_all(dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(file_error(Op::Remove, dir)(error)),
+/// A benchmark's scratch directory: created empty, and removed with everything in it by
+/// [`Scratch::remove`], or when dropped on the way out of a benchmark that failed.
+#[derive(Debug)]
+pub struct Scratch {
+    path: PathBuf,
+    /// Whether [`Scratch::remove`] already ran.
+    removed: bool,
+}
+
+impl Scratch {
+    /// Removes `path` if it exists, with what it holds, and creates it empty (and its
+    /// parents).
+    ///
+    /// # Errors
+    ///
+    /// When the old directory cannot be removed or the new one cannot be made.
+    pub fn new(path: PathBuf) -> Result<Self, BenchError> {
+        remove_all(&path)?;
+        fs::create_dir_all(&path).map_err(file_error(Op::MakeDir, &path))?;
+        Ok(Self {
+            path,
+            removed: false,
+        })
     }
-    fs::create_dir_all(dir).map_err(file_error(Op::MakeDir, dir))
+
+    /// The directory.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Removes the directory and everything in it.
+    ///
+    /// # Errors
+    ///
+    /// When it cannot be removed.
+    pub fn remove(mut self) -> Result<(), BenchError> {
+        self.removed = true;
+        remove_all(&self.path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // Only a failed benchmark gets here, and its own error is what the run reports; a
+        // leftover directory is removed by the next run's `Scratch::new`.
+        if !self.removed
+            && let Err(error) = remove_all(&self.path)
+        {
+            eprintln!("ferric-perf: {error}");
+        }
+    }
+}
+
+/// Removes `path` and everything in it; a path that does not exist is already removed.
+fn remove_all(path: &Path) -> Result<(), BenchError> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(file_error(Op::Remove, path)(error)),
+    }
 }
 
 /// The `file` group.
 pub fn run(config: &Config) -> Result<Vec<Measurement>, BenchError> {
-    let dir = config.dir.join("files");
-    scratch(&dir)?;
+    let scratch = Scratch::new(config.dir.join("files"))?;
+    let dir = scratch.path();
     let mut clock = Monotonic::new();
     let mut paths: Vec<PathBuf> = Vec::new();
     let [create] = measure(&config.plan(CREATE_PLAN), &mut clock, |laps| {
@@ -84,22 +136,56 @@ pub fn run(config: &Config) -> Result<Vec<Measurement>, BenchError> {
         Ok::<_, BenchError>(())
     })?
     .phases;
-    fs::remove_dir(&dir).map_err(file_error(Op::Remove, &dir))?;
+    scratch.remove()?;
     Ok(vec![
         Measurement {
             name: "file-create",
             latency: create,
             bytes: None,
+            extra: Vec::new(),
         },
         Measurement {
             name: "file-stat",
             latency: stat,
             bytes: None,
+            extra: Vec::new(),
         },
         Measurement {
             name: "file-unlink",
             latency: unlink,
             bytes: None,
+            extra: Vec::new(),
         },
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ferric-perf-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn a_scratch_directory_starts_empty_and_is_removed() {
+        let path = root("scratch").join("files");
+        fs::create_dir_all(&path).expect("mkdir");
+        fs::write(path.join("left-over"), b"x").expect("write");
+        let scratch = Scratch::new(path.clone()).expect("made");
+        assert_eq!(fs::read_dir(&path).expect("exists").count(), 0);
+        fs::write(path.join("f"), b"x").expect("write");
+        scratch.remove().expect("removed");
+        assert!(!path.exists());
+        fs::remove_dir(root("scratch")).expect("cleanup");
+    }
+
+    #[test]
+    fn a_failed_benchmark_leaves_no_scratch_directory() {
+        let path = root("dropped");
+        let scratch = Scratch::new(path.clone()).expect("made");
+        fs::write(path.join("f"), b"x").expect("write");
+        drop(scratch);
+        assert!(!path.exists());
+    }
 }

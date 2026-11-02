@@ -12,6 +12,10 @@
 //! - `mean_ns` is exact; `median_ns` and `p99_ns` are percentiles of `ferric_iobench`'s
 //!   fio-layout [`Histogram`] (the middle of the bucket the rank falls in, within 1/64 of the
 //!   true value, as fio and `ferric-trace counts` report them); `min_ns` and `max_ns` are exact.
+//!   The rank is the nearest rank, rounded up: the median of an even count is the lower
+//!   middle sample, and with fewer than 100 samples `p99_ns` is the slowest one, `max_ns`.
+//! - A line can add integer fields of its own ([`Line::extra`]): `perf-clock` adds `res_ns`,
+//!   the clock's resolution.
 //! - A phase that moves data adds `bytes`, per iteration, and `mib_s`, the bytes of an
 //!   iteration over its mean time in MiB per second with one decimal.
 
@@ -33,6 +37,8 @@ pub struct Line<'a> {
     pub latency: &'a Histogram,
     /// Bytes each iteration moves, for a throughput.
     pub bytes: Option<u64>,
+    /// More `key=value` fields, printed after `max_ns`.
+    pub extra: &'a [(&'static str, u64)],
 }
 
 impl Line<'_> {
@@ -64,6 +70,9 @@ impl fmt::Display for Line<'_> {
             lat.min(),
             lat.max(),
         )?;
+        for (key, value) in self.extra {
+            write!(f, " {key}={value}")?;
+        }
         if let (Some(bytes), Some(tenths)) = (self.bytes, self.mib_s_tenths()) {
             write!(f, " bytes={bytes} mib_s={}.{}", tenths / 10, tenths % 10)?;
         }
@@ -92,6 +101,7 @@ mod tests {
             name: "spawn-posix-spawn-static",
             latency: &latency,
             bytes: None,
+            extra: &[],
         };
         assert_eq!(
             line.to_string(),
@@ -116,6 +126,7 @@ mod tests {
             name: "pipe-throughput",
             latency: &latency,
             bytes: Some(4 << 20),
+            extra: &[],
         };
         assert_eq!(line.mib_s_tenths(), Some(40_000));
         assert_eq!(
@@ -129,8 +140,33 @@ mod tests {
             name: "write-null",
             latency: &latency,
             bytes: Some(70),
+            extra: &[],
         };
         assert_eq!(line.mib_s_tenths(), Some(222));
+    }
+
+    #[test]
+    fn extra_fields_follow_the_distribution() {
+        let latency = histogram(&[40, 60]);
+        let line = Line {
+            name: "clock",
+            latency: &latency,
+            bytes: None,
+            extra: &[("res_ns", 1)],
+        };
+        assert_eq!(
+            line.to_string(),
+            "FERRIC_BENCH perf-clock iters=2 mean_ns=50 median_ns=40 p99_ns=60 min_ns=40 \
+             max_ns=60 res_ns=1"
+        );
+    }
+
+    #[test]
+    fn few_samples_take_the_nearest_rank() {
+        // Ten samples: the median is the fifth, and p99 is the slowest.
+        let latency = histogram(&(1..=10).collect::<Vec<u64>>());
+        assert_eq!(latency.percentile(500_000), 5);
+        assert_eq!(latency.percentile(990_000), 10);
     }
 
     #[test]
@@ -140,6 +176,7 @@ mod tests {
             name: "clock",
             latency: &empty,
             bytes: Some(1),
+            extra: &[],
         };
         assert_eq!(line.mib_s_tenths(), Some(0));
         assert_eq!(

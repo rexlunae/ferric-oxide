@@ -1,5 +1,6 @@
 //! The system calls the benchmarks need that `std` does not offer, behind safe wrappers:
-//! `fork` and `execve`, `posix_spawn`, `waitpid`, and a read-only private file mapping.
+//! `fork` and `execve`, `posix_spawn`, `waitpid`, a read-only private file mapping, and the
+//! monotonic clock's resolution.
 //!
 //! This is the crate's only unsafe code. relibc implements `posix_spawn` natively on Redox
 //! (a new child process without copying the parent's address space), but the `libc` crate
@@ -136,6 +137,27 @@ impl Program {
     }
 }
 
+/// The resolution of the monotonic clock `Instant` reads, in nanoseconds:
+/// `clock_getres(CLOCK_MONOTONIC)`. On Redox the kernel reports its clock source's: 1 for the
+/// KVM clock or the TSC, the HPET's period, or the PIT's (838 ns) when it has neither.
+///
+/// # Errors
+///
+/// When `clock_getres` fails.
+pub fn monotonic_resolution_ns() -> io::Result<u64> {
+    let mut res = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `res` is a valid place for the result.
+    if unsafe { libc::clock_getres(libc::CLOCK_MONOTONIC, &mut res) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let secs = u64::try_from(res.tv_sec).map_err(io::Error::other)?;
+    let nanos = u64::try_from(res.tv_nsec).map_err(io::Error::other)?;
+    Ok(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
+}
+
 /// Waits for child `pid` to exit.
 fn wait(pid: libc::pid_t) -> io::Result<ExitStatus> {
     let mut status = 0;
@@ -240,6 +262,12 @@ mod tests {
         assert_eq!(program.envp.len(), std::env::vars_os().count() + 1);
         assert!(program.envp.last().expect("terminated").is_null());
         assert!(Program::new(Path::new("/bin/sh"), &["a\0b"]).is_err());
+    }
+
+    #[test]
+    fn the_monotonic_clock_has_a_resolution() {
+        let res = monotonic_resolution_ns().expect("clock_getres");
+        assert!((1..=1_000_000).contains(&res), "{res} ns");
     }
 
     #[test]

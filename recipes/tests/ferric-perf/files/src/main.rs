@@ -7,7 +7,7 @@
 //!
 //! | Lines | One sample |
 //! | --- | --- |
-//! | `clock` | Reading the monotonic clock: the overhead in every other sample |
+//! | `clock` | Reading the monotonic clock: the overhead in every other sample; adds `res_ns`, the clock's resolution |
 //! | `spawn-fork-exec-{static,dynamic}` | `fork`, `execve` of an empty program, `waitpid` |
 //! | `spawn-posix-spawn-{static,dynamic}` | `posix_spawn` of the same program, `waitpid` |
 //! | `spawn-ion` | `ion -c true` through `posix_spawn` |
@@ -16,7 +16,7 @@
 //! | `pipe-throughput` | Reading 4 MiB a writer thread sends in 64 KiB writes |
 //! | `write-null`, `write-log` | One 70-byte line written to `/scheme/null`, or to `/scheme/log` (what services' standard error is) |
 //! | `file-create`, `file-stat`, `file-unlink` | Creating, getting the metadata of, and removing an empty file |
-//! | `mmap-map`, `mmap-touch`, `mmap-unmap` | Mapping a 32 MiB file read-only, reading every page, unmapping it |
+//! | `mmap-map`, `mmap-touch`, `mmap-unmap` | Mapping a 32 MiB file read-only, reading every page, unmapping it (the `bench::mmap` module says where the work falls on Redox and on Linux) |
 //!
 //! Every benchmark warms up first, then runs up to a fixed number of iterations or for a few
 //! seconds, whichever ends first ([`measure`]); a whole run takes well under a minute under
@@ -76,8 +76,8 @@ struct Cli {
     /// The sink write-null writes to
     #[arg(long, default_value = "/scheme/null")]
     null: PathBuf,
-    /// A scratch directory for the file and mapping benchmarks; it is emptied first and
-    /// removed at the end
+    /// Where the file and mapping benchmarks make their scratch directories (`files` and
+    /// `mmap`, each emptied first and removed after its benchmark); created if needed
     #[arg(long, default_value = "/tmp/ferric-perf")]
     dir: PathBuf,
     /// The size of the file the mmap benchmark maps, in MiB

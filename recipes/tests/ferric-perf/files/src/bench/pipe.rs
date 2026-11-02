@@ -3,8 +3,11 @@
 //!
 //! - `pingpong-thread` and `pingpong-process`: one byte goes to the peer through one pipe and
 //!   comes back through another. A sample is one round trip, so it holds two pipe writes, two
-//!   reads, two wake-ups and at least two context switches (four on one CPU). The process peer
-//!   is this program run with `--pong`, so a switch to it also changes the address space.
+//!   reads, two wake-ups and at least two context switches: two when both sides share a CPU
+//!   (each switches straight to the other), four when they run on two CPUs that go idle while
+//!   they wait (to and from the idle context on each). The scheduler places them; the
+//!   benchmark does not pin them. The process peer is this program run with `--pong`, so a
+//!   switch to it also changes the address space.
 //! - `pipe-rtt-1b`: the same thread writes one byte into a pipe and reads it back: the pipe's
 //!   system call cost without a wake-up or switch, to subtract from the ping-pongs.
 //! - `pipe-throughput`: a thread writes 64 KiB chunks (the kernel's pipe capacity) as fast as
@@ -109,6 +112,7 @@ fn round_trips(
         name,
         latency,
         bytes: None,
+        extra: Vec::new(),
     })
 }
 
@@ -241,6 +245,7 @@ pub fn throughput(config: &Config) -> Result<Vec<Measurement>, BenchError> {
         name: "pipe-throughput",
         latency,
         bytes: Some(ROUND as u64),
+        extra: Vec::new(),
     }])
 }
 

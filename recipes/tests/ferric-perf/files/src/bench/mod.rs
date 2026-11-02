@@ -14,6 +14,7 @@ use ferric_iobench::latency::Histogram;
 
 use crate::measure::{Monotonic, Plan, measure};
 use crate::report::Line;
+use crate::sys;
 
 mod file;
 mod mmap;
@@ -34,8 +35,9 @@ pub struct Config {
     pub log: PathBuf,
     /// The sink `write-null` writes to.
     pub null: PathBuf,
-    /// A scratch directory for the file and mapping benchmarks; it is removed and created
-    /// again, and removed at the end.
+    /// The directory under which the file and mapping benchmarks make their scratch
+    /// directories, `files` and `mmap` ([`file::Scratch`]); it is created if needed and left
+    /// in place.
     pub dir: PathBuf,
     /// The size of the file `mmap` maps, in MiB.
     pub mmap_mib: u64,
@@ -136,6 +138,9 @@ pub enum BenchError {
         /// The thread's role.
         name: &'static str,
     },
+    /// The monotonic clock's resolution could not be read.
+    #[error("cannot read the monotonic clock's resolution")]
+    Resolution(#[source] io::Error),
     /// This program's own path, which `pingpong-process` runs as its peer, is unknown.
     #[error("cannot find this program's path")]
     CurrentExe(#[source] io::Error),
@@ -199,6 +204,8 @@ pub struct Measurement {
     pub latency: Histogram,
     /// Bytes each iteration moved, for a throughput.
     pub bytes: Option<u64>,
+    /// More integer fields for the line ([`Line::extra`]).
+    pub extra: Vec<(&'static str, u64)>,
 }
 
 impl Measurement {
@@ -208,6 +215,7 @@ impl Measurement {
             name: self.name,
             latency: &self.latency,
             bytes: self.bytes,
+            extra: &self.extra,
         }
     }
 }
@@ -332,8 +340,10 @@ pub fn select(filters: &[String]) -> Result<Vec<&'static Group>, UnknownFilter> 
         .collect())
 }
 
-/// `clock`: what reading the clock costs, the overhead in every other measurement's samples.
+/// `clock`: what reading the clock costs, the overhead in every other measurement's samples,
+/// and its resolution (`res_ns`), which bounds how finely any sample can be timed.
 fn clock(config: &Config) -> Result<Vec<Measurement>, BenchError> {
+    let resolution = sys::monotonic_resolution_ns().map_err(BenchError::Resolution)?;
     let plan = config.plan(Plan {
         warmup: 1000,
         iters: 10_000,
@@ -349,6 +359,7 @@ fn clock(config: &Config) -> Result<Vec<Measurement>, BenchError> {
         name: "clock",
         latency,
         bytes: None,
+        extra: vec![("res_ns", resolution)],
     }])
 }
 
