@@ -147,7 +147,11 @@ ferric-scheme-self-test || echo FERRIC_TEST_FAIL scheme-self-open exited with an
 ferric-trace-test || echo FERRIC_TEST_FAIL trace exited with an error
 # Saves a capture through the ring mappings and reads it back, on a kernel with kernel.trace. The /scheme listing says
 # whether it has one, as in ferric-trace-test; the trace-overhead baseline image has none.
-if contains "$(ls /scheme)" kernel.trace
+# Host-visible rings (FERRIC_TRACE_HOST, the harness's trace mode) have one reader, the host:
+# the guest can neither read nor map them.
+if contains "$(cat /scheme/sys/env)" FERRIC_TRACE_HOST
+    echo FERRIC_TEST_SKIP trace-capture: host-visible rings have one reader, the host
+else if contains "$(ls /scheme)" kernel.trace
     ferric-trace capture --via map /tmp/ferric-trace-capture && ferric-trace text /tmp/ferric-trace-capture > /dev/null && echo FERRIC_TEST_PASS trace-capture || echo FERRIC_TEST_FAIL trace-capture
 else
     echo FERRIC_TEST_SKIP trace-capture: no kernel.trace scheme

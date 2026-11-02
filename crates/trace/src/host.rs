@@ -16,8 +16,10 @@
 //! never waits for a reader and a reader can never hold the kernel up. A host that sees the
 //! guest's RAM (QEMU's `memory-backend-file` with `share=on`) finds the directory, maps it
 //! read-only and follows each ring with an [`Observer`](crate::ring::Observer), which keeps
-//! its own position and stores nothing. Readers inside the guest (`kernel.trace/cpu/<n>`)
-//! still work; what they consume does not change what a host reads.
+//! its own position and stores nothing. The host is these rings' only reader: the kernel
+//! refuses reads and commits of them through `kernel.trace/cpu/<n>` (`EBUSY`), because a
+//! guest consumer would move the `tail` an overtaken observer takes as its oldest whole
+//! record.
 //!
 //! # The directory
 //!
