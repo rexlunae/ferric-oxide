@@ -263,22 +263,24 @@ mod image_tests {
         assert_eq!(loaded_len(probe(&extended), size), size);
     }
 
-    /// This test binary is a real ELF object: the mapping covers every segment and the
-    /// program header table, and stops before the section header table.
+    /// This test binary is a real ELF object: the mapping ends exactly where its last
+    /// program header range or the program header table ends, and before the section
+    /// header table.
     #[test]
     fn a_real_object_maps_its_segments_and_not_its_section_headers() {
         let bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         let header = FileHeader64::<E>::parse(&*bytes).unwrap();
         let segments = header.program_headers(E, &*bytes).unwrap();
+        let table_end = header.e_phoff(E) + size_of_val(segments) as u64;
+        let expected = segments
+            .iter()
+            .map(|segment| {
+                let (offset, size) = segment.file_range(E);
+                offset + size
+            })
+            .fold(table_end, u64::max);
         let len = u64::try_from(loaded_len(probe(&bytes), bytes.len())).unwrap();
-        for segment in segments {
-            let (offset, size) = segment.file_range(E);
-            assert!(
-                offset + size <= len,
-                "segment {offset:#x}+{size:#x} past {len:#x}"
-            );
-        }
-        assert!(header.e_phoff(E) + size_of_val(segments) as u64 <= len);
+        assert_eq!(len, expected);
         let shoff = header.e_shoff(E);
         assert!(
             len <= shoff && shoff < bytes.len() as u64,
