@@ -68,10 +68,11 @@ fn ownership(path: &str) -> Result<(u32, u32, u32), Failure> {
     Ok((metadata.uid(), metadata.gid(), metadata.mode() & 0o7777))
 }
 
-/// Succeeds when `result` is the `EPERM` a refused change returns.
+/// Succeeds when `result` is the `EPERM` a refused change returns. `EACCES`, which the
+/// standard library also reports as `PermissionDenied`, is a failure.
 fn refused(what: &str, result: io::Result<()>) -> Result<(), Failure> {
     match result {
-        Err(err) if err.kind() == ErrorKind::PermissionDenied => Ok(()),
+        Err(err) if err.raw_os_error() == Some(libc::EPERM) => Ok(()),
         Err(err) => Err(Failure::Check(format!("{what}: {err}, expected EPERM"))),
         Ok(()) => Err(Failure::Check(format!("{what} was allowed"))),
     }

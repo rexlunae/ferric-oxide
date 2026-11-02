@@ -276,8 +276,11 @@ pub fn current_time() -> TimeSpec {
 /// `fchown` and `fchmod` change under the POSIX rules in `ferric_abi::id`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ownership {
+    /// The file type and permission bits (`MODE_TYPE` and `MODE_PERM`).
     pub mode: u16,
+    /// The owner's user ID.
     pub uid: u32,
+    /// The file's group ID.
     pub gid: u32,
 }
 
