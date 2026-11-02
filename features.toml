@@ -1446,6 +1446,8 @@ Sets CONFIG_NAME; the build directory is build/<arch>/<config>.
 ferric-smoke and ferric-fuzz select the existing CI test images on x86_64.
 ferric-sched-bench selects the x86-64 scheduler baseline workload; enable
 kernel.trace, kernel.trace_sched and kernel.rings for its measurements.
+ferric-perf runs the process, pipe, logging and file microbenchmarks
+(ferric-perf) once at boot and shuts down; it needs no optional features.
 They retain your configured CPU and kernel options; CI's forced test settings
 are separate from these image-content choices."""
 choices = [
@@ -1463,6 +1465,7 @@ choices = [
   { value = "ferric-smoke", title = "ferric-smoke: Ferric CI smoke tests (x86-64)" },
   { value = "ferric-fuzz", title = "ferric-fuzz: extended syscall fuzzing (x86-64)" },
   { value = "ferric-sched-bench", title = "ferric-sched-bench: scheduler and ring baseline measurements (x86-64)" },
+  { value = "ferric-perf", title = "ferric-perf: process, pipe, logging and file microbenchmarks" },
   { value = "ferric-hardware", title = "ferric-hardware: hardware bring-up inventory (x86-64)" },
 ]
 

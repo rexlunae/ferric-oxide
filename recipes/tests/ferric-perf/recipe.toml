@@ -1,0 +1,39 @@
+# Ferric Oxide: process, context-switch, pipe, logging and file microbenchmarks
+# (roadmap Phase 0 benchmarks). ferric-perf times process spawn (fork+exec and
+# posix_spawn of a static and a dynamically linked program, and `ion -c true`),
+# thread and process ping-pong over pipes, pipe throughput and a 1-byte round
+# trip, 70-byte writes to /scheme/log against /scheme/null, file create, stat and
+# unlink, and mapping a large file, and prints a FERRIC_BENCH perf-* line per
+# measurement (iterations, mean, median and p99 in nanoseconds).
+# config/ferric-perf.toml runs it at boot. Only for test images. Source lives in
+# files/; as a path source (relative to the repository root) edits there rebuild it.
+[source]
+path = "recipes/tests/ferric-perf/files"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+# The iobench crate is a path dependency at ../../../../crates/iobench from files/.
+# The cookbook builds a copy of files/ in this recipe's source/, at the same depth,
+# so the relative path holds there too.
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+# ferric-perf and the static spawn target ferric-perf-true, linked statically like
+# the other test programs.
+cookbook_cargo
+
+# The dynamic spawn target: the same empty program linked against relibc's libc.so
+# and started through ld.so, as ferric-aslr-test is. It gets its own target
+# directory, so the static build's artifacts are left alone.
+DYNAMIC_INIT
+CARGO_TARGET_DIR="${COOKBOOK_BUILD}/target-dynamic" "${COOKBOOK_CARGO}" build \
+    --manifest-path "${COOKBOOK_SOURCE}/Cargo.toml" --bin ferric-perf-true \
+    ${build_flags} -j "${COOKBOOK_MAKE_JOBS}" "${COOKBOOK_CARGO_FLAGS[@]}"
+cp -v "${COOKBOOK_BUILD}/target-dynamic/${TARGET}/${build_type}/ferric-perf-true" \
+    "${COOKBOOK_STAGE}/usr/bin/ferric-perf-true-dynamic"
+"""
+
+[package]
+# `spawn-ion` runs ion; the dynamic spawn target needs libgcc_s.so (Rust's unwinder
+# when it is not linked statically) beside relibc's libc.so and ld.so.
+dependencies = ["ion", "libgcc"]

@@ -436,6 +436,7 @@ See [the network queue test](ferric-io.md#kernel-bypass-network-queues) for manu
 | `ferric-fat-test` | Mounts the `fatd` FAT32 fixture image (`fs.fat`), then the exFAT one (`fs.exfat`, a skip without it), and on each lists the root, an empty directory and one over several clusters, reads files whole and at an offset by their long names, their 8.3 short names (FAT only) and in another case, checks sizes, kinds, modes and modification times from `stat`, and checks that writing, creating, removing, renaming and `mkdir` fail with `EROFS` |
 | `ferric-blocklayer-test` | Serves the `crates/blocklayer` fixture images with `ferric-blockd` (`fs.luks`, `fs.lvm`): an LV inside LUKS2 with 4096-byte sectors, LUKS2 inside an LV and a LUKS1 volume read back their patterns whole and across a sector boundary; opening for writing fails with `EROFS`, a UID 2000 process gets `EACCES`, and a wrong passphrase makes the daemon exit without serving. With `ferric-unlock` (`fs.unlock_at_boot`), `blocklayer-unlock-boot` reads back the volumes its `/etc/ferric/crypttab` had unlocked at boot: LVM on LUKS from a key file, and ext4 mounted by `ext4d` through `ferric-blockd` |
 | `ferric-trace-bench` | Times RedoxFS requests and null system calls with tracing compiled out, compiled in but off, and every event on, for the overhead budget |
+| `ferric-perf` | Not in the smoke image: process spawn, thread and process ping-pong over pipes, pipe throughput and round trip, `/scheme/log` against `/scheme/null` writes, file create/stat/unlink and large-file `mmap` timings, run by `config/ferric-perf.toml` ([Process and IPC benchmarks](#process-and-ipc-benchmarks)) |
 | `ferric-iommu-test` | QEMU edu device DMA, domain ownership, permissions, invalidation, fork isolation, grant/sub-grant access and revocation; with tracing, `iommu.fault` records of its faults (`iommu-trace`) completed DMA map/protect/unmap records, cached translations and live disable (`iommu-mapping-trace`), and the `irq.deliver`/`irq.ack` pair of its MSI (`trace-irq`) |
 | `ferric-syscall-fuzz` | Seeded multi-process syscall fuzzing and validation of invalid inputs |
 
@@ -517,6 +518,128 @@ The workflow exports recipe-facing kernel/relibc/bootloader settings from its
 temporary generated config. It does not install a root `ferric.toml` or
 automatically apply every generated user-space CPU flag to this mixed
 prebuilt/source image. Dedicated local baseline builds are a separate check.
+
+## Process and IPC benchmarks
+
+`recipes/tests/ferric-perf` holds microbenchmarks for the costs that the other
+benchmarks do not cover: starting processes, switching between contexts that
+talk over pipes, logging, file metadata and mapping files. `config/ferric-perf.toml`
+(`image.config = "ferric-perf"`, or `make all CONFIG_NAME=ferric-perf`) boots the
+minimal system, waits five seconds for the boot services to settle, runs
+`ferric-perf` once between `FERRIC_PERF_BEGIN` and `FERRIC_PERF_DONE`, prints
+`FERRIC_SMOKE_OK` and shuts down. It needs no optional kernel features and is not
+part of CI's image boots. Run it by hand in any image that includes the recipe:
+`ferric-perf` runs everything, `ferric-perf spawn pingpong` runs the benchmarks
+whose names start with those words, and `ferric-perf --list` lists them.
+
+| Line (`FERRIC_BENCH perf-…`) | One sample |
+| --- | --- |
+| `clock` | Two consecutive readings of the monotonic clock: the overhead included in every other sample; adds `res_ns`, the clock's resolution from `clock_getres` |
+| `spawn-fork-exec-static`, `-dynamic` | `fork`, `execve` of an empty program in the child, and `waitpid` until it exits |
+| `spawn-posix-spawn-static`, `-dynamic` | relibc's `posix_spawn` of the same program, which builds the child without copying the parent, and `waitpid` |
+| `spawn-ion` | `ion -c true` through `posix_spawn`: a shell started to run one builtin |
+| `pingpong-thread`, `pingpong-process` | One byte to a peer thread, or to a peer process (`ferric-perf --pong`), over one pipe and back over another |
+| `pipe-rtt-1b` | One thread writes a byte into a pipe and reads it back: the pipe's system calls without a wake-up or switch |
+| `pipe-throughput` | Reading 4 MiB that a writer thread sends in 64 KiB writes; adds `bytes` and `mib_s` |
+| `write-null`, `write-log` | One 70-byte line written to `/scheme/null` (`zerod`), or to `/scheme/log`, the standard output and error init gives services; adds `bytes` and `mib_s` |
+| `file-create`, `file-stat`, `file-unlink` | Creating (`O_CREAT \| O_EXCL`, then closing) an empty file in a new scratch directory, `/tmp/ferric-perf/ferric-perf-<pid>-files` (`--dir` sets the parent; a name a killed run left gets a `.<n>` suffix, and nothing already there is touched; RedoxFS: `/tmp` is a directory of the root file system), getting a file's metadata by path, removing a file |
+| `mmap-map`, `mmap-touch`, `mmap-unmap` | `mmap` of a 32 MiB file (`PROT_READ`, `MAP_PRIVATE`, as `ld.so` maps objects), reading one byte of every 4 KiB page of the new mapping, `munmap`; the first two add `bytes` and `mib_s` |
+
+The static spawn target is `/usr/bin/ferric-perf-true`, an empty Rust program
+linked like the other test programs; the recipe builds the same program a second
+time with `DYNAMIC_INIT` as `/usr/bin/ferric-perf-true-dynamic`, which `ld.so`
+starts with relibc's `libc.so` (as `ferric-aslr-test` is linked). On riscv64gc,
+where the cookbook has no dynamic linking, both are static. The `write-log`
+lines appear on the serial console; they start with `ferric-perf write-log:`.
+
+Every line has the same fields:
+
+```text
+FERRIC_BENCH perf-spawn-posix-spawn-static iters=200 mean_ns=… median_ns=… p99_ns=… min_ns=… max_ns=…
+```
+
+- **`iters`** is the number of timed samples. Each benchmark first runs a few
+  untimed warm-up iterations, then runs until it reaches its iteration limit (200
+  spawns, 10,000 round trips or null writes, 500 files, 20 mappings, …) or until its
+  time budget of one to three seconds runs out, whichever comes first, with a small
+  minimum. A count below the limit means the operation was slower than planned. A
+  run stays well under a minute on KVM even when something waits for the scheduler
+  tick on every iteration.
+- **`mean_ns`**, **`min_ns`** and **`max_ns`** are exact. **`median_ns`** and
+  **`p99_ns`** come from `ferric_iobench`'s fio-layout histogram (the middle of the
+  bucket the rank falls in, within 1/64 of the true value), the same percentiles
+  `ferric-iobench` and `ferric-trace counts` report. The rank is the nearest rank,
+  rounded up: the median of an even count is the lower middle sample, and with
+  fewer than 100 samples (the `mmap` lines always, the spawn and `write-log` lines
+  when their budget runs out) `p99_ns` is the slowest sample, the same as `max_ns`.
+- Each sample is timed with two clock reads, so it includes one `clock` sample.
+  On Redox a clock read is a system call; subtract `perf-clock`'s median before
+  comparing operations that take only a few microseconds, such as `pipe-rtt-1b`
+  and `write-null`. `perf-clock`'s `res_ns` is the resolution of the kernel's
+  clock source: 1 for the KVM clock or the TSC, the HPET's period (about 10 ns
+  under QEMU), or 838 for the PIT fallback. Under QEMU an HPET read is a VM exit,
+  so the `clock` cost itself depends on the source; compare runs only with the
+  same source. With `kernel.time.one_shot` the kernel log names it at boot
+  (`time: clock source ...`); otherwise it is the KVM clock with `x86_kvm_pv`
+  under KVM, else the HPET, else the PIT.
+- The run ends with `FERRIC_TEST_PASS perf`. A benchmark that fails prints
+  `FERRIC_TEST_FAIL perf-<group>: <cause>`, the others still run, and the run ends
+  with `FERRIC_TEST_FAIL perf: …` and exit status 1. `boot-smoke.sh` fails a boot
+  with any `FERRIC_TEST_FAIL` line.
+
+Read the lines in pairs as well as one at a time:
+
+- `pingpong-thread` minus `pipe-rtt-1b` is roughly the cost of two wake-ups and
+  the context switches between two threads. The scheduler places the two sides:
+  on one CPU a round trip is two direct switches, on two CPUs it is four switches
+  through the idle contexts plus the wake-up IPIs, so compare runs with the same
+  number of vCPUs. `pingpong-process` adds the switch
+  between address spaces (CR3 loads, and IBPB barriers when `kernel.cpu.ibpb` is
+  on), so compare it under `kernel.cpu.kpti` and `kernel.cpu.ibpb` settings.
+- `write-log` minus `write-null` is what the log path costs per line: `logd`
+  writes each line to the kernel's serial console before it answers.
+- `spawn-*-dynamic` minus `spawn-*-static` is the dynamic linker's share of
+  starting a process, and `spawn-fork-exec-*` minus `spawn-posix-spawn-*` is the
+  cost of copying the parent's address space with `fork`.
+- The `mmap` lines split the work differently on Redox and on Linux, so compare
+  their sum across systems. On Redox, RedoxFS reads the file into a buffer of its
+  own on the first mapping (the untimed warm-up) and keeps it while the file is
+  unchanged, and the kernel maps every page of a private file mapping
+  copy-on-write from that buffer before `mmap` returns: a timed `mmap-map` is a
+  request to RedoxFS plus mapping 8192 pages, `mmap-touch` takes no page faults
+  (only TLB misses), and `mmap-unmap` removes the 8192 pages. On Linux, `mmap`
+  only reserves the range and `mmap-touch` takes the page faults. None of the
+  timed samples reads the file.
+
+For a comparison between two kernels, configurations or commits, boot each image
+several times on the same idle host, alternating which boots first, and compare
+the medians of the paired differences, as `scripts/ferric-ci/check-trace-overhead.sh`
+does for the tracing budget. Run-to-run noise under QEMU/KVM is several percent
+(see [Kernel tracing](ferric-tracing.md#overhead-budget)), so a single boot shows
+an order of magnitude, not a small change. To see where the time of an operation
+goes, take a capture while the benchmark runs on a kernel with `kernel.trace` and
+read it with `ferric-trace latency` ([Latency](ferric-tracing.md#latency)): the
+system call, scheme request, wake-up and interrupt durations behind each line.
+
+The benchmarks are plain POSIX, so they also run on Linux for a reference point,
+given host paths for their targets:
+
+```sh
+cd recipes/tests/ferric-perf/files
+cargo build --release
+./target/release/ferric-perf --static-true target/release/ferric-perf-true \
+    --dynamic-true target/release/ferric-perf-true --ion /bin/sh \
+    --log /dev/stderr --null /dev/null --dir target/scratch
+```
+
+On the host, `cargo test --locked --manifest-path recipes/tests/ferric-perf/files/Cargo.toml`
+runs the unit tests of the timing and statistics code (warm-up, iteration limit,
+budget and minimum against a scripted clock; phase timing; line format and
+throughput), the system-call wrappers, the benchmark selection, and a CLI test
+that runs every benchmark briefly (`--quick`) and checks every line, the
+failure path and the cleanup. `host-tools.yml` runs those tests and strict
+Clippy for the host and `x86_64-unknown-redox`, and Rustdoc for the target.
+The numbers on Redox and the dynamic spawn target need an image build and a boot.
 
 ## Reproducing a boot
 

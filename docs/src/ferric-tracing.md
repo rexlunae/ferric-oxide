@@ -1117,6 +1117,68 @@ and the start time (its first eight bytes; OTLP/JSON encodes the id in base64), 
 captures sent to one backend keep separate traces. The mapping is described in
 `tools/ferric-trace/src/otlp.rs`.
 
+### Latency
+
+`latency` turns a capture into latency histograms, one `key=value` line per key and
+a merged `all` line per kind, like the `counts` view:
+
+```sh
+cargo run -p ferric-trace-cli -- latency capture/ --tsc-mhz 3000
+```
+
+```text
+latency syscall nr=0x9e name=yield count=2 open=0 min_ns=50 mean_ns=75 p50_ns=50 p90_ns=100 p99_ns=100 max_ns=100
+latency syscall nr=all count=3 open=1 unmatched=1 min_ns=50 mean_ns=1050 p50_ns=100 p90_ns=2992 p99_ns=2992 max_ns=3000
+latency scheme scheme=2 opcode=Write count=1 open=0 min_ns=1900 mean_ns=1900 p50_ns=1900 p90_ns=1900 p99_ns=1900 max_ns=1900
+latency wake_run cpu=0 count=1 min_ns=200 mean_ns=200 p50_ns=200 p90_ns=200 p99_ns=200 max_ns=200
+latency irq irq=11 count=1 open=0 min_ns=1100 mean_ns=1100 p50_ns=1100 p90_ns=1100 p99_ns=1100 max_ns=1100
+```
+
+| Kind | Interval | Key | Events to enable |
+| --- | --- | --- | --- |
+| `syscall` | `syscall.enter` to the matching `syscall.exit` of the same context, including time it was blocked and the CPU it resumed on | `nr` (and `name` where `redox_syscall` defines the number) | `syscall`, and `sched.switch` for calls that block |
+| `scheme` | `scheme.request` to the `scheme.response` with the same scheme and tag | `scheme` id and `opcode` (the `schemev2::Opcode` name, or the number) | `scheme` |
+| `wake_run` | The `wait` of `sched.wake_run`: from `unblock` making a context runnable to it running | `cpu`, the CPU it ran on | `sched.wake_run` (`trace_sched`) |
+| `irq` | `irq.deliver` to the `irq.ack` that ended it: the one with the same IRQ, CPU and count, or of a later count when another interrupt of the IRQ arrived before the driver acknowledged this one (the kernel refuses an acknowledgement of a count that is no longer current) | `irq` | `irq` |
+
+System call names come from the crates.io `redox_syscall` release the tool
+links, not from the kernel's in-tree copy (`crates/kernel/syscall`), so a number
+only the kernel's copy defines has no `name`: notably `SYS_OPENAT_INTO2`
+(`nr=0x101003da`), which relibc opens files with.
+
+The pairing of system calls and requests is the one the OpenTelemetry export
+uses (`tools/ferric-trace/src/spans.rs`). For interrupts, a delivery that woke no
+handle is not counted, and when several handles share an IRQ, the first
+acknowledgement ends it and the others are ignored. The minimum, mean and maximum
+are exact, and `p50`, `p90` and `p99` are percentiles of `ferric_iobench`'s
+fio-layout histogram (the middle of the rank's bucket, within 1/64 of the true
+value). The rank is the nearest rank, rounded up: with fewer than 100 intervals,
+`p99` is the longest one. Durations above about 17 s share the histogram's last
+bucket, so a percentile that falls there reads as about 17 s (a daemon's read
+that waits for the whole capture, say); the mean and maximum stay exact.
+
+`open` counts intervals that started in the capture and had not ended by its last
+record, such as a call still blocked or a request not yet answered; the `all`
+line's `unmatched` counts ends whose start is not in the capture. Neither is in
+the histogram, and a key whose intervals all stayed open prints `count=0` with no
+distribution fields rather than zeros. Both grow when a ring dropped records, and a lost record can pair
+the wrong records (an exit whose enter was lost ends an older call of the same
+number whose exit was lost). When the capture directories hold the drain's
+`stats.start` and `stats.end` snapshots, the view starts with a
+`latency lost cpu=<n> lost_before=<n> lost_during=<n>` line per CPU, the losses
+`counts` reports; read a distribution as complete only when they are zero.
+Without `sched.switch`, every record on a CPU counts as
+one context's, and a call that blocks while another context runs a different
+call on that CPU stays open. Timestamps convert as for `counts`: with the
+capture's clock when it has a tick length, otherwise with `--tsc-mhz`.
+
+`ferric-trace-cli`'s unit tests (`latency::tests`, and `spans::tests` for the
+interrupt pairing) cover each kind, open and unmatched intervals, interrupts
+overtaken by a later count or acknowledged by several handles, the loss lines and
+the clock conversion. Its CLI test reads `tools/ferric-trace/tests/fixtures/latency`, a
+two-CPU capture written byte by byte from the record format rather than with the
+crate's encoder, and compares the output with `latency.expected` beside it.
+
 ## Host-visible rings
 
 With `kernel.trace_host`, a host reads the trace rings straight out of a

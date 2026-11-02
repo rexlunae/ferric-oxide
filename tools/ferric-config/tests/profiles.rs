@@ -22,6 +22,7 @@ impl Fixture {
             "ferric-smoke",
             "ferric-fuzz",
             "ferric-sched-bench",
+            "ferric-perf",
             "ferric-hardware",
         ] {
             std::fs::copy(
@@ -191,6 +192,15 @@ fn assert_profile_packages(profile: &str, resolved: &redox_installer::Config) {
             "ferric-iobench",
             "ferric-sched-bench",
         ]
+    } else if profile == "ferric-perf" {
+        &[
+            "kernel",
+            "relibc",
+            "bootloader",
+            "redoxfs",
+            "base",
+            "ferric-perf",
+        ]
     } else {
         &[
             "kernel",
@@ -251,6 +261,15 @@ fn assert_profile_scripts(profile: &str, resolved: &redox_installer::Config) {
         assert!(script.contains("shutdown"));
         return;
     }
+    if profile == "ferric-perf" {
+        assert!(last_file("/usr/lib/init.d/30_console").contains("ion /usr/lib/ferric-perf.ion"));
+        let script = last_file("/usr/lib/ferric-perf.ion");
+        assert!(script.contains("echo FERRIC_PERF_BEGIN"));
+        assert!(script.contains("ferric-perf ||"));
+        assert!(script.contains("echo FERRIC_SMOKE_OK"));
+        assert!(script.contains("shutdown"));
+        return;
+    }
     assert!(last_file("/usr/lib/init.d/30_console").contains("ion /usr/lib/ferric-smoke.ion"));
     let script = last_file("/usr/lib/ferric-smoke.ion");
     assert!(script.contains("echo FERRIC_SMOKE_BEGIN"));
@@ -285,6 +304,11 @@ fn fuzz_profile_keeps_saved_features_through_make_and_installer() {
 #[test]
 fn scheduler_baseline_profile_reaches_make_and_installer() {
     assert_profile("ferric-sched-bench");
+}
+
+#[test]
+fn perf_benchmark_profile_reaches_make_and_installer() {
+    assert_profile("ferric-perf");
 }
 
 #[test]
