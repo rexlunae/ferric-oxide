@@ -1,0 +1,42 @@
+# Type a boot environment entry into the bootloader's editor ('e'), the fallback for
+# bootloaders without fw_cfg support, then log in on the serial console, check that the
+# entry reached the kernel's environment, and read VT 2 by OCR.
+#
+#   ferric-harness run build/x86_64/wayland/harddrive.img --mem 4096 \
+#       --boot-env FERRIC_HARNESS_PROBE=a-b_42 --boot-env-via keys \
+#       --scenario tools/ferric-harness/scenarios/typed-boot-env.toml
+description = "a boot environment typed into the bootloader editor reaches the kernel"
+timeout = 60
+
+[[step]]
+expect = "login:"
+timeout = 300
+
+[[step]]
+send = "root"
+
+[[step]]
+expect = "assword"
+
+[[step]]
+send = "password"
+
+[[step]]
+expect = "root:~# "
+
+[[step]]
+send = "grep FERRIC_HARNESS /scheme/sys/env"
+
+[[step]]
+expect = "FERRIC_HARNESS_PROBE=a-b_42"
+
+[[step]]
+key = "meta_l-f2"
+
+[[step]]
+wait = "text:login:"
+timeout = 30
+
+[[step]]
+text = "vt2.txt"
+contains = "redox login:"
