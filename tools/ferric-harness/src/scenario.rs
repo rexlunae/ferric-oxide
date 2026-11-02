@@ -27,7 +27,7 @@
 //! [[step]]
 //! pointer = { button = "left", action = "click" }
 //! [[step]]
-//! shot = "desktop.png"          # screenshot, relative to <run>/shots; `true` names it
+//! shot = "desktop.png"          # screenshot file name in <run>/shots; `true` names it
 //! [[step]]
 //! text = "vt1.txt"              # read the screen, save the text; `true` only logs it
 //! contains = "login"            # optional: fail unless the text contains this
@@ -55,6 +55,7 @@ use thiserror::Error;
 use crate::error::{Error, chain};
 use crate::input::{self, Button, ButtonAction, InputError, PointerAction};
 use crate::report::StepResult;
+use crate::rundir::{self, NotFileName};
 use crate::screen::{ScreenError, ScreenPredicate};
 use crate::serial::Eol;
 use crate::session::{Session, Since};
@@ -118,6 +119,9 @@ pub enum StepProblem {
     /// A `wait` predicate that does not parse.
     #[error(transparent)]
     Predicate(#[from] ScreenError),
+    /// A `shot` name that is not a plain file name in `<run>/shots/`.
+    #[error(transparent)]
+    ShotName(#[from] NotFileName),
     /// A `pointer` table without exactly one of `abs`, `rel` and `button`.
     #[error("pointer needs exactly one of abs, rel or button")]
     PointerShape,
@@ -148,7 +152,7 @@ enum OneOrMany {
 #[serde(untagged)]
 enum FileOrFlag {
     Flag(bool),
-    File(PathBuf),
+    File(String),
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -217,8 +221,9 @@ pub enum Action {
     Key(Vec<String>),
     /// Pointer input.
     Pointer(PointerAction),
-    /// Take a screenshot (to a file under `<run>/shots/`, or named automatically).
-    Shot(Option<PathBuf>),
+    /// Take a screenshot (to the file of this name in `<run>/shots/`, or named
+    /// automatically).
+    Shot(Option<String>),
     /// Read the screen's text, optionally saving it and requiring a substring.
     Text {
         /// Where to save the text, under the run directory.
@@ -249,11 +254,7 @@ impl Action {
             Action::Type(text) => format!("type {text:?}"),
             Action::Key(keys) => format!("key {}", keys.join(" ")),
             Action::Pointer(p) => format!("pointer {p:?}"),
-            Action::Shot(path) => format!(
-                "shot {}",
-                path.as_deref()
-                    .map_or("".into(), |p| p.display().to_string())
-            ),
+            Action::Shot(name) => format!("shot {}", name.as_deref().unwrap_or("")),
             Action::Text { save, .. } => format!(
                 "text {}",
                 save.as_deref()
@@ -367,11 +368,16 @@ fn convert(step: usize, spec: StepSpec, default_timeout: f64) -> Result<Step, Sc
         actions.push(("pointer", Action::Pointer(pointer(p).map_err(invalid)?)));
     }
     if let Some(shot) = spec.shot {
-        let path = file_or_flag(shot, "shot").map_err(invalid)?;
-        actions.push(("shot", Action::Shot(path)));
+        let name = file_or_flag(shot, "shot").map_err(invalid)?;
+        if let Some(name) = &name {
+            rundir::file_name(name).map_err(|e| invalid(e.into()))?;
+        }
+        actions.push(("shot", Action::Shot(name)));
     }
     if let Some(text) = spec.text {
-        let save = file_or_flag(text, "text").map_err(invalid)?;
+        let save = file_or_flag(text, "text")
+            .map_err(invalid)?
+            .map(PathBuf::from);
         actions.push((
             "text",
             Action::Text {
@@ -428,7 +434,7 @@ fn convert(step: usize, spec: StepSpec, default_timeout: f64) -> Result<Step, Sc
 }
 
 /// `true` or a file name; `false` would be a step that does nothing.
-fn file_or_flag(value: FileOrFlag, action: &'static str) -> Result<Option<PathBuf>, StepProblem> {
+fn file_or_flag(value: FileOrFlag, action: &'static str) -> Result<Option<String>, StepProblem> {
     match value {
         FileOrFlag::File(path) => Ok(Some(path)),
         FileOrFlag::Flag(true) => Ok(None),
@@ -514,9 +520,8 @@ fn execute(session: &Session, step: &Step) -> Result<String, Error> {
             session.pointer(*action)?;
             Ok(String::new())
         }
-        Action::Shot(path) => {
-            let out = path.as_ref().map(|p| run.shots_dir().join(p));
-            let shot = session.shot(out.as_deref())?;
+        Action::Shot(name) => {
+            let shot = session.shot(name.as_deref())?;
             Ok(format!(
                 "{} ({}x{})",
                 shot.path.display(),
@@ -741,6 +746,13 @@ since = "m"
             parse("[[step]]\nshot = false\n"),
             Err(ScenarioError::Invalid {
                 problem: StepProblem::DoesNothing { action: "shot" },
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse("[[step]]\nshot = \"../../escape.png\"\n"),
+            Err(ScenarioError::Invalid {
+                problem: StepProblem::ShotName(_),
                 ..
             })
         ));

@@ -92,8 +92,8 @@ covers every module.
 | `up <image> [options]` | Starts QEMU and the supervisor, and returns once the guest runs. Prints the run directory and QEMU's PID |
 | `run <image> [--scenario <toml>] [options]` | `up`, the scenario (or waiting for power-off), `down` and the report in one process. Exits 0 when the verdict passes |
 | `status [--json]` | The run's state: uptime, serial counters, milestones, test counts, crash, host rings. After the run ends, it prints the verdict from `report.json` instead |
-| `shot [--out f.png]` | A QMP `screendump` as PNG. The default is `<run>/shots/shot-<n>.png` |
-| `text [--save f.png] [--json]` | Reads the text of the console on the screen (see [Screen](#screen)) |
+| `shot [--out f.png]` | A QMP `screendump` as PNG, kept as `<run>/shots/shot-<n>-<t>ms.png`. `--out` also copies it to `f.png` |
+| `text [--save f.png] [--json]` | Reads the text of the console on the screen (see [Screen](#screen)). `--save` also copies the screenshot to `f.png` |
 | `type <text>` | Types on a US-layout keyboard. `\n` is Enter |
 | `key <combo>...` | Presses key combinations in turn: `ret`, `ctrl-alt-f2`, `meta_l-f2` |
 | `pointer abs <x> <y> [--raw]` | Moves the absolute pointer, in screen pixels or, with `--raw`, in QEMU axis units (0 to 0x7fff) |
@@ -188,7 +188,7 @@ wait = "text:login:"       # a wait-screen predicate
 text = "vt2.txt"           # read the screen; `true` only logs it
 contains = "redox login:"  # optional: fail unless the text contains this
 [[step]]
-shot = "vt2.png"           # under <run>/shots; `true` names it automatically
+shot = "vt2.png"           # a file name in <run>/shots; `true` names it automatically
 [[step]]
 sleep = 2.5
 [[step]]
@@ -337,6 +337,13 @@ same events through xhcid and usbhidd as well.
 ### Screen
 
 `shot` saves the framebuffer from QMP `screendump` as a PNG.
+
+QEMU writes screenshots only in `<run>/shots/`. A control request names the
+file, never a path: `shot` and `text` requests take a plain file name (no `/`,
+not `.` or `..`) and are refused with any other, as are such names in a
+scenario's `shot` step. `shot --out` and `text --save` write the copy
+themselves, in the client, so a file outside the run directory is written with
+the client's own permissions, not by QEMU.
 
 `text` reads text without general OCR. fbcond, fbbootlogd and the kernel's
 graphical debug output draw every character as an 8x16 cell in two colours,

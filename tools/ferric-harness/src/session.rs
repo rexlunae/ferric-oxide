@@ -573,55 +573,48 @@ impl Session {
         }
     }
 
-    /// Takes a screenshot into `out` (absolute), or `<run>/shots/shot-<n>.png`.
+    /// Takes a screenshot into `<run>/shots/<name>`, or `<run>/shots/shot-<n>-<t>ms.png`.
+    /// QEMU writes only there; a client that wants the file elsewhere copies it.
     ///
     /// # Errors
     ///
-    /// QMP errors (the guest exited, say) and errors reading the PNG back.
-    pub fn shot(&self, out: Option<&Path>) -> Result<ShotInfo, Error> {
-        let path = match out {
-            Some(path) => path.to_path_buf(),
-            None => {
-                let n = {
-                    let mut state = self.inner.state();
-                    state.shots += 1;
-                    state.shots
-                };
-                self.inner
-                    .run
-                    .shots_dir()
-                    .join(format!("shot-{n:03}-{:.0}ms.png", self.now_ms()))
-            }
-        };
+    /// [`Error::ShotName`] when `name` is not a plain file name, before anything is
+    /// written; QMP errors (the guest exited, say) and errors reading the PNG back.
+    pub fn shot(&self, name: Option<&str>) -> Result<ShotInfo, Error> {
+        let path = self.shot_path("shot", name)?;
         self.inner.screendump(&path).map(|(info, _)| info)
     }
 
-    /// Reads the text on the screen (see [`screen::read_text`]); the screenshot is kept at
-    /// `save` or under `<run>/shots/`.
+    /// Reads the text on the screen (see [`screen::read_text`]); the screenshot is kept as
+    /// `<run>/shots/<name>`, or `<run>/shots/text-<n>-<t>ms.png`.
     ///
     /// # Errors
     ///
     /// As [`shot`](Self::shot).
-    pub fn text(&self, save: Option<&Path>) -> Result<TextShot, Error> {
-        let path = match save {
-            Some(path) => path.to_path_buf(),
-            None => {
-                let n = {
-                    let mut state = self.inner.state();
-                    state.shots += 1;
-                    state.shots
-                };
-                self.inner
-                    .run
-                    .shots_dir()
-                    .join(format!("text-{n:03}-{:.0}ms.png", self.now_ms()))
-            }
-        };
+    pub fn text(&self, name: Option<&str>) -> Result<TextShot, Error> {
+        let path = self.shot_path("text", name)?;
         let (shot, image) = self.inner.screendump(&path)?;
         Ok(TextShot {
             shot,
             screen: screen::read_text(&image),
         })
+    }
+
+    /// The file a screenshot goes to: `<run>/shots/<name>`, or a numbered `<kind>-...png`.
+    fn shot_path(&self, kind: &str, name: Option<&str>) -> Result<PathBuf, Error> {
+        if let Some(name) = name {
+            return Ok(self.inner.run.shot(name)?);
+        }
+        let n = {
+            let mut state = self.inner.state();
+            state.shots += 1;
+            state.shots
+        };
+        Ok(self
+            .inner
+            .run
+            .shots_dir()
+            .join(format!("{kind}-{n:03}-{:.0}ms.png", self.now_ms())))
     }
 
     /// Types `text` on the keyboard (US layout).

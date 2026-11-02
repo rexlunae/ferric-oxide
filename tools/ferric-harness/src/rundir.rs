@@ -13,12 +13,38 @@
 use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::fs::DirBuilderExt as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+use thiserror::Error;
 
 use crate::error::Error;
 
 /// Name of the link to the newest run under `build/harness/`.
 pub const LATEST: &str = "latest";
+
+/// A name that is not a plain file name, refused where a file must stay in its directory.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("{0:?} is not a plain file name (no `/`, not `.` or `..`, not empty)")]
+pub struct NotFileName(pub String);
+
+/// Checks that `name` names a file directly inside a directory: one normal path component,
+/// so not empty, not absolute, not `.` or `..`, and without `/` or NUL.
+///
+/// # Errors
+///
+/// [`NotFileName`] for anything else.
+pub fn file_name(name: &str) -> Result<&str, NotFileName> {
+    let mut components = Path::new(name).components();
+    let single = matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(part)), None) if part == name
+    );
+    if single && !name.contains('\0') {
+        Ok(name)
+    } else {
+        Err(NotFileName(name.to_owned()))
+    }
+}
 
 /// The files of one run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +145,14 @@ impl RunDir {
     /// Screenshots.
     pub fn shots_dir(&self) -> PathBuf {
         self.root.join("shots")
+    }
+    /// The screenshot `name` in [`shots_dir`](Self::shots_dir), where QEMU may write.
+    ///
+    /// # Errors
+    ///
+    /// [`NotFileName`] unless `name` is a plain file name ([`file_name`]).
+    pub fn shot(&self, name: &str) -> Result<PathBuf, NotFileName> {
+        Ok(self.shots_dir().join(file_name(name)?))
     }
     /// Periodic stats samples, one JSON object per line.
     pub fn stats_jsonl(&self) -> PathBuf {
@@ -315,6 +349,27 @@ mod tests {
         fs::create_dir_all(&deep).expect("mkdir");
         assert_eq!(find_repo_root(&deep).as_deref(), Some(tmp.path()));
         assert_eq!(harness_root(&deep), tmp.path().join("build/harness"));
+    }
+
+    #[test]
+    fn screenshot_names_stay_in_the_shots_directory() {
+        let run = RunDir::new("/r");
+        assert_eq!(run.shot("a.png"), Ok(PathBuf::from("/r/shots/a.png")));
+        assert_eq!(run.shot("..a.png"), Ok(PathBuf::from("/r/shots/..a.png")));
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../a.png",
+            "a/b.png",
+            "a/",
+            "./a.png",
+            "/etc/passwd",
+            "/tmp/a.png",
+            "a\0b",
+        ] {
+            assert_eq!(run.shot(bad), Err(NotFileName(bad.to_owned())), "{bad:?}");
+        }
     }
 
     #[test]

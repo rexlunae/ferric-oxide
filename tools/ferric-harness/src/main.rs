@@ -65,11 +65,11 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Take a screenshot (PNG).
+    /// Take a screenshot (PNG), kept in <run>/shots/.
     Shot {
         #[command(flatten)]
         run: RunArg,
-        /// Where to write it; default <run>/shots/shot-<n>.png.
+        /// Also copy it here.
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -77,7 +77,7 @@ enum Cmd {
     Text {
         #[command(flatten)]
         run: RunArg,
-        /// Keep the screenshot here.
+        /// Also copy the screenshot here.
         #[arg(long)]
         save: Option<PathBuf>,
         /// Print JSON (rows, size, unknown cells).
@@ -483,20 +483,34 @@ fn dispatch(command: Cmd) -> Result<ExitCode, Error> {
         Cmd::Status { run, json } => status(&run.dir(), json),
         Cmd::Report { runs, a, b, json } => report_cmd(&runs, &a, &b, json),
         Cmd::Shot { run, out } => {
-            let out = out.map(|p| absolute(&p));
-            print_output(&run.dir(), &Request::Shot { out })
+            match control::request(&run.dir(), &Request::Shot { name: None })? {
+                Output::Shot(mut shot) => {
+                    if let Some(out) = out {
+                        shot.path = copy_shot(&shot.path, &out)?;
+                    }
+                    print_output(Output::Shot(shot))
+                }
+                other => print_output(other),
+            }
         }
         Cmd::Text { run, save, json } => {
-            let save = save.map(|p| absolute(&p));
-            match control::request(&run.dir(), &Request::Text { save })? {
-                Output::Text(t) if json => println!("{}", to_json(&*t)),
-                Output::Text(t) => println!("{}", t.screen.text()),
+            match control::request(&run.dir(), &Request::Text { name: None })? {
+                Output::Text(mut t) => {
+                    if let Some(save) = save {
+                        t.shot.path = copy_shot(&t.shot.path, &save)?;
+                    }
+                    if json {
+                        println!("{}", to_json(&*t));
+                    } else {
+                        println!("{}", t.screen.text());
+                    }
+                }
                 other => println!("{}", to_json(&other)),
             }
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Type { run, text } => print_output(&run.dir(), &Request::Type { text }),
-        Cmd::Key { run, combos } => print_output(&run.dir(), &Request::Key { combos }),
+        Cmd::Type { run, text } => request_output(&run.dir(), &Request::Type { text }),
+        Cmd::Key { run, combos } => request_output(&run.dir(), &Request::Key { combos }),
         Cmd::Pointer { run, action } => {
             let action = match action {
                 PointerCmd::Abs { x, y, raw } => PointerAction::Abs { x, y, raw },
@@ -506,18 +520,18 @@ fn dispatch(command: Cmd) -> Result<ExitCode, Error> {
                     action: how.action(),
                 },
             };
-            print_output(&run.dir(), &Request::Pointer { action })
+            request_output(&run.dir(), &Request::Pointer { action })
         }
         Cmd::Serial {
             run,
             action: SerialCmd::Send { text, eol },
-        } => print_output(&run.dir(), &Request::SerialSend { text, eol }),
+        } => request_output(&run.dir(), &Request::SerialSend { text, eol }),
         Cmd::Expect {
             run,
             pattern,
             timeout,
             since,
-        } => print_output(
+        } => request_output(
             &run.dir(),
             &Request::Expect {
                 pattern,
@@ -525,12 +539,12 @@ fn dispatch(command: Cmd) -> Result<ExitCode, Error> {
                 since,
             },
         ),
-        Cmd::Mark { run, name } => print_output(&run.dir(), &Request::Mark { name }),
+        Cmd::Mark { run, name } => request_output(&run.dir(), &Request::Mark { name }),
         Cmd::WaitScreen {
             run,
             predicate,
             timeout,
-        } => print_output(
+        } => request_output(
             &run.dir(),
             &Request::WaitScreen {
                 predicate,
@@ -542,9 +556,9 @@ fn dispatch(command: Cmd) -> Result<ExitCode, Error> {
                 TraceCmd::Start => Request::TraceStart,
                 TraceCmd::Stop => Request::TraceStop,
             };
-            print_output(&run.dir(), &request)
+            request_output(&run.dir(), &request)
         }
-        Cmd::Stats { run } => print_output(&run.dir(), &Request::Stats),
+        Cmd::Stats { run } => request_output(&run.dir(), &Request::Stats),
         Cmd::Down { run, timeout } => {
             match control::request(&run.dir(), &Request::Down { timeout_s: timeout })? {
                 Output::Down(down) => {
@@ -568,8 +582,24 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
 }
 
-fn print_output(run: &Path, request: &Request) -> Result<ExitCode, Error> {
-    match control::request(run, request)? {
+/// Copies a screenshot the supervisor wrote under `<run>/shots/` to where the user asked
+/// for it, and returns that path. The client writes it, so the supervisor and QEMU never
+/// write outside the run directory.
+fn copy_shot(from: &Path, to: &Path) -> Result<PathBuf, Error> {
+    let to = absolute(to);
+    fs::copy(from, &to).map_err(|source| Error::Io {
+        path: to.clone(),
+        source,
+    })?;
+    Ok(to)
+}
+
+fn request_output(run: &Path, request: &Request) -> Result<ExitCode, Error> {
+    print_output(control::request(run, request)?)
+}
+
+fn print_output(output: Output) -> Result<ExitCode, Error> {
+    match output {
         Output::Done => {}
         Output::Shot(shot) => println!(
             "{} {}x{} at {:.0} ms",

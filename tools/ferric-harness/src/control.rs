@@ -7,6 +7,9 @@
 //! `{"err": {"kind": ..., "message": ...}}`). Connections are served on their own threads,
 //! so a long `expect` does not hold up a `shot`.
 //!
+//! Screenshots are written only under `<run>/shots/`: a request names the file, never a
+//! path ([`Request::Shot`]), and a client that wants it elsewhere copies it there itself.
+//!
 //! Only the supervisor's own user may drive the guest. The socket is made `0600` as soon as
 //! it is bound, before any connection is accepted, and every accepted connection's peer
 //! user (`SO_PEERCRED`) must be the supervisor's effective user ([`peer_permitted`]); any
@@ -16,7 +19,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -41,15 +44,15 @@ use crate::stats::Sample;
 pub enum Request {
     /// The run's state.
     Status,
-    /// A screenshot.
+    /// A screenshot, written under `<run>/shots/` (the client copies it elsewhere).
     Shot {
-        /// Where to write it (absolute); default under `<run>/shots/`.
-        out: Option<PathBuf>,
+        /// Its file name there (no directories); default `shot-<n>-<t>ms.png`.
+        name: Option<String>,
     },
     /// The text on the screen.
     Text {
-        /// Where to keep the screenshot (absolute).
-        save: Option<PathBuf>,
+        /// The screenshot's file name under `<run>/shots/`; default `text-<n>-<t>ms.png`.
+        name: Option<String>,
     },
     /// Type text on the keyboard.
     Type {
@@ -174,8 +177,8 @@ fn seconds(s: f64) -> Duration {
 pub fn handle(session: &Session, request: Request) -> Result<Output, Error> {
     Ok(match request {
         Request::Status => Output::Status(Box::new(session.status())),
-        Request::Shot { out } => Output::Shot(session.shot(out.as_deref())?),
-        Request::Text { save } => Output::Text(Box::new(session.text(save.as_deref())?)),
+        Request::Shot { name } => Output::Shot(session.shot(name.as_deref())?),
+        Request::Text { name } => Output::Text(Box::new(session.text(name.as_deref())?)),
         Request::Type { text } => {
             session.type_text(&text)?;
             Output::Done

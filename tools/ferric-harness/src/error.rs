@@ -9,6 +9,7 @@ use thiserror::Error;
 use crate::bootenv::BootEnvError;
 use crate::input::InputError;
 use crate::qmp::QmpError;
+use crate::rundir::NotFileName;
 use crate::scenario::ScenarioError;
 use crate::screen::ScreenError;
 
@@ -182,6 +183,9 @@ pub enum Error {
     /// The control protocol broke (a malformed or missing reply).
     #[error("control socket protocol error")]
     Protocol(#[source] serde_json::Error),
+    /// A screenshot name that would put the file outside `<run>/shots/`.
+    #[error("invalid screenshot name")]
+    ShotName(#[from] NotFileName),
     /// A control client that runs as another user than the supervisor, or whose user
     /// could not be read.
     #[error("only uid {owner} may use this run's control socket")]
@@ -244,7 +248,8 @@ impl Error {
             | Error::TraceNotReady
             | Error::TraceRunning
             | Error::TraceNotRunning
-            | Error::PeerRefused { .. } => ErrorKind::BadRequest,
+            | Error::PeerRefused { .. }
+            | Error::ShotName(_) => ErrorKind::BadRequest,
             Error::Screen(ScreenError::Predicate(_) | ScreenError::Regex(_)) => {
                 ErrorKind::BadRequest
             }

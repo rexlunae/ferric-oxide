@@ -18,6 +18,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ferric_harness::bootenv::BootEnvVia;
+use ferric_harness::control::{self, Request};
+use ferric_harness::error::ErrorKind;
 use ferric_harness::input::{Button, ButtonAction, PointerAction};
 use ferric_harness::machine::{Display, LaunchConfig, Mode, OnCrash};
 use ferric_harness::markers::Marker;
@@ -488,6 +490,43 @@ fn desktop_session_end_to_end() {
     let shot = session.shot(None).expect("shot");
     assert_eq!((shot.width, shot.height), (640, 400));
     assert!(shot.path.starts_with(session.run().shots_dir()));
+    let named = session.shot(Some("named.png")).expect("named shot");
+    assert_eq!(named.path, session.run().shots_dir().join("named.png"));
+    // Nothing a client names makes QEMU write outside <run>/shots/.
+    let outside = fixture.path("escape.png");
+    for name in [
+        "../escape.png",
+        "../../escape.png",
+        outside.to_str().expect("utf-8"),
+        "sub/x.png",
+    ] {
+        assert!(
+            matches!(
+                session.shot(Some(name)),
+                Err(ferric_harness::Error::ShotName(_))
+            ),
+            "{name}"
+        );
+        assert!(
+            matches!(
+                session.text(Some(name)),
+                Err(ferric_harness::Error::ShotName(_))
+            ),
+            "{name}"
+        );
+        let reply = control::handle(
+            &session,
+            Request::Shot {
+                name: Some(name.to_owned()),
+            },
+        );
+        assert!(
+            matches!(&reply, Err(e) if e.kind() == ErrorKind::BadRequest),
+            "{name}: {reply:?}"
+        );
+    }
+    assert!(!outside.exists());
+    assert!(!session.run().root().join("escape.png").exists());
     let text = session.text(None).expect("text");
     assert_eq!(text.screen.text(), "Ferric Oxide boot log\nredox login: _");
     session
@@ -967,6 +1006,28 @@ fn cli_up_commands_down_report() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("no match for"));
     let out = run_args(&["text"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("redox login: _"));
+    // The client copies a screenshot to wherever its user asks; the supervisor writes it
+    // only under <run>/shots/.
+    let elsewhere = fixture.path("elsewhere");
+    fs::create_dir(&elsewhere).expect("mkdir");
+    let vt = elsewhere.join("vt.png");
+    let out = run_args(&["shot", "--out", vt.to_str().expect("utf-8")]);
+    assert!(
+        out.status.success(),
+        "shot: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with(&format!("{} 640x400", vt.display())));
+    assert!(vt.is_file());
+    let saved = elsewhere.join("text.png");
+    let out = run_args(&["text", "--save", saved.to_str().expect("utf-8")]);
+    assert!(out.status.success());
+    assert!(saved.is_file());
+    let in_run = fs::read_dir(run.join("shots")).expect("shots").count();
+    assert_eq!(
+        in_run, 3,
+        "these two and the first text's are kept in the run"
+    );
     let out = run_args(&["key", "nonsense-key"]);
     assert_eq!(out.status.code(), Some(2));
     let out = run_args(&["status", "--json"]);
