@@ -17,6 +17,10 @@
 //!
 //! - **Crash dump.** With `trace_crash`, a panic leaves its message and the newest records in
 //!   memory that survives a warm reboot, for the next boot to hand out (`crash`).
+//! - **Trace mode.** With `trace_mode` this is the trace-mode kernel, the second kernel the
+//!   `kernel.trace_mode` option adds to an image and the bootloader loads for
+//!   `FERRIC_KERNEL=trace`; it logs `trace: trace-mode kernel` from `init_boot`. The image's
+//!   normal kernel can then leave `trace` out, and run no tracing code at all.
 //!
 //! Records go to a ring per CPU (`ferric_trace::ring::Ring` in the shared layout, 64 KiB of
 //! records after a header page), stamped by the clock the `clock` module picks at boot: an

@@ -638,14 +638,18 @@ fn native_sysroot_is_newer(stamp: Option<std::time::SystemTime>, packages: &[Pat
 // A native sysroot contains static relibc objects outside normal recipe deps.
 // Kernel/UEFI do not link them, and relibc itself creates the sysroot stamp.
 fn native_sysroot_modified(recipe_dir: &Path) -> Option<std::time::SystemTime> {
-    if matches!(
-        recipe_dir.file_name()?.to_str()?,
-        "relibc" | "kernel" | "bootloader"
-    ) {
+    if !links_native_sysroot(recipe_dir.file_name()?.to_str()?) {
         return None;
     }
     let stamp = std::env::var_os("FERRIC_NATIVE_SYSROOT_STAMP")?;
     fs::modified(Path::new(&stamp)).ok()
+}
+
+/// Whether the recipe `name` can link the native sysroot's objects: relibc makes
+/// them, and the kernels (Ferric Oxide's trace-mode one too) and the UEFI
+/// bootloader are freestanding.
+fn links_native_sysroot(name: &str) -> bool {
+    !matches!(name, "relibc" | "kernel" | "kernel-trace" | "bootloader")
 }
 
 fn build_is_source_newer(
@@ -1213,6 +1217,16 @@ mod tests {
                 !script.contains(&format!("-- \"{fragment}")),
                 "the shim passes no path for {fragment}: {script}"
             );
+        }
+    }
+
+    #[test]
+    fn freestanding_recipes_ignore_the_native_sysroot() {
+        for name in ["relibc", "kernel", "kernel-trace", "bootloader"] {
+            assert!(!super::links_native_sysroot(name), "{name}");
+        }
+        for name in ["base", "kernel-tools", "ferric-trace"] {
+            assert!(super::links_native_sysroot(name), "{name}");
         }
     }
 
