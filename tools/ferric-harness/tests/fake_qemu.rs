@@ -602,6 +602,41 @@ fn desktop_session_end_to_end() {
     assert!(!session.run().qmp_sock().exists());
 }
 
+/// A match in text before the cursor (`since` a mark) moves the cursor back to the end of
+/// that match, so the next default `expect` finds the text right after it.
+#[test]
+fn expect_since_a_mark_moves_the_cursor_back() {
+    let fixture = Fixture::new();
+    let script = json!({
+        "serial": [{"text": "ready\r\n"}],
+        "respond": [{"expect": "go\r", "reply": "alpha 1\r\nbeta\r\nalpha 2\r\nend\r\n"}],
+        "on_powerdown": "exit"
+    });
+    let mut config = fixture.config("rewind", &script);
+    config.display = Display::None;
+    let session = Running::launch(config);
+    let wait = Duration::from_secs(20);
+    session.expect("ready", &Since::Start, wait).expect("ready");
+    session.mark("before");
+    session.serial_send("go", Eol::Cr).expect("send");
+    let end = session.expect("^end$", &Since::Cursor, wait).expect("end");
+    let first = session
+        .expect(r"^alpha \d$", &Since::Mark("before".into()), wait)
+        .expect("rewound match");
+    assert_eq!(first.matched.text, "alpha 1");
+    assert!(first.matched.end < end.matched.end);
+    assert_eq!(session.status().expect_cursor, first.matched.end);
+    let next = session
+        .expect(r"^\w+", &Since::Cursor, Duration::from_secs(2))
+        .expect("the text right after the rewound match");
+    assert_eq!(next.matched.text, "beta");
+    let again = session
+        .expect(r"^alpha \d$", &Since::Cursor, Duration::from_secs(2))
+        .expect("the next alpha");
+    assert_eq!(again.matched.text, "alpha 2");
+    session.down(None);
+}
+
 #[test]
 fn smoke_run_powers_off_by_itself() {
     let fixture = Fixture::new();

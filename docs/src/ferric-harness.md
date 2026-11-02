@@ -100,7 +100,7 @@ covers every module.
 | `pointer rel <dx> <dy>` | Relative motion, which ps2d ignores while it uses the absolute vmmouse |
 | `pointer button <left\|right\|middle\|wheel-up\|wheel-down> [--click\|--down\|--up]` | A button click (the default), press or release |
 | `serial send <text> [--eol cr\|lf\|crlf\|none]` | Writes to the serial console, followed by a carriage return by default |
-| `expect <regex> [--timeout s] [--since cursor\|start\|now\|<mark>]` | Waits for a multi-line regular expression on the console. By default the search starts just past the previous match |
+| `expect <regex> [--timeout s] [--since cursor\|start\|now\|<mark>]` | Waits for a multi-line regular expression on the console. By default the search starts just past the previous match; every match, even one found by searching from an earlier `--since` point, sets where the next default search starts |
 | `mark <name>` | Records a named time and console offset in the report. `expect --since <name>` starts the search at the mark |
 | `wait-screen <predicate> [--timeout s]` | Waits until the screen matches `text:<s>`, `regex:<re>`, `changed`, `stable[:<ms>]` or `nonblank` |
 | `trace start` / `trace stop` | Starts or stops `ferric-trace follow` (trace mode). Each start writes a new capture directory |

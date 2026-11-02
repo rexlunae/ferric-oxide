@@ -697,7 +697,8 @@ impl Session {
     }
 
     /// Waits until `pattern` (a regular expression, multi-line) matches the console from
-    /// `since` on; the match moves the cursor for the next `expect`.
+    /// `since` on; the cursor for the next `expect` becomes the end of the match, even
+    /// when that is earlier than before (a search rewound to a mark or the start).
     ///
     /// # Errors
     ///
@@ -729,7 +730,9 @@ impl Session {
             Ok(matched) => {
                 {
                     let mut state = self.inner.state();
-                    state.cursor = state.cursor.max(matched.end);
+                    // Even when `since` rewound the search, the next default `expect`
+                    // continues right after this match.
+                    state.cursor = matched.end;
                 }
                 Ok(ExpectResult {
                     matched,
