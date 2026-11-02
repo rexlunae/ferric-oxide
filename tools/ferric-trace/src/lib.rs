@@ -64,9 +64,9 @@ pub mod crash;
 pub mod describe;
 pub mod drain;
 pub mod flamegraph;
-pub mod latency;
 #[cfg(target_os = "linux")]
 pub mod follow;
+pub mod latency;
 pub mod otlp;
 pub mod perfetto;
 pub mod profile;

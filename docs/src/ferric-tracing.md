@@ -125,8 +125,9 @@ the same kernel source again and installs it as `usr/lib/boot/kernel-trace`
 `ferric-config` exports its Cargo features as `FERRIC_TRACE_KERNEL_FEATURES`:
 the image kernel's features (`FERRIC_KERNEL_FEATURES`) plus `trace`,
 `trace_mode`, every subsystem's `trace_<subsystem>`, the level feature of
-`kernel.trace_max_level`'s default (`trace_level_info`) and `trace_crash`,
-without `profiling`, which cannot be combined with tracing. Both kernels use the
+`kernel.trace_max_level`'s default (`trace_level_info`), `trace_crash` and
+`trace_host` ([host-visible rings](#host-visible-rings), inactive unless booted
+with `FERRIC_TRACE_HOST`), without `profiling`, which cannot be combined with tracing. Both kernels use the
 same `kernel-config.toml` and link arguments, every option that rebuilds the
 kernel rebuilds the trace-mode kernel too, and like the kernel it never gets
 the user-space CPU flags (`cpu.flags_exclude`). The kernel recipes

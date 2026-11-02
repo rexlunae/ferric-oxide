@@ -34,7 +34,7 @@ const TRACE_MODE_OPTION: &str = "kernel.trace_mode";
 const TRACE_LEVEL_OPTION: &str = "kernel.trace_max_level";
 /// The kernel features the trace-mode kernel always has, besides each subsystem's and the
 /// level's: tracing itself, the boot log line saying which kernel runs, and the crash dump.
-const TRACE_KERNEL_FEATURES: [&str; 3] = ["trace", "trace_mode", "trace_crash"];
+const TRACE_KERNEL_FEATURES: [&str; 4] = ["trace", "trace_mode", "trace_host", "trace_crash"];
 /// Kernel features that cannot be combined with `trace`, which the trace-mode kernel drops.
 const CONFLICTS_WITH_TRACE: [&str; 1] = ["profiling"];
 
@@ -1232,7 +1232,7 @@ mod tests {
             "{mk}"
         );
         assert!(
-            mk.contains("export FERRIC_TRACE_KERNEL_FEATURES:=acpi,aslr,kaslr,multi_core,prot_none,self_modifying,serial_debug,trace,trace_crash,trace_iommu,trace_irq,trace_level_info,trace_mm,trace_mode,trace_sched,trace_scheme,trace_syscall,x86_kvm_pv\n"),
+            mk.contains("export FERRIC_TRACE_KERNEL_FEATURES:=acpi,aslr,kaslr,multi_core,prot_none,self_modifying,serial_debug,trace,trace_crash,trace_host,trace_iommu,trace_irq,trace_level_info,trace_mm,trace_mode,trace_sched,trace_scheme,trace_syscall,x86_kvm_pv\n"),
             "{mk}"
         );
         // Only for the configured target, like the kernel's own features.

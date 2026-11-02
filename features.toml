@@ -1086,7 +1086,8 @@ help = """
 Also build a trace-mode kernel and install it as usr/lib/boot/kernel-trace,
 beside the image's kernel. It has the image kernel's features plus tracing:
 kernel.trace with every subsystem's tracepoints at kernel.trace_max_level's
-default level, and kernel.trace_crash; kernel.profiling, which cannot be
+default level, kernel.trace_crash, and kernel.trace_host (host-visible rings,
+used when booted with FERRIC_TRACE_HOST); kernel.profiling, which cannot be
 combined with tracing, is left out. It logs "trace: trace-mode kernel" at boot.
 
 The bootloader loads it when the boot environment has FERRIC_KERNEL=trace (from
