@@ -23,6 +23,7 @@
 use alloc::{boxed::Box, vec::Vec};
 use core::{fmt, sync::atomic::AtomicU64};
 
+use ferric_abi::boot_env::FERRIC_TRACE;
 use ferric_trace::{
     abi::{UserRecord, CPU_RING_WORDS},
     filter::{Filter, FilterError, Loaded, Slot},
@@ -143,7 +144,7 @@ pub(super) fn env_value<'a>(env: &'a [u8], key: &str) -> Option<&'a str> {
 fn boot_sources(env: &[u8]) -> [(&'static str, &str); 2] {
     [
         ("trace.boot", option_env!("FERRIC_TRACE_BOOT").unwrap_or("")),
-        ("FERRIC_TRACE", env_value(env, "FERRIC_TRACE").unwrap_or("")),
+        (FERRIC_TRACE, env_value(env, FERRIC_TRACE).unwrap_or("")),
     ]
 }
 
