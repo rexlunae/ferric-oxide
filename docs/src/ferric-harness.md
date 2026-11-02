@@ -185,7 +185,7 @@ pointer = { button = "left", action = "click" }   # or "down", "up"; or rel = [d
 [[step]]
 wait = "text:login:"       # a wait-screen predicate
 [[step]]
-text = "vt2.txt"           # read the screen; `true` only logs it
+text = "vt2.txt"           # read the screen into <run>/vt2.txt (a plain file name); `true` only logs it
 contains = "redox login:"  # optional: fail unless the text contains this
 [[step]]
 shot = "vt2.png"           # a file name in <run>/shots; `true` names it automatically

@@ -29,7 +29,7 @@
 //! [[step]]
 //! shot = "desktop.png"          # screenshot file name in <run>/shots; `true` names it
 //! [[step]]
-//! text = "vt1.txt"              # read the screen, save the text; `true` only logs it
+//! text = "vt1.txt"              # read the screen into <run>/vt1.txt (a plain file name); `true` only logs it
 //! contains = "login"            # optional: fail unless the text contains this
 //! [[step]]
 //! wait = "text:redox login"     # a wait-screen predicate
@@ -119,9 +119,16 @@ pub enum StepProblem {
     /// A `wait` predicate that does not parse.
     #[error(transparent)]
     Predicate(#[from] ScreenError),
-    /// A `shot` name that is not a plain file name in `<run>/shots/`.
-    #[error(transparent)]
-    ShotName(#[from] NotFileName),
+    /// A `shot` or `text` file name that is not a plain file name, which could put the file
+    /// outside the run directory.
+    #[error("{action}: {name}")]
+    FileName {
+        /// The step's action, `shot` or `text`.
+        action: &'static str,
+        /// The name refused.
+        #[source]
+        name: NotFileName,
+    },
     /// A `pointer` table without exactly one of `abs`, `rel` and `button`.
     #[error("pointer needs exactly one of abs, rel or button")]
     PointerShape,
@@ -370,14 +377,26 @@ fn convert(step: usize, spec: StepSpec, default_timeout: f64) -> Result<Step, Sc
     if let Some(shot) = spec.shot {
         let name = file_or_flag(shot, "shot").map_err(invalid)?;
         if let Some(name) = &name {
-            rundir::file_name(name).map_err(|e| invalid(e.into()))?;
+            rundir::file_name(name).map_err(|name| {
+                invalid(StepProblem::FileName {
+                    action: "shot",
+                    name,
+                })
+            })?;
         }
         actions.push(("shot", Action::Shot(name)));
     }
     if let Some(text) = spec.text {
-        let save = file_or_flag(text, "text")
-            .map_err(invalid)?
-            .map(PathBuf::from);
+        let save = file_or_flag(text, "text").map_err(invalid)?;
+        if let Some(name) = &save {
+            rundir::file_name(name).map_err(|name| {
+                invalid(StepProblem::FileName {
+                    action: "text",
+                    name,
+                })
+            })?;
+        }
+        let save = save.map(PathBuf::from);
         actions.push((
             "text",
             Action::Text {
@@ -752,10 +771,23 @@ since = "m"
         assert!(matches!(
             parse("[[step]]\nshot = \"../../escape.png\"\n"),
             Err(ScenarioError::Invalid {
-                problem: StepProblem::ShotName(_),
+                problem: StepProblem::FileName { action: "shot", .. },
                 ..
             })
         ));
+        for escape in ["../outside.txt", "/tmp/outside.txt", "sub/dir.txt", ".."] {
+            let step = format!("[[step]]\ntext = \"{escape}\"\n");
+            assert!(
+                matches!(
+                    parse(&step),
+                    Err(ScenarioError::Invalid {
+                        problem: StepProblem::FileName { action: "text", .. },
+                        ..
+                    })
+                ),
+                "{escape}"
+            );
+        }
         assert!(matches!(
             parse("[[step]]\nsleep = -1\n"),
             Err(ScenarioError::Invalid {
