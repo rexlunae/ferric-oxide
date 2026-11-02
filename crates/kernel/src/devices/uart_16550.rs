@@ -43,7 +43,20 @@ pub struct SerialPort<T: Io> {
     line_sts: ReadOnly<T>,
     /// Modem status
     modem_sts: ReadOnly<T>,
+    /// Ferric Oxide: bytes the transmitter takes after it reports empty: the FIFO's 16 when
+    /// `init` found one, else 1.
+    tx_burst: u8,
+    /// Ferric Oxide: bytes that can still be written without reading the line status again.
+    tx_room: u8,
 }
+
+/// The transmit FIFO of a 16550A.
+const TX_FIFO_BYTES: u8 = 16;
+
+/// The interrupt identification register's bits 6 and 7 (read at the FIFO control port),
+/// both set when the FIFOs are enabled and work (a 16550A); a 16450 has none, and a 16550
+/// with the broken FIFO sets only bit 7.
+const IIR_FIFOS_ENABLED: u8 = 0xC0;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 impl SerialPort<Pio<u8>> {
@@ -56,6 +69,8 @@ impl SerialPort<Pio<u8>> {
             modem_ctrl: Pio::new(base + 4),
             line_sts: ReadOnly::new(Pio::new(base + 5)),
             modem_sts: ReadOnly::new(Pio::new(base + 6)),
+            tx_burst: 1,
+            tx_room: 0,
         }
     }
 }
@@ -76,6 +91,8 @@ where
                 modem_ctrl: MmioPtr::new(ptr.add(4)),
                 line_sts: ReadOnly::new(MmioPtr::new(ptr.add(5))),
                 modem_sts: ReadOnly::new(MmioPtr::new(ptr.add(6))),
+                tx_burst: 1,
+                tx_room: 0,
             }
         }
     }
@@ -104,6 +121,18 @@ where
 
             // Enable and clear FIFOs with 14-byte threshold
             self.fifo_ctrl.write(0xC7.into());
+            // Ferric Oxide: with a working transmit FIFO, `send` fills it whenever the line
+            // status says it is empty, instead of reading the status before every byte. Each
+            // of those reads is a VM exit under KVM, so this nearly halves the cost of
+            // console output.
+            let iir: u8 = (self.fifo_ctrl.read() & 0xFF.into())
+                .try_into()
+                .unwrap_or(0);
+            self.tx_burst = if iir & IIR_FIFOS_ENABLED == IIR_FIFOS_ENABLED {
+                TX_FIFO_BYTES
+            } else {
+                1
+            };
 
             // IRQs enabled, RTS/DSR set
             self.modem_ctrl.write(0x0B.into());
@@ -134,6 +163,8 @@ where
             // Enable receive interrupt
             self.int_en.write(0x01.into());
         }
+        // The loopback test wrote to the transmitter; wait for it to empty before the next byte.
+        self.tx_room = 0;
 
         Ok(())
     }
@@ -152,8 +183,14 @@ where
         }
     }
 
+    /// Sends one byte, first waiting for the transmitter to empty when the bytes written since
+    /// it last did could fill it.
     pub fn send(&mut self, data: u8) {
-        while !self.line_sts().contains(LineStsFlags::OUTPUT_EMPTY) {}
+        if self.tx_room == 0 {
+            while !self.line_sts().contains(LineStsFlags::OUTPUT_EMPTY) {}
+            self.tx_room = self.tx_burst;
+        }
+        self.tx_room = self.tx_room.saturating_sub(1);
         self.data.write(data.into())
     }
 
