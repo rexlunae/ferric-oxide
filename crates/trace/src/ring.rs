@@ -142,6 +142,9 @@ pub trait Storage {
     fn data_len(&self) -> usize;
     /// Data word `index`, below [`Storage::data_len`].
     fn data(&self, index: usize) -> &AtomicU64;
+    /// Records the producer's policy where readers can see it ([`POLICY_WORD`] in a shared
+    /// header); inline storage has no readers but the ring itself.
+    fn set_full_policy(&self, _policy: WhenFull) {}
 }
 
 /// Counters in the ring, data in a slice of words: [`Ring::new`].
@@ -198,8 +201,14 @@ pub const TAIL_WORD: usize = 16;
 /// The header word holding `lost`.
 pub const LOST_WORD: usize = 24;
 /// The header word holding `oldest`: the first record whose words the producer has not
-/// overwritten. Only the producer stores it.
+/// overwritten. Only the producer stores it, and only a ring whose [`POLICY_WORD`] says
+/// [`WhenFull::OverwriteOldest`] maintains it.
 pub const OLDEST_WORD: usize = 32;
+/// The header word holding the producer's [`WhenFull`] policy ([`WhenFull::word`]): 0, as a
+/// zeroed header starts, for [`WhenFull::DropNewest`], 1 for [`WhenFull::OverwriteOldest`].
+/// An [`Observer`] reads it to know whether `oldest` or `tail` bounds what the producer may
+/// have overwritten.
+pub const POLICY_WORD: usize = 40;
 
 /// Counters and data both in one run of words, [`SHARED_HEADER_WORDS`] of header first:
 /// [`Ring::shared`], and the words a [`View`] reads.
@@ -235,6 +244,11 @@ impl<W: Words> Storage for Shared<W> {
     fn data(&self, index: usize) -> &AtomicU64 {
         self.words.word(SHARED_HEADER_WORDS + index)
     }
+    fn set_full_policy(&self, policy: WhenFull) {
+        self.words
+            .word(POLICY_WORD)
+            .store(policy.word(), Ordering::Release);
+    }
 }
 
 /// A ring over the storage `S`; see the [module docs](self).
@@ -256,6 +270,25 @@ pub enum WhenFull {
     /// Drop the oldest records, counting them as lost, until the new one fits: a flight
     /// recorder.
     OverwriteOldest,
+}
+
+impl WhenFull {
+    /// The policy as [`POLICY_WORD`] holds it.
+    pub const fn word(self) -> u64 {
+        match self {
+            WhenFull::DropNewest => 0,
+            WhenFull::OverwriteOldest => 1,
+        }
+    }
+
+    /// The policy [`POLICY_WORD`] holds: any value other than 1 reads as
+    /// [`WhenFull::DropNewest`], the policy of a zeroed header.
+    pub const fn from_word(word: u64) -> Self {
+        match word {
+            1 => WhenFull::OverwriteOldest,
+            _ => WhenFull::DropNewest,
+        }
+    }
 }
 
 /// Why words cannot be a ring.
@@ -554,6 +587,7 @@ impl<S: Storage> Ring<S> {
     #[must_use]
     pub fn when_full(mut self, when_full: WhenFull) -> Self {
         self.when_full = when_full;
+        self.storage.set_full_policy(when_full);
         self
     }
 
@@ -683,7 +717,12 @@ impl<S: Storage> Ring<S> {
                 WhenFull::OverwriteOldest => self.make_room(head, words),
             }
         }
-        self.advance_oldest(head, words);
+        // Only an overwriting ring maintains `oldest`: a ring that drops new records never
+        // writes over words no reader has taken, so its `tail` already bounds what it reuses,
+        // and the push stays as cheap as before.
+        if self.when_full == WhenFull::OverwriteOldest {
+            self.advance_oldest(head, words);
+        }
         // Pairs with the acquire fences in `Ring::peek_checked` and `Observer::observe`: a
         // reader that sees one of the stores below then sees a `tail` at least this one (the
         // consumer's, or the one `make_room` just stored) and the `oldest` just stored, so it
@@ -1584,7 +1623,36 @@ mod tests {
     #[test]
     fn oldest_follows_the_producer_past_a_consumer() {
         check_oldest(WhenFull::OverwriteOldest, true);
-        check_oldest(WhenFull::DropNewest, true);
+    }
+
+    /// A ring that drops new records leaves `oldest` alone (its `tail` bounds what it reuses)
+    /// and says so in its header, so an observer knows which bound to use.
+    #[test]
+    fn only_an_overwriting_ring_maintains_oldest() {
+        let memory: Vec<AtomicU64> = words(SHARED_HEADER_WORDS + 32);
+        let ring = Ring::shared(&memory[..]).expect("valid");
+        let mut buf = [0u8; 1024];
+        for i in 0..200u64 {
+            ring.read(&mut buf).expect("fits");
+            ring.push(EventId::new(1), i, &[i; 3]).expect("room");
+        }
+        assert_eq!(oldest(&ring), 0);
+        assert_eq!(memory[POLICY_WORD].load(Ordering::Relaxed), 0);
+        let ring = ring.when_full(WhenFull::OverwriteOldest);
+        assert_eq!(
+            memory[POLICY_WORD].load(Ordering::Relaxed),
+            WhenFull::OverwriteOldest.word()
+        );
+        ring.push(EventId::new(1), 200, &[0; 3]).expect("room");
+        assert!(oldest(&ring) > 0);
+    }
+
+    #[test]
+    fn policy_words_round_trip() {
+        for policy in [WhenFull::DropNewest, WhenFull::OverwriteOldest] {
+            assert_eq!(WhenFull::from_word(policy.word()), policy);
+        }
+        assert_eq!(WhenFull::from_word(7), WhenFull::DropNewest);
     }
 
     /// A consumer drains the ring ahead of the producer's overwrites: `tail` passes `oldest`,

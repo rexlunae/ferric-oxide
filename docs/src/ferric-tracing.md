@@ -719,13 +719,17 @@ are overwritten and counted (see [Crash dump](#crash-dump) and
 environment gives).
 The ring sits in kernel-allocated pages in the shared layout of
 `ferric_trace::ring`: a 4 KiB header page (magic `FOTRACE1`, layout version
-2, data length, and `head`, `tail`, `lost` and `oldest` on cache lines of
-their own), then the data pages. `oldest` is the first record whose words the
+2, data length, `head`, `tail`, `lost`, `oldest` and the ring's policy for
+records that do not fit, each on a cache line of its own), then the data pages.
+A ring that overwrites its oldest records (host-visible rings, and every ring
+with `kernel.trace_crash`) keeps `oldest`: the first record whose words the
 kernel has not overwritten. Only the kernel stores it, moving it record by
 record before it writes over older records, whether a reader has consumed them
-or not. The records from `oldest` up to `head` are therefore always whole and
-never span more than one ring's capacity. Version 2 added `oldest`, and readers
-refuse other versions.
+or not, so the records from `oldest` up to `head` are always whole. A ring that
+drops new records reuses only words a reader consumed, so its `tail` bounds
+that instead, and it skips the `oldest` bookkeeping on every record; a host
+observer reads the policy word to know which bound applies. Version 2 added
+`oldest` and the policy word, and readers refuse other versions.
 
 ### Timestamps
 
