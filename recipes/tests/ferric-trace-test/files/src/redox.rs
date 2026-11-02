@@ -861,7 +861,13 @@ fn host_rings_read() -> Result<(), Failure> {
     let mut buf = vec![0u8; READ_LEN];
     let len = file.read(&mut buf).map_err(io_failure(STEP, &path))?;
     if len == 0 {
-        return Err(check(STEP, format!("a read of {path} found no records")));
+        return Err(check(
+            STEP,
+            format!(
+                "a read of {path} found no records (sched.switch must be on from boot: \
+                 trace.boot, or FERRIC_TRACE=sched in the boot environment)"
+            ),
+        ));
     }
     let mut entries = Vec::new();
     decode(STEP, 0, buf.get(..len).unwrap_or_default(), &mut entries)?;
