@@ -388,7 +388,8 @@ pub mod boot_env {
     //!   digit, then `=`, then the value: the rest of the line, which may be empty.
     //! - Blank lines and comments (lines whose first non-blank character is `#`) are skipped.
     //!   Comments are for presets; the bootloader never writes them.
-    //! - Anything else, including a line containing a NUL byte, is malformed and skipped.
+    //! - Anything else, including a line containing a NUL byte or a `\r` elsewhere, is
+    //!   malformed and skipped.
     //! - When a key is assigned more than once the first assignment counts, as it does for
     //!   relibc's `getenv` and the kernel's own readers.
     //!
@@ -623,7 +624,7 @@ pub mod boot_env {
             if trimmed.starts_with(b"#") {
                 return Self::Comment;
             }
-            if line.contains(&0) {
+            if line.iter().any(|&byte| matches!(byte, b'\r' | 0)) {
                 return Self::Malformed(line);
             }
             let Some(at) = line.iter().position(|&byte| byte == b'=') else {
@@ -856,7 +857,7 @@ pub mod boot_env {
 
         #[test]
         fn lines_are_classified() {
-            let text = b"A=1\n\n  \n# note\n  #x=1\nB=\nC=x=y\r\n=1\n1A=2\nA B=1\nno\nD=a\0b\nE=  spaced  ";
+            let text = b"A=1\n\n  \n# note\n  #x=1\nB=\nC=x=y\r\n=1\n1A=2\nA B=1\nno\nD=a\0b\nF=a\rb\nE=  spaced  ";
             let lines: Vec<_> = lines(text).collect();
             let entry = |key, value| Line::Assignment(Entry { key, value });
             assert_eq!(
@@ -874,6 +875,7 @@ pub mod boot_env {
                     Line::Malformed(b"A B=1"),
                     Line::Malformed(b"no"),
                     Line::Malformed(b"D=a\0b"),
+                    Line::Malformed(b"F=a\rb"),
                     entry("E", b"  spaced  "),
                 ]
             );
@@ -1007,12 +1009,14 @@ pub mod boot_env {
             let mut bad = Vec::new();
             let added = env
                 .merge(
-                    b"# harness preset\r\nFERRIC_KERNEL=trace\r\nbroken\n\nFERRIC_TRACE=sched,irq",
+                    b"# harness preset\r\nFERRIC_KERNEL=trace\r\nbroken\n\nX=a\rb\nFERRIC_TRACE=sched,irq",
                     |number, line| bad.push((number, line.to_vec())),
                 )
                 .unwrap();
             assert_eq!(added, 2);
-            assert_eq!(bad, [(3, b"broken".to_vec())]);
+            // Only lines that would not read back as their assignment are skipped; nothing
+            // that is skipped can make the merge fail.
+            assert_eq!(bad, [(3, b"broken".to_vec()), (5, b"X=a\rb".to_vec())]);
             assert_eq!(
                 env.as_bytes(),
                 b"RSDP_ADDR=f5a40\nFERRIC_KERNEL=trace\nFERRIC_TRACE=sched,irq\n"
