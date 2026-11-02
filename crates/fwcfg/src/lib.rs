@@ -426,6 +426,27 @@ mod tests {
     }
 
     #[test]
+    fn a_file_may_fill_the_buffer_exactly() {
+        let file = |size| File {
+            size,
+            selector: 0x2b,
+            name: [0; FILE_NAME_BYTES],
+        };
+        let mut fake = qemu();
+        fake.items.insert(0x2b, std::vec![b'x'; 4097]);
+        let mut fw_cfg = FwCfg::probe(fake).unwrap();
+        let mut buf = [0; 4096];
+        assert_eq!(fw_cfg.read_file(&file(4096), &mut buf).unwrap().len(), 4096);
+        assert_eq!(
+            fw_cfg.read_file(&file(4097), &mut buf),
+            Err(Error::FileTooLarge {
+                size: 4097,
+                capacity: 4096
+            })
+        );
+    }
+
+    #[test]
     fn a_nonsense_directory_count_is_refused() {
         let mut fake = qemu();
         fake.items.insert(key::FILE_DIR, std::vec![0xff; 4]);
