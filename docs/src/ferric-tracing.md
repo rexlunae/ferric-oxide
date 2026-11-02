@@ -760,6 +760,7 @@ over ([Capabilities](#capabilities)). The paths are defined in
 | `events` | One line per compiled-in event: `<id> <name> <subsystem> <level> <on\|off>` | `enable <selection>` or `disable <selection>` patches the tracepoints live; `filter <event> <filter\|none>` sets or removes an argument filter ([Argument filters](#argument-filters)) |
 | `stats` | One line per CPU: `cpu <n> pending <words> lost <records>` | — |
 | `clock` | One line: `clock <tsc\|kvmclock\|hpet> period_fs <femtoseconds\|unknown>` ([Timestamps](#timestamps)) | — |
+| `host` | Empty, or with [host-visible rings](#host-visible-rings) one line: `phys 0x<hex> cpus <n> kib <KiB per CPU>` | — |
 | `filters` | One line per filtered event, the command that sets it: `filter <event> <filter>` | — |
 | `cpu/<n>` | Drains whole records from CPU n's ring | `commit <end>` consumes a mapped read up to `end` |
 | `crash` | The previous boot's crash dump, from any offset (`kernel.trace_crash`; it exists only when there is one) | `panic` panics the kernel, with `kernel.trace_crash_test` only |
@@ -1206,7 +1207,16 @@ trace: host rings at phys 0x2a00000, 4 CPUs x 4096 KiB
 A value that is not such a size, or a region no free area of RAM holds in one
 run, is logged (`trace: FERRIC_TRACE_HOST="..." ignored: ...`) and leaves host
 rings off, with all of memory still free; the kernel then traces as without
-`trace_host`. The region stays in use for the whole boot, and the boot-time
+`trace_host`. So `FERRIC_TRACE_HOST` in the boot environment is only a
+request; what the kernel did is in `kernel.trace/host`
+(`ferric_trace::host::HostRingsLine`), readable with the same access as
+`clock`: empty without host rings (also on a kernel without `trace_host`),
+otherwise one line with the region's physical address, the number of host
+rings and their size:
+
+```text
+phys 0x2a00000 cpus 4 kib 4096
+``` The region stays in use for the whole boot, and the boot-time
 allocator gives up the rest of any free area too small for the region on its
 way to one large enough, which the kernel logs (`reserved: <n> KiB of free RAM
 left unused ...`). Rings that fit in the first free area avoid that.
@@ -1225,7 +1235,11 @@ ordinary, readable one): a drain or a commit moves the ring's `tail`, which an o
 record still whole, so it would skip records the ring still holds. Mapping
 them fails with `EINVAL`, because the region's pages are not frames a mapping
 can hold ([#378](https://github.com/rexlunae/ferric-oxide/issues/378)). Use
-`follow` on the host instead, or boot without `FERRIC_TRACE_HOST`.
+`follow` on the host instead, or boot without `FERRIC_TRACE_HOST`. Guest
+tests decide from `kernel.trace/host`, not from the boot environment:
+`ferric-trace-test` runs only `trace-host-busy` (reading and committing CPU
+0's ring fail with `EBUSY`) when it holds a line, and the smoke script skips
+`trace-capture`.
 
 ### Following from the host
 

@@ -10,6 +10,7 @@ use crate::clock_capture::{CaptureError, CountsError};
 use ferric_trace::abi::{self, EventLine, StatsLine};
 use ferric_trace::abi::{CPU_MAP_BYTES, CpuCommand};
 use ferric_trace::config::{BootConfig, INITFS_PATH};
+use ferric_trace::host::HostRingsLine;
 use ferric_trace::kernel::{
     CATALOG, MM_PAGE_FAULT, PageFaultFlags, PageFaultOutcome, SCHED_SWITCH, SCHEME_CANCEL,
     SCHEME_REQUEST, SCHEME_RESPONSE, SYSCALL_ENTER, SYSCALL_EXIT,
@@ -65,8 +66,9 @@ enum Why {
     Capture { cpu: u32, source: CaptureError },
     /// The clock probe did not retain exactly its issued writes.
     ClockCounts(CountsError),
-    /// The clock descriptor does not contain a valid clock line.
-    ClockLine {
+    /// A text file of the scheme does not hold the line it should.
+    Line {
+        file: &'static str,
         line: String,
         source: abi::LineError,
     },
@@ -88,7 +90,7 @@ impl fmt::Display for Failure {
             Why::Io { path, .. } => f.write_str(path),
             Why::Capture { cpu, .. } => write!(f, "cpu {cpu} capture"),
             Why::ClockCounts(_) => f.write_str("clock write counts"),
-            Why::ClockLine { line, .. } => write!(f, "clock line {line:?}"),
+            Why::Line { file, line, .. } => write!(f, "{file} line {line:?}"),
             Why::Call { call, result } => write!(f, "{call} returned {result:?}"),
             Why::Check(what) => f.write_str(what),
         }
@@ -101,7 +103,7 @@ impl std::error::Error for Failure {
             Why::Io { source, .. } => Some(source),
             Why::Capture { source, .. } => Some(source),
             Why::ClockCounts(source) => Some(source),
-            Why::ClockLine { source, .. } => Some(source),
+            Why::Line { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -815,13 +817,30 @@ fn check_fault(cpus: &[u32]) -> Result<(), Failure> {
     Ok(())
 }
 
-/// The steps; returns the first failure.
-/// Whether the boot environment asked for host-visible rings (`FERRIC_TRACE_HOST`).
-fn host_rings() -> bool {
-    std::fs::read_to_string("/scheme/sys/env").is_ok_and(|env| {
-        env.lines()
-            .any(|line| line.starts_with("FERRIC_TRACE_HOST="))
-    })
+/// Whether the kernel has host-visible rings, from its `host` file: empty without them, else
+/// one [`HostRingsLine`]. The boot environment's `FERRIC_TRACE_HOST` is only a request, which
+/// the kernel can refuse. A kernel without the file (from before it) has none.
+fn host_rings() -> Result<bool, Failure> {
+    const STEP: &str = "trace-host";
+    let path = path(abi::HOST_PATH);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(io_failure(STEP, &path)(err)),
+    };
+    if text.is_empty() {
+        return Ok(false);
+    }
+    HostRingsLine::parse(&text)
+        .map(|_| true)
+        .map_err(|source| Failure {
+            step: STEP,
+            why: Why::Line {
+                file: abi::HOST_PATH,
+                line: text,
+                source,
+            },
+        })
 }
 
 /// `trace-host-busy`: reading CPU 0's host ring, and committing it, fail with `EBUSY`, so
@@ -852,6 +871,7 @@ fn host_rings_are_busy() -> Result<(), Failure> {
     )
 }
 
+/// The steps; returns the first failure.
 fn run() -> Result<(), Failure> {
     check_initfs()?;
     let list = listing("trace-boot")?;
@@ -1099,29 +1119,11 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    // With host-visible rings the host is their only reader, so the steps below, which drain
-    // and map the rings in the guest, do not apply; `trace-host-busy` checks that they are
-    // refused instead.
-    if host_rings() {
-        return match host_rings_are_busy() {
-            Ok(()) => {
-                println!("FERRIC_TEST_PASS trace-host-busy");
-                println!(
-                    "FERRIC_TEST_SKIP trace: host-visible rings (FERRIC_TRACE_HOST) have one reader, the host"
-                );
-                ExitCode::SUCCESS
-            }
-            Err(failure) => {
-                println!("FERRIC_TEST_FAIL {failure}");
-                ExitCode::FAILURE
-            }
-        };
-    }
     // `ferric-trace-test crash` runs the crash-dump step alone (see `crash`).
     let steps = match std::env::args().nth(1).as_deref() {
         Some("crash") => crash::run,
         Some(crash::DENIED_COMMAND) => return crash::denied(),
-        _ => run,
+        _ => default_steps,
     };
     match steps() {
         Ok(()) => ExitCode::SUCCESS,
@@ -1136,4 +1138,19 @@ pub fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The steps without a mode argument: [`run`], or with host-visible rings, whose only reader
+/// is the host, `trace-host-busy` instead, since `run` drains and maps the rings in the guest.
+fn default_steps() -> Result<(), Failure> {
+    if !host_rings()? {
+        return run();
+    }
+    host_rings_are_busy()?;
+    println!("FERRIC_TEST_PASS trace-host-busy");
+    println!(
+        "FERRIC_TEST_SKIP trace: the kernel's rings are host-visible ({}), with one reader, the host",
+        path(abi::HOST_PATH)
+    );
+    Ok(())
 }
