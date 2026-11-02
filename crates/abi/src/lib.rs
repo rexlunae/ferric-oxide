@@ -3,7 +3,8 @@
 //!
 //! `redox_syscall` holds the system call ABI itself. This crate holds the values that ride
 //! inside calls whose meaning is fixed by POSIX rather than by the kernel: the `futimens`
-//! sentinels in [`time`] and the `fchown` one in [`id`]. It also holds the files through
+//! sentinels in [`time`] and the `fchown` one in [`id`], with the POSIX rules for who may
+//! change a file's owner, group and mode. It also holds the files through
 //! which a host's `redoxer` hands a command to the guest's `redoxerd` and reads its result,
 //! in [`redoxerd`]. It is `no_std` and has no dependencies, so relibc, the kernel, daemons
 //! and host tools can all use it.
@@ -18,11 +19,19 @@
 
 pub mod id {
     //! The owner and group sentinel of `fchown`, `chown` and `fchownat` (POSIX
-    //! `<unistd.h>`).
+    //! `<unistd.h>`), and the rules for who may change a file's owner, group and mode.
     //!
     //! relibc passes the `uid_t` and `gid_t` arguments to the `fchown` scheme call as
     //! `u32`s, so POSIX's `(uid_t)-1` and `(gid_t)-1`, "leave this one as it is", arrive as
     //! [`UNCHANGED`].
+    //!
+    //! [`chown_permitted`], [`chmod_permitted`], [`mode_after_chown`] and
+    //! [`mode_after_chmod`] follow the POSIX.1-2017 `chown` and `chmod` pages with
+    //! `_POSIX_CHOWN_RESTRICTED` in effect, which a scheme applies after the kernel has
+    //! passed the call on. A [`Caller`] carries the effective IDs only: a scheme is not told
+    //! a process's supplementary groups, so "one of the caller's groups" is its effective
+    //! group here, which refuses what a supplementary group would have allowed and never the
+    //! reverse.
     //!
     //! # Examples
     //!
@@ -64,9 +73,186 @@ pub mod id {
         (uid, gid)
     }
 
+    /// The user and group a process acts as in permission checks: its effective IDs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Caller {
+        /// The effective user ID.
+        pub uid: u32,
+        /// The effective group ID.
+        pub gid: u32,
+    }
+
+    impl Caller {
+        /// Whether the caller has what POSIX calls appropriate privileges: it is root.
+        pub const fn is_privileged(self) -> bool {
+            self.uid == 0
+        }
+    }
+
+    /// Whether `caller` may give a file whose owner and group are `owner` the owner `uid`
+    /// and group `gid` (each possibly [`UNCHANGED`]).
+    ///
+    /// Root may make any change. Anyone else must own the file, may not change its owner,
+    /// and may set its group only to its current group or the caller's own group.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferric_abi::id::{Caller, UNCHANGED, chown_permitted};
+    ///
+    /// let user = Caller { uid: 1000, gid: 100 };
+    /// assert!(chown_permitted(user, (1000, 0), UNCHANGED, 100));
+    /// assert!(!chown_permitted(user, (0, 0), 1000, UNCHANGED));
+    /// ```
+    pub const fn chown_permitted(caller: Caller, owner: (u32, u32), uid: u32, gid: u32) -> bool {
+        if caller.is_privileged() {
+            return true;
+        }
+        if caller.uid != owner.0 {
+            return false;
+        }
+        let owner_kept = match requested(uid) {
+            None => true,
+            Some(uid) => uid == owner.0,
+        };
+        let group_allowed = match requested(gid) {
+            None => true,
+            Some(gid) => gid == owner.1 || gid == caller.gid,
+        };
+        owner_kept && group_allowed
+    }
+
+    /// Whether `caller` may change the mode of a file owned by `owner_uid`: root or the
+    /// file's owner.
+    pub const fn chmod_permitted(caller: Caller, owner_uid: u32) -> bool {
+        caller.is_privileged() || caller.uid == owner_uid
+    }
+
+    /// The set-user-ID mode bit (`S_ISUID`).
+    const SET_USER_ID: u16 = 0o4000;
+    /// The set-group-ID mode bit (`S_ISGID`).
+    const SET_GROUP_ID: u16 = 0o2000;
+
+    /// A file's mode after `caller` changes its owner or group, from its `mode` before.
+    ///
+    /// An unprivileged change to a regular file clears its set-user-ID and set-group-ID bits,
+    /// so a program cannot go on running as IDs its new owner or group never granted. POSIX
+    /// requires this when an execute bit is set and leaves the rest to the implementation;
+    /// clearing them on every regular file is the stricter reading. A privileged change keeps
+    /// them, which POSIX also leaves to the implementation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferric_abi::id::{Caller, mode_after_chown};
+    ///
+    /// let user = Caller { uid: 1000, gid: 100 };
+    /// assert_eq!(mode_after_chown(0o6755, true, user), 0o0755);
+    /// ```
+    pub const fn mode_after_chown(mode: u16, regular_file: bool, caller: Caller) -> u16 {
+        if regular_file && !caller.is_privileged() {
+            mode & !(SET_USER_ID | SET_GROUP_ID)
+        } else {
+            mode
+        }
+    }
+
+    /// The mode a permitted `chmod` by `caller` gives a file whose group is `file_gid`, from
+    /// the `new_mode` it asked for.
+    ///
+    /// An unprivileged caller outside the file's group cannot make a regular file
+    /// set-group-ID: the bit is cleared, so nobody can grant a group they are not in.
+    pub const fn mode_after_chmod(
+        new_mode: u16,
+        regular_file: bool,
+        file_gid: u32,
+        caller: Caller,
+    ) -> u16 {
+        if regular_file && !caller.is_privileged() && caller.gid != file_gid {
+            new_mode & !SET_GROUP_ID
+        } else {
+            new_mode
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        const ROOT: Caller = Caller { uid: 0, gid: 0 };
+        const USER: Caller = Caller {
+            uid: 1000,
+            gid: 100,
+        };
+
+        #[test]
+        fn root_may_change_any_owner_or_group() {
+            for (owner, uid, gid) in [
+                ((0, 0), 1000, 100),
+                ((1000, 100), 0, 0),
+                ((5, 5), UNCHANGED, 7),
+                ((5, 5), 9, UNCHANGED),
+            ] {
+                assert!(
+                    chown_permitted(ROOT, owner, uid, gid),
+                    "{owner:?} {uid} {gid}"
+                );
+            }
+        }
+
+        #[test]
+        fn only_the_owner_may_change_a_files_group() {
+            // The owner sets its own group, keeps the current one, or leaves both.
+            for (uid, gid) in [
+                (UNCHANGED, 100),
+                (UNCHANGED, 50),
+                (1000, UNCHANGED),
+                (1000, 100),
+                (UNCHANGED, UNCHANGED),
+            ] {
+                assert!(chown_permitted(USER, (1000, 50), uid, gid), "{uid} {gid}");
+            }
+            // Somebody else's file, even naming only the caller's own IDs.
+            for (uid, gid) in [(1000, UNCHANGED), (UNCHANGED, 100), (UNCHANGED, UNCHANGED)] {
+                assert!(!chown_permitted(USER, (0, 0), uid, gid), "{uid} {gid}");
+            }
+        }
+
+        #[test]
+        fn the_owner_may_not_give_a_file_away_or_pick_a_foreign_group() {
+            assert!(!chown_permitted(USER, (1000, 50), 0, UNCHANGED));
+            assert!(!chown_permitted(USER, (1000, 50), 1001, UNCHANGED));
+            assert!(!chown_permitted(USER, (1000, 50), UNCHANGED, 0));
+            assert!(!chown_permitted(USER, (1000, 50), 1000, 0));
+        }
+
+        #[test]
+        fn only_root_or_the_owner_may_change_a_mode() {
+            assert!(chmod_permitted(ROOT, 1000));
+            assert!(chmod_permitted(USER, 1000));
+            assert!(!chmod_permitted(USER, 0));
+            assert!(!chmod_permitted(USER, 1001));
+        }
+
+        #[test]
+        fn an_unprivileged_chown_clears_set_id_bits_of_a_regular_file() {
+            assert_eq!(mode_after_chown(0o6755, true, USER), 0o0755);
+            assert_eq!(mode_after_chown(0o4100, true, USER), 0o0100);
+            // Not executable: cleared too, the stricter of the readings POSIX allows.
+            assert_eq!(mode_after_chown(0o6644, true, USER), 0o0644);
+            // Not a regular file, or root: kept.
+            assert_eq!(mode_after_chown(0o2755, false, USER), 0o2755);
+            assert_eq!(mode_after_chown(0o6755, true, ROOT), 0o6755);
+        }
+
+        #[test]
+        fn a_set_group_id_chmod_needs_the_files_group() {
+            assert_eq!(mode_after_chmod(0o2755, true, 50, USER), 0o0755);
+            assert_eq!(mode_after_chmod(0o2755, true, 100, USER), 0o2755);
+            assert_eq!(mode_after_chmod(0o4755, true, 50, USER), 0o4755);
+            assert_eq!(mode_after_chmod(0o2755, false, 50, USER), 0o2755);
+            assert_eq!(mode_after_chmod(0o2755, true, 50, ROOT), 0o2755);
+        }
 
         #[test]
         fn minus_one_keeps_the_id() {

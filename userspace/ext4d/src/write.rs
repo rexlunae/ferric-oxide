@@ -68,6 +68,8 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ferric_abi::id::{Caller, mode_after_chown};
+
 use ferric_jbd2::{CommitTime, LogError, OpenError, Writer};
 use thiserror::Error;
 
@@ -128,10 +130,8 @@ const I_GID_HIGH: usize = 0x7A;
 /// `i_mode`'s file type bits and a regular file's value of them.
 const S_IFMT: u16 = 0xF000;
 const S_IFREG: u16 = 0x8000;
-/// `i_mode`'s permission bits, and the set-ID bits among them.
+/// `i_mode`'s permission bits.
 const PERMISSION_BITS: u16 = 0o7777;
-const S_ISUID: u16 = 0o4000;
-const S_ISGID: u16 = 0o2000;
 
 /// `i_flags`, and the flags a data write checks.
 const IMMUTABLE_FL: u32 = 0x10;
@@ -484,9 +484,9 @@ pub struct Owner {
     pub uid: Option<u32>,
     /// The new group (`i_gid`), or `None` to keep it.
     pub gid: Option<u32>,
-    /// Whether to clear the set-user-ID and set-group-ID bits of a regular file, as POSIX
-    /// `chown` does for callers without privilege.
-    pub drop_set_id: bool,
+    /// Who makes the change: it decides whether the set-user-ID and set-group-ID bits of a
+    /// regular file are cleared (`ferric_abi::id::mode_after_chown`).
+    pub caller: Caller,
     /// The new change time.
     pub changed: Timestamp,
 }
@@ -730,9 +730,9 @@ fn put_owner(
     }
     put_ids(target, number, inode, new)?;
     let mode = le16(inode, I_MODE);
-    if owner.drop_set_id && mode & S_IFMT == S_IFREG {
-        let mode = mode & !(S_ISUID | S_ISGID);
-        inode[I_MODE..I_MODE + 2].copy_from_slice(&mode.to_le_bytes());
+    let kept = mode_after_chown(mode, mode & S_IFMT == S_IFREG, owner.caller);
+    if kept != mode {
+        inode[I_MODE..I_MODE + 2].copy_from_slice(&kept.to_le_bytes());
     }
     Ok(())
 }

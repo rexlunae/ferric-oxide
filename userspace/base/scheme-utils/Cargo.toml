@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 libredox.workspace = true
+plain.workspace = true
 redox-scheme.workspace = true
 redox_syscall.workspace = true
 

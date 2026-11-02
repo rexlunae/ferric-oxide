@@ -15,8 +15,8 @@ use syscall::Error;
 
 use super::scheme::{MsgFlags, UdsScheme};
 use super::{
-    get_uid_gid_from_pid, path_buf_to_str, read_msghdr_info, read_num, AncillaryData, Credential,
-    DataPacket, MsgWriter, MIN_RECV_MSG_LEN,
+    path_buf_to_str, read_msghdr_info, read_num, AncillaryData, Credential, DataPacket, MsgWriter,
+    MIN_RECV_MSG_LEN,
 };
 
 pub type UdsStreamScheme<'sock> = UdsScheme<'sock, Socket>;
@@ -682,12 +682,10 @@ impl super::scheme::Socket for Socket {
             let (remote_id, remote_rc) = Socket::get_connected_peer(scheme, id)?;
             let mut socket = remote_rc.borrow_mut();
             let connection = socket.require_connected_connection(msg_flags)?;
-            let (pid, uid, gid) = get_uid_gid_from_pid(scheme.proc_creds_capability, ctx.pid)?;
-
             let packet = DataPacket::from_stream(
                 msg_stream,
                 name,
-                Credential::new(pid as i32, uid as i32, gid as i32),
+                Credential::of_process(scheme.proc_creds_capability, ctx.pid)?,
             )?;
 
             let payload_len = packet.len();

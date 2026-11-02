@@ -35,6 +35,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
 use ext4_view::{Ext4, Ext4Read, File, FileType, Metadata};
+#[cfg(feature = "write")]
+use ferric_abi::id::{Caller, UNCHANGED, chmod_permitted, chown_permitted, mode_after_chmod};
 use ferric_abi::time::{UTIME_NOW, UTIME_OMIT};
 
 use crate::Error;
@@ -1186,13 +1188,16 @@ impl Fs {
             if metadata.is_symlink() {
                 return Err(Error::SymlinkMode);
             }
-            if uid != 0 && metadata.uid() != uid {
+            let caller = Caller { uid, gid };
+            if !chmod_permitted(caller, metadata.uid()) {
                 return Err(Error::NotOwner);
             }
-            let mut permissions = mode & PERMISSION_BITS;
-            if uid != 0 && metadata.gid() != gid && metadata.file_type() == FileType::Regular {
-                permissions &= !S_ISGID;
-            }
+            let permissions = mode_after_chmod(
+                mode & PERMISSION_BITS,
+                metadata.file_type() == FileType::Regular,
+                metadata.gid(),
+                caller,
+            );
             let mode = Mode {
                 permissions,
                 changed: Timestamp::now(),
@@ -1237,20 +1242,24 @@ impl Fs {
 
             self.writer.as_ref().ok_or(Error::ReadOnly)?;
             let metadata = &handle.metadata;
-            if uid != 0 {
-                if metadata.uid() != uid {
-                    return Err(Error::NotOwner);
-                }
-                let gives_away = new_uid.is_some_and(|new| new != metadata.uid());
-                let foreign_group = new_gid.is_some_and(|new| new != metadata.gid() && new != gid);
-                if gives_away || foreign_group {
-                    return Err(Error::ChownRestricted);
-                }
+            let caller = Caller { uid, gid };
+            if !chmod_permitted(caller, metadata.uid()) {
+                return Err(Error::NotOwner);
+            }
+            let (requested_uid, requested_gid) =
+                (new_uid.unwrap_or(UNCHANGED), new_gid.unwrap_or(UNCHANGED));
+            if !chown_permitted(
+                caller,
+                (metadata.uid(), metadata.gid()),
+                requested_uid,
+                requested_gid,
+            ) {
+                return Err(Error::ChownRestricted);
             }
             let owner = Owner {
                 uid: new_uid,
                 gid: new_gid,
-                drop_set_id: uid != 0,
+                caller,
                 changed: Timestamp::now(),
             };
             self.change(id, &Change::Owner(owner))

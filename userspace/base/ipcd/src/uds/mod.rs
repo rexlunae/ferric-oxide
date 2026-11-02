@@ -2,7 +2,6 @@ use std::cmp;
 use std::convert::TryInto;
 use std::fmt::Debug;
 
-use libredox::protocol::ProcMeta;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use syscall::error::*;
@@ -38,6 +37,18 @@ struct Credential {
 impl Credential {
     fn new(pid: i32, uid: i32, gid: i32) -> Self {
         Self { pid, uid, gid }
+    }
+
+    /// Ferric Oxide: the credentials a message from process `pid` carries, as procmgr
+    /// reports them through `cap_fd`. Like the kernel's caller IDs and Linux's
+    /// `SCM_CREDENTIALS`, these are the effective IDs.
+    fn of_process(cap_fd: usize, pid: usize) -> syscall::Result<Self> {
+        let creds = scheme_utils::proc_credentials(cap_fd, pid)?;
+        Ok(Self::new(
+            creds.pid as i32,
+            creds.euid as i32,
+            creds.egid as i32,
+        ))
     }
 }
 
@@ -188,24 +199,6 @@ where
     T: NumFromBytes,
 {
     T::from_le_bytes_slice(buffer)
-}
-
-fn get_uid_gid_from_pid(cap_fd: usize, target_pid: usize) -> Result<(u32, u32, u32)> {
-    let mut buffer = [0u8; size_of::<ProcMeta>()];
-    let _ = libredox::call::get_proc_credentials(cap_fd, target_pid, &mut buffer).map_err(|e| {
-        eprintln!(
-            "Failed to get process credentials for pid {}: {:?}",
-            target_pid, e
-        );
-        Error::new(EINVAL)
-    })?;
-    let mut cursor = 0;
-    let pid = read_num::<u32>(&buffer[cursor..])?;
-    cursor += size_of::<u32>() * 3;
-    let uid = read_num::<u32>(&buffer[cursor..])?;
-    cursor += size_of::<u32>() * 3;
-    let gid = read_num::<u32>(&buffer[cursor..])?;
-    Ok((pid, uid, gid))
 }
 
 fn read_msghdr_info(stream: &mut [u8]) -> Result<(usize, usize, usize)> {

@@ -3,6 +3,7 @@ use std::os::unix::io::AsRawFd;
 use std::str;
 
 use event::{EventFlags, RawEventQueue};
+use ferric_abi::id::Caller;
 use indexmap::IndexMap;
 use libredox::protocol::FsCall;
 use libredox::{flag, Fd};
@@ -14,7 +15,7 @@ use redox_rings::op::{
 use redox_rings::sync::{BlockingConsumer, BlockingProducer};
 use redox_scheme::scheme::SchemeSync;
 use redox_scheme::{CallerCtx, OpenResult, SendFdRequest, Socket};
-use scheme_utils::{FpathWriter, HandleMap};
+use scheme_utils::{proc_credentials, FpathWriter, HandleMap};
 use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{
     EACCES, EBADF, EBADFD, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOMEM, ENOSYS, ENOTDIR, ENOTEMPTY,
@@ -188,6 +189,26 @@ impl<'a> Scheme<'a> {
     }
 
     /// Remove a directory entry, where the entry can be both a file or a directory. Used by `unlinkat`.
+    /// Ferric Oxide: the effective IDs of the process behind a StdFsCall. Its ctx carries
+    /// only the pid (the kernel sends no IDs with it, so ctx.uid and ctx.gid read as root);
+    /// procmgr reports the rest.
+    fn std_fs_caller(&self, ctx: &CallerCtx) -> Result<Caller> {
+        let creds = proc_credentials(self.proc_creds_capability.raw(), ctx.pid)?;
+        Ok(Caller {
+            uid: creds.euid,
+            gid: creds.egid,
+        })
+    }
+
+    /// The file an inode handle `fd` refers to.
+    fn inode_file_mut(&mut self, fd: usize) -> Result<&mut File> {
+        let inode = self.handles.get(fd)?.as_inode()?;
+        self.filesystem
+            .files
+            .get_mut(&inode)
+            .ok_or(Error::new(EBADFD))
+    }
+
     fn remove_dentry(&mut self, path: &str, uid: u32, gid: u32, directory: bool) -> Result<()> {
         let (parent_dir_inode, name_to_delete) =
             self.filesystem.resolve_except_last(path, uid, gid)?;
@@ -796,46 +817,18 @@ impl SchemeSync for Scheme<'_> {
         }
         Ok(buf)
     }
-    fn fchmod(&mut self, fd: usize, mode: u16, _ctx: &CallerCtx) -> Result<()> {
-        let inode = self.handles.get(fd)?.as_inode()?;
-        let file = self
-            .filesystem
-            .files
-            .get_mut(&inode)
-            .ok_or(Error::new(EBADFD))?;
-
-        let cur_type = file.mode & MODE_TYPE;
-
-        /*
-        // TODO: validate ctx
-        if ctx.uid != 0 && ctx.uid != file.uid {
-            return Err(Error::new(EPERM));
-        }
-        */
-
-        /*
-        if mode & MODE_TYPE != 0 {
-            return Err(Error::new(EINVAL));
-        }
-        */
-
-        file.mode = (mode & 0o7777) | cur_type;
-
-        Ok(())
+    fn fchmod(&mut self, fd: usize, mode: u16, ctx: &CallerCtx) -> Result<()> {
+        // Ferric Oxide: fchmod arrives as a StdFsCall, whose ctx carries no IDs.
+        let caller = self.std_fs_caller(ctx)?;
+        self.inode_file_mut(fd)?.chmod_by(caller, mode)
     }
-    fn fchown(&mut self, fd: usize, uid: u32, gid: u32, _ctx: &CallerCtx) -> Result<()> {
-        let inode = self.handles.get(fd)?.as_inode()?;
-        let file = self
-            .filesystem
-            .files
-            .get_mut(&inode)
-            .ok_or(Error::new(EBADFD))?;
-
-        // TODO: validate ctx
-
-        file.set_owner(uid, gid);
-
-        Ok(())
+    fn fchown(&mut self, fd: usize, uid: u32, gid: u32, ctx: &CallerCtx) -> Result<()> {
+        // Ferric Oxide: the kernel's fchown call carries the caller's effective IDs.
+        let caller = Caller {
+            uid: ctx.uid,
+            gid: ctx.gid,
+        };
+        self.inode_file_mut(fd)?.chown_by(caller, uid, gid)
     }
     fn fcntl(
         &mut self,
@@ -1416,12 +1409,13 @@ impl SchemeSync for Scheme<'_> {
     ) -> Result<usize> {
         match kind {
             StdFsCallKind::Fchown => {
-                let (new_uid, new_gid) = (metadata.arg1 as u32, metadata.arg1 >> 32 as u32);
-                let (_pid, uid, gid) = get_uid_gid_from_pid(&self.proc_creds_capability, ctx.pid)?;
-                if uid != 0 && (uid != ctx.uid || gid != ctx.gid) {
-                    return Err(Error::new(EPERM));
-                }
-                self.fchown(id, new_uid, new_gid as u32, ctx).map(|_| 0)
+                // Ferric Oxide: no kernel check precedes this path, and its ctx carries no
+                // IDs, so the full rule applies to the IDs procmgr reports.
+                let (new_uid, new_gid) = (metadata.arg1 as u32, (metadata.arg1 >> 32) as u32);
+                let caller = self.std_fs_caller(ctx)?;
+                self.inode_file_mut(id)?
+                    .chown_by(caller, new_uid, new_gid)
+                    .map(|()| 0)
             }
             /* TODO: Support Unlinkat using std_fs_call
             Unlinkat => {
@@ -1434,11 +1428,11 @@ impl SchemeSync for Scheme<'_> {
                         return Err(Error::new(EACCES));
                     }
                 }
-                let (_pid, uid, gid) = get_uid_gid_from_pid(&self.proc_creds_capability, ctx.pid)?;
+                let caller = self.std_fs_caller(ctx)?;
                 self.remove_dentry(
                     path,
-                    uid,
-                    gid,
+                    caller.uid,
+                    caller.gid,
                     *flags as usize & syscall::AT_REMOVEDIR == syscall::AT_REMOVEDIR,
                 )
                 .map(|_| 0)
@@ -1496,33 +1490,4 @@ fn check_permissions(flags: usize, single_mode: u8) -> Result<()> {
         return Err(Error::new(EACCES));
     }
     Ok(())
-}
-
-fn get_uid_gid_from_pid(cap_fd: &libredox::Fd, target_pid: usize) -> Result<(u32, u32, u32)> {
-    let mut buffer = [0u8; size_of::<libredox::protocol::ProcMeta>()];
-    let _ = libredox::call::get_proc_credentials(cap_fd.raw(), target_pid, &mut buffer).map_err(
-        |e| {
-            eprintln!(
-                "Failed to get process credentials for pid {}: {:?}",
-                target_pid, e
-            );
-            Error::new(EINVAL)
-        },
-    )?;
-    let mut cursor = 0;
-    let pid = read_u32(&buffer, cursor)?;
-    cursor += size_of::<u32>() * 3;
-    let uid = read_u32(&buffer, cursor)?;
-    cursor += size_of::<u32>() * 3;
-    let gid = read_u32(&buffer, cursor)?;
-    Ok((pid, uid, gid))
-}
-
-fn read_u32(buffer: &[u8], offset: usize) -> Result<u32> {
-    let bytes = buffer
-        .get(offset..offset + 4)
-        .and_then(|slice| slice.try_into().ok())
-        .ok_or_else(|| Error::new(EINVAL))?;
-
-    Ok(u32::from_le_bytes(bytes))
 }

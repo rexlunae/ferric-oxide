@@ -16,8 +16,8 @@ use syscall::{Error, FobtainFdFlags};
 
 use super::scheme::{MsgFlags, UdsScheme};
 use super::{
-    get_uid_gid_from_pid, path_buf_to_str, read_msghdr_info, read_num, AncillaryData, Credential,
-    DataPacket, MsgWriter, MAX_DGRAM_MSG_LEN, SOCK_MIN_SNDBUF,
+    path_buf_to_str, read_msghdr_info, read_num, AncillaryData, Credential, DataPacket, MsgWriter,
+    MAX_DGRAM_MSG_LEN, SOCK_MIN_SNDBUF,
 };
 
 pub type UdsDgramScheme<'sock> = UdsScheme<'sock, Socket>;
@@ -156,12 +156,8 @@ impl Socket {
             return Err(Error::new(EINVAL));
         }
 
-        let (pid, uid, gid) = get_uid_gid_from_pid(cap_fd, ctx.pid)?;
-        let message = DataPacket::from_stream(
-            msg_stream,
-            name,
-            Credential::new(pid as i32, uid as i32, gid as i32),
-        )?;
+        let message =
+            DataPacket::from_stream(msg_stream, name, Credential::of_process(cap_fd, ctx.pid)?)?;
         let payload_len = message.len();
 
         if payload_len > socket.snd_buf_size {

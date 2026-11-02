@@ -3,11 +3,16 @@ use std::convert::TryInto;
 use std::os::unix::io::AsRawFd;
 use std::{fs, iter, time};
 
+use ferric_abi::id::{
+    chmod_permitted, chown_permitted, mode_after_chmod, mode_after_chown, owner_after, Caller,
+};
 use indexmap::IndexMap;
 use libredox::Fd;
 use redox_path::RedoxReference;
-use syscall::error::{EACCES, EBADFD, EIO, EISDIR, ENFILE, ENOENT, ENOMEM, ENXIO, EOVERFLOW};
-use syscall::{Error, Result, TimeSpec, EINVAL, MODE_DIR, MODE_TYPE};
+use syscall::error::{
+    EACCES, EBADFD, EIO, EISDIR, ENFILE, ENOENT, ENOMEM, ENXIO, EOVERFLOW, EPERM,
+};
+use syscall::{Error, Result, TimeSpec, EINVAL, MODE_DIR, MODE_FILE, MODE_PERM, MODE_TYPE};
 
 use super::scheme::current_perm;
 
@@ -29,10 +34,38 @@ pub struct File {
 }
 
 impl File {
-    /// Ferric Oxide: sets the owner and group `fchown` asks for, keeping either one that is
-    /// `ferric_abi::id::UNCHANGED` (-1, as POSIX `chown` defines it).
-    pub fn set_owner(&mut self, uid: u32, gid: u32) {
-        (self.uid, self.gid) = ferric_abi::id::owner_after((self.uid, self.gid), uid, gid);
+    /// Ferric Oxide: `fchown` by `caller` (see [`Ownership::chown_by`]).
+    ///
+    /// # Errors
+    /// `EPERM` when `caller` may not make the change.
+    pub fn chown_by(&mut self, caller: Caller, uid: u32, gid: u32) -> Result<()> {
+        self.set_ownership(self.ownership().chown_by(caller, uid, gid)?);
+        Ok(())
+    }
+
+    /// Ferric Oxide: `fchmod` by `caller` (see [`Ownership::chmod_by`]).
+    ///
+    /// # Errors
+    /// `EPERM` when `caller` may not make the change.
+    pub fn chmod_by(&mut self, caller: Caller, mode: u16) -> Result<()> {
+        self.set_ownership(self.ownership().chmod_by(caller, mode)?);
+        Ok(())
+    }
+
+    fn ownership(&self) -> Ownership {
+        Ownership {
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+        }
+    }
+
+    fn set_ownership(&mut self, ownership: Ownership) {
+        Ownership {
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+        } = ownership;
     }
 
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
@@ -236,5 +269,131 @@ pub fn current_time() -> TimeSpec {
             .subsec_nanos()
             .try_into()
             .unwrap_or(i32::max_value()),
+    }
+}
+
+/// Ferric Oxide: a file's owner, group and mode (type and permission bits), which
+/// `fchown` and `fchmod` change under the POSIX rules in `ferric_abi::id`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ownership {
+    /// The file type and permission bits (`MODE_TYPE` and `MODE_PERM`).
+    pub mode: u16,
+    /// The owner's user ID.
+    pub uid: u32,
+    /// The file's group ID.
+    pub gid: u32,
+}
+
+impl Ownership {
+    /// After `fchown(uid, gid)` by `caller`: the owner and group asked for, each kept when it
+    /// is `ferric_abi::id::UNCHANGED` (-1, as POSIX `chown` defines it), and the set-ID bits
+    /// an unprivileged change must clear, cleared.
+    ///
+    /// # Errors
+    /// `EPERM` unless `ferric_abi::id::chown_permitted` allows it: root, or the owner
+    /// keeping the owner and choosing its own group.
+    pub fn chown_by(self, caller: Caller, uid: u32, gid: u32) -> Result<Self> {
+        if !chown_permitted(caller, (self.uid, self.gid), uid, gid) {
+            return Err(Error::new(EPERM));
+        }
+        let (uid, gid) = owner_after((self.uid, self.gid), uid, gid);
+        Ok(Self {
+            mode: mode_after_chown(self.mode, self.is_regular(), caller),
+            uid,
+            gid,
+        })
+    }
+
+    /// After `fchmod(mode)` by `caller`: the permission bits of `mode`, the file's type
+    /// kept. Bits outside the permissions are ignored, and set-group-ID is dropped when an
+    /// unprivileged caller is not in the file's group.
+    ///
+    /// # Errors
+    /// `EPERM` unless `caller` is root or owns the file.
+    pub fn chmod_by(self, caller: Caller, mode: u16) -> Result<Self> {
+        if !chmod_permitted(caller, self.uid) {
+            return Err(Error::new(EPERM));
+        }
+        let permissions = mode_after_chmod(mode & MODE_PERM, self.is_regular(), self.gid, caller);
+        Ok(Self {
+            mode: permissions | (self.mode & MODE_TYPE),
+            ..self
+        })
+    }
+
+    fn is_regular(self) -> bool {
+        self.mode & MODE_TYPE == MODE_FILE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ferric_abi::id::{Caller, UNCHANGED};
+    use syscall::{EPERM, MODE_DIR, MODE_FILE};
+
+    use super::Ownership;
+
+    const ROOT: Caller = Caller { uid: 0, gid: 0 };
+    const USER: Caller = Caller {
+        uid: 1000,
+        gid: 1000,
+    };
+
+    fn file(mode: u16, uid: u32, gid: u32) -> Ownership {
+        Ownership { mode, uid, gid }
+    }
+
+    /// #246: a process that can open a file it does not own cannot give it to itself or
+    /// change its mode.
+    #[test]
+    fn a_file_another_user_owns_cannot_be_taken_or_rechmoded() {
+        let theirs = file(MODE_FILE | 0o666, 0, 0);
+        for (uid, gid) in [(1000, UNCHANGED), (UNCHANGED, 1000), (UNCHANGED, UNCHANGED)] {
+            assert_eq!(theirs.chown_by(USER, uid, gid).unwrap_err().errno, EPERM);
+        }
+        assert_eq!(theirs.chmod_by(USER, 0o777).unwrap_err().errno, EPERM);
+    }
+
+    #[test]
+    fn the_owner_may_regroup_and_chmod_its_own_file() {
+        let mine = file(MODE_FILE | 0o644, 1000, 50);
+        let regrouped = mine.chown_by(USER, UNCHANGED, 1000).unwrap();
+        assert_eq!(regrouped, file(MODE_FILE | 0o644, 1000, 1000));
+        let private = regrouped.chmod_by(USER, 0o600).unwrap();
+        assert_eq!(private, file(MODE_FILE | 0o600, 1000, 1000));
+        // But not give it away.
+        assert_eq!(mine.chown_by(USER, 0, UNCHANGED).unwrap_err().errno, EPERM);
+    }
+
+    #[test]
+    fn root_may_change_any_file() {
+        let theirs = file(MODE_FILE | 0o644, 1000, 1000);
+        let taken = theirs.chown_by(ROOT, 0, 0).unwrap();
+        let setuid = taken.chmod_by(ROOT, 0o4755).unwrap();
+        assert_eq!(setuid, file(MODE_FILE | 0o4755, 0, 0));
+    }
+
+    /// An unprivileged regroup of a set-ID executable clears its set-ID bits; chmod keeps
+    /// the file type and drops bits outside the permissions.
+    #[test]
+    fn set_id_bits_and_the_file_type_are_handled_as_posix_says() {
+        let program = file(MODE_FILE | 0o6755, 1000, 1000);
+        assert_eq!(
+            program.chown_by(USER, UNCHANGED, 1000).unwrap().mode,
+            MODE_FILE | 0o0755
+        );
+
+        let dir = file(MODE_DIR | 0o755, 1000, 1000);
+        assert_eq!(
+            dir.chmod_by(USER, MODE_FILE | 0o2700).unwrap().mode,
+            MODE_DIR | 0o2700
+        );
+
+        // Set-group-ID needs the file's group.
+        let other_group = file(MODE_FILE | 0o755, 1000, 50);
+        assert_eq!(
+            other_group.chmod_by(USER, 0o2755).unwrap().mode,
+            MODE_FILE | 0o0755
+        );
     }
 }

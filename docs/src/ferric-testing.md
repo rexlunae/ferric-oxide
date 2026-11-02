@@ -1286,6 +1286,27 @@ Rustdoc. The image workflow builds the recipe and boots it in its smoke
 matrix. Kernel changes also require the kernel lint ratchet; host compilation
 alone does not exercise the credential check.
 
+## ramfs ownership changes
+
+`ferric-owner-test` runs in the smoke image and checks `ramfs`'s `fchown` and
+`fchmod` (#246) on `/scheme/logging`, the instance every image runs. As root it
+creates a file root owns that anyone may open for writing, and one user 1000
+owns with mode `6755`, then runs itself as user 1000:
+
+- `owner-refused`: on root's file, `fchown` to its own user or group and
+  `fchmod` are refused, and root then finds the file unchanged;
+- `owner-allowed`: on its own file it may set its own group, which clears the
+  set-ID bits, and change the mode, but not give the file to root; root then
+  finds the owner, group and mode it set.
+
+`fchown` reaches `ramfs` as the kernel's direct call and `fchmod` as a
+`StdFsCall`, so the two steps cover both ways `ramfs` learns the caller's IDs.
+Without `/scheme/logging` it prints a skip. The rules themselves have host
+tests in `crates/abi` (`ferric_abi::id`) and `userspace/base/ramfs`, which the
+base-workspace job in `host-tools.yml` runs with `scheme-utils`' credential
+decoding. `host-tools.yml` also checks the test's formatting, target Clippy and
+Rustdoc; the image workflow requires both steps.
+
 ## Documentation checks
 
 The system chapters are ordinary mdBook pages listed in `docs/src/SUMMARY.md`.

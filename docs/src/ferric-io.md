@@ -1500,7 +1500,9 @@ remains available to other mounts of the same daemon binary.
   the set-group-ID bit on a regular file. A symbolic link opened itself
   (`O_SYMLINK`) is refused with `EOPNOTSUPP`, as its mode is not used.
 - **`fchown`** (`Fs::set_owner`) follows POSIX `chown` with
-  `_POSIX_CHOWN_RESTRICTED`: `-1` (`ferric_abi::id::UNCHANGED`) keeps an ID;
+  `_POSIX_CHOWN_RESTRICTED`, through the rules `ramfs` shares
+  (`ferric_abi::id`, see [owner, group and mode changes](./security.md#owner-group-and-mode-changes)):
+  `-1` (`ferric_abi::id::UNCHANGED`) keeps an ID;
   UID 0 may set any owner and group; any other caller must own the file, may
   not give it to another owner, and may set its group only to its own or the
   caller's GID (`EPERM` otherwise), and then the set-user-ID and set-group-ID
