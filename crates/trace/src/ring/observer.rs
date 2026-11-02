@@ -43,7 +43,7 @@ pub const OBSERVE_TRIES: usize = 8;
 /// producer moves it. A reader that consumes the ring moves it to records it has read but
 /// the producer has not overwritten, and an overtaken observer then skips those too. So an
 /// observer that may fall behind should be the ring's only reader; the kernel refuses
-/// `cpu/<n>` reads of its host-visible rings for that reason.
+/// `cpu/<n>` reads and commits of its host-visible rings for that reason.
 ///
 /// Every load is relaxed, with acquire fences where ordering matters, because the memory may
 /// be mapped read-only, where only relaxed atomic loads are allowed.
