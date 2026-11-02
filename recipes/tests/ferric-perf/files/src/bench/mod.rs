@@ -36,8 +36,8 @@ pub struct Config {
     /// The sink `write-null` writes to.
     pub null: PathBuf,
     /// The directory under which the file and mapping benchmarks make their scratch
-    /// directories, `files` and `mmap` ([`file::Scratch`]); it is created if needed and left
-    /// in place.
+    /// directories, `ferric-perf-<pid>-files` and `-mmap` ([`file::Scratch`]); it is created
+    /// if needed, and nothing already in it is touched.
     pub dir: PathBuf,
     /// The size of the file `mmap` maps, in MiB.
     pub mmap_mib: u64,

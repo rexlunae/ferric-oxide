@@ -47,7 +47,7 @@ const FILL: u8 = 0x5a;
 
 /// The `mmap` group.
 pub fn run(config: &Config) -> Result<Vec<Measurement>, BenchError> {
-    let scratch = Scratch::new(config.dir.join("mmap"))?;
+    let scratch = Scratch::new(&config.dir, "mmap")?;
     let path = scratch.path().join("large");
     let mib = usize::try_from(config.mmap_mib).unwrap_or(usize::MAX);
     let len = mib.saturating_mul(1 << 20);

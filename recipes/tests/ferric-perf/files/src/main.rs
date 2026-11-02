@@ -76,8 +76,9 @@ struct Cli {
     /// The sink write-null writes to
     #[arg(long, default_value = "/scheme/null")]
     null: PathBuf,
-    /// Where the file and mapping benchmarks make their scratch directories (`files` and
-    /// `mmap`, each emptied first and removed after its benchmark); created if needed
+    /// Where the file and mapping benchmarks make their scratch directories
+    /// (`ferric-perf-<pid>-files` and `-mmap`, new ones, removed after each benchmark;
+    /// nothing already in it is touched); created if needed
     #[arg(long, default_value = "/tmp/ferric-perf")]
     dir: PathBuf,
     /// The size of the file the mmap benchmark maps, in MiB
