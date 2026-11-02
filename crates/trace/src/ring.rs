@@ -2,8 +2,9 @@
 //!
 //! A ring is a power-of-two run of `AtomicU64` data words and four counters: `head` (the next
 //! word the producer writes), `tail` (the next word the consumer reads), `lost` (records the
-//! producer dropped because the ring was full) and `oldest` (the first record whose words the
-//! producer has not overwritten). `head`, `tail` and `oldest` only grow; a word's slot is its
+//! producer dropped because the ring was full) and `oldest` (on a ring that overwrites, the
+//! first record whose words the producer has not overwritten). `head`, `tail` and `oldest`
+//! only grow; a word's slot is its
 //! position modulo the data length, so a record can wrap around the end.
 //!
 //! The producer writes a record's words with relaxed stores and then publishes them by storing
@@ -26,12 +27,15 @@
 //!   growing and `tail` moving under them. `lost` is then an upper bound: a record a reader
 //!   had copied and checked just before the producer overwrote it is delivered and counted.
 //!
-//! Either way, before the producer writes over the words of older records, it moves `oldest`
-//! past them, record by record, whoever has read them (see [`Ring::push`]); only the
-//! producer stores `oldest`. So the records from `oldest` up to `head` are always whole, and
-//! `head - oldest` never exceeds the ring's capacity. Consumers move `tail` independently: a
-//! consumer that drained the ring leaves `tail` past records whose words are still intact,
-//! and `oldest` stays at the first of them. `lost` counts what the producer dropped or
+//! With [`WhenFull::OverwriteOldest`], before the producer writes over the words of older
+//! records, it moves `oldest` past them, record by record, whoever has read them (see
+//! [`Ring::push`]); only the producer stores `oldest`. So the records from `oldest` up to
+//! `head` are always whole, and `head - oldest` never exceeds the ring's capacity. Consumers
+//! move `tail` independently: a consumer that drained the ring leaves `tail` past records
+//! whose words are still intact, and `oldest` stays at the first of them. A ring that drops
+//! new records reuses only words a consumer took, so its `tail` already bounds what it
+//! reuses, and it leaves `oldest` alone (at 0) to keep its push cheap; its header's
+//! [`POLICY_WORD`] says which kind it is. `lost` counts what the producer dropped or
 //! overwrote before a consumer took it; records overwritten after a consumer took them are
 //! not lost to that consumer, so they are not counted.
 //!
@@ -67,14 +71,15 @@
 //!   after each copy and retries a copy it overtook.
 //!
 //! An [`Observer`] reads the same layout without handing anything back to anyone: it keeps
-//! its own position, ignores what other readers consume, and judges from `head` and `oldest`
-//! whether the producer overwrote what it copied. A host reading a guest's rings out of its
+//! its own position, ignores what other readers consume, and judges from `head` and, as the
+//! ring's [`POLICY_WORD`] says, `oldest` or `tail` whether the producer overwrote what it
+//! copied. A host reading a guest's rings out of its
 //! RAM is one ([`host`](crate::host)).
 //!
 //! The header, in words: [`SHARED_MAGIC`] at [`MAGIC_WORD`], [`SHARED_VERSION`] at
-//! [`VERSION_WORD`], the data length at [`DATA_WORDS_WORD`], and `head`, `tail`, `lost` and
-//! `oldest` at [`HEAD_WORD`], [`TAIL_WORD`], [`LOST_WORD`] and [`OLDEST_WORD`], each on a
-//! 64-byte line of its own, so the producer's stores to `head` and the consumer's to `tail`
+//! [`VERSION_WORD`], the data length at [`DATA_WORDS_WORD`], and `head`, `tail`, `lost`,
+//! `oldest` and the policy at [`HEAD_WORD`], [`TAIL_WORD`], [`LOST_WORD`], [`OLDEST_WORD`] and
+//! [`POLICY_WORD`], each on a 64-byte line of its own, so the producer's stores to `head` and the consumer's to `tail`
 //! do not share a cache line.
 //!
 //! A producer never trusts the counters it reads back, beyond what keeps its own accesses in
@@ -446,6 +451,7 @@ impl<W: Words> Ring<Shared<W>> {
             (TAIL_WORD, 0),
             (LOST_WORD, 0),
             (OLDEST_WORD, 0),
+            (POLICY_WORD, WhenFull::default().word()),
         ] {
             words.word(index).store(value, Ordering::Relaxed);
         }
@@ -586,6 +592,12 @@ impl<S: Storage> Ring<S> {
     /// The ring with the policy `when_full` for records that do not fit.
     #[must_use]
     pub fn when_full(mut self, when_full: WhenFull) -> Self {
+        if when_full == WhenFull::OverwriteOldest && self.when_full != when_full {
+            // `oldest` was not maintained until now. `tail` is a record boundary with every
+            // record from it to `head` whole, so it is where `oldest` starts.
+            let tail = self.storage.tail().load(Ordering::Acquire);
+            self.storage.oldest().store(tail, Ordering::Relaxed);
+        }
         self.when_full = when_full;
         self.storage.set_full_policy(when_full);
         self
@@ -1657,6 +1669,42 @@ mod tests {
         );
         ring.push(EventId::new(1), 200, &[0; 3]).expect("room");
         assert!(oldest(&ring) > 0);
+    }
+
+    /// A ring that dropped new records, then switched to overwriting, starts `oldest` at
+    /// `tail`, so the records from there are not taken for overwritten.
+    #[test]
+    fn switching_to_overwrite_starts_oldest_at_tail() {
+        let memory: Vec<AtomicU64> = words(SHARED_HEADER_WORDS + 32);
+        let ring = Ring::shared(&memory[..]).expect("valid");
+        let mut buf = [0u8; 1024];
+        for i in 0..10u64 {
+            ring.push(EventId::new(1), i, &[i]).expect("room");
+        }
+        assert_eq!(ring.read(&mut buf[..48]).map(|len| len > 0), Ok(true));
+        let tail = ring.storage.tail().load(Ordering::Relaxed);
+        let ring = ring.when_full(WhenFull::OverwriteOldest);
+        assert_eq!(oldest(&ring), tail);
+        let observer = Observer::new(&memory[..]).expect("a shared ring");
+        let copy = observer.observe(tail, &mut buf).expect("observes");
+        assert_eq!((copy.skipped(), copy.end()), (0, head(&ring)));
+    }
+
+    /// `Ring::shared` writes the whole header, the policy included, so words a ring that
+    /// overwrote used before do not make a new ring look like one.
+    #[test]
+    fn a_new_shared_ring_resets_the_policy() {
+        let memory: Vec<AtomicU64> = words(SHARED_HEADER_WORDS + 32);
+        drop(
+            Ring::shared(&memory[..])
+                .expect("valid")
+                .when_full(WhenFull::OverwriteOldest),
+        );
+        assert_eq!(memory[POLICY_WORD].load(Ordering::Relaxed), 1);
+        Ring::shared(&memory[..]).expect("valid");
+        assert_eq!(memory[POLICY_WORD].load(Ordering::Relaxed), 0);
+        let observer = Observer::new(&memory[..]).expect("a shared ring");
+        assert_eq!(observer.full_policy(), WhenFull::DropNewest);
     }
 
     #[test]
