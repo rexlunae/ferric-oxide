@@ -212,7 +212,8 @@ pub(super) fn check(cpus: &[u32]) -> Result<(), Failure> {
     let text = read_text(STEP, abi::CLOCK_PATH)?;
     let line = ClockLine::parse(&text).map_err(|source| Failure {
         step: STEP,
-        why: Why::ClockLine {
+        why: Why::Line {
+            file: abi::CLOCK_PATH,
             line: text.clone(),
             source,
         },
