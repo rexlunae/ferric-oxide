@@ -34,7 +34,7 @@
 //! [[step]]
 //! wait = "text:redox login"     # a wait-screen predicate
 //! [[step]]
-//! sleep = 2.5
+//! sleep = 2.5                   # may not exceed the step's timeout
 //! [[step]]
 //! mark = "workload"
 //! [[step]]
@@ -145,6 +145,14 @@ pub enum StepProblem {
         field: &'static str,
         /// Its value.
         seconds: f64,
+    },
+    /// A `sleep` longer than the step's time limit, which would let the step overrun it.
+    #[error("sleep = {sleep} is longer than the step's timeout ({timeout} s)")]
+    SleepPastTimeout {
+        /// The sleep in seconds.
+        sleep: f64,
+        /// The step's effective timeout in seconds (its own, else the scenario's).
+        timeout: f64,
     },
 }
 
@@ -438,6 +446,11 @@ fn convert(step: usize, spec: StepSpec, default_timeout: f64) -> Result<Step, Sc
             field: "timeout",
             seconds: timeout,
         }));
+    }
+    if let Some(sleep) = spec.sleep
+        && sleep > timeout
+    {
+        return Err(invalid(StepProblem::SleepPastTimeout { sleep, timeout }));
     }
     match actions.len() {
         0 => Err(ScenarioError::NoAction(step)),
@@ -795,5 +808,39 @@ since = "m"
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn rejects_sleep_past_timeout() {
+        assert!(matches!(
+            parse("[[step]]\nsleep = 5\ntimeout = 2\n"),
+            Err(ScenarioError::Invalid {
+                step: 1,
+                problem: StepProblem::SleepPastTimeout {
+                    sleep: 5.0,
+                    timeout: 2.0
+                },
+            })
+        ));
+        assert!(matches!(
+            parse("timeout = 1.5\n[[step]]\nmark = \"m\"\n[[step]]\nsleep = 2\n"),
+            Err(ScenarioError::Invalid {
+                step: 2,
+                problem: StepProblem::SleepPastTimeout {
+                    sleep: 2.0,
+                    timeout: 1.5
+                },
+            })
+        ));
+        assert!(matches!(
+            parse("[[step]]\nsleep = 61\n"),
+            Err(ScenarioError::Invalid {
+                problem: StepProblem::SleepPastTimeout { timeout: 60.0, .. },
+                ..
+            })
+        ));
+        let ok = parse("timeout = 2\n[[step]]\nsleep = 2\n[[step]]\nsleep = 90\ntimeout = 90\n")
+            .expect("sleeps within their timeouts");
+        assert_eq!(ok.steps[1].action, Action::Sleep(Duration::from_secs(90)));
     }
 }

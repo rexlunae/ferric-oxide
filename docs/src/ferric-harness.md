@@ -163,7 +163,8 @@ report is written only once the scenario has ended, so that failure is always
 in it. Each step has one action and an
 optional `timeout` in seconds. Without one, a step uses the file's `timeout`,
 or 60 seconds if the file sets none. The harness checks every pattern,
-predicate, key name and typed character before it boots the guest.
+predicate, key name and typed character before it boots the guest, and
+rejects a `sleep` longer than its step's timeout.
 
 ```toml
 description = "log in on the serial console"
@@ -190,7 +191,7 @@ contains = "redox login:"  # optional: fail unless the text contains this
 [[step]]
 shot = "vt2.png"           # a file name in <run>/shots; `true` names it automatically
 [[step]]
-sleep = 2.5
+sleep = 2.5                # seconds; no longer than the step's timeout
 [[step]]
 mark = "workload"
 [[step]]
