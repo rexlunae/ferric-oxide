@@ -150,6 +150,10 @@ The `ferric-hardware` choice selects the x86-64 hardware inventory image;
 `kernel.trace=true`, `kernel.trace_sched=true` and `kernel.rings=true` for its
 workload; this choice preserves the saved CPU/kernel policy like the other
 profiles. It is rejected on other architectures.
+`ferric-perf` selects the process, pipe, logging and file microbenchmark image
+(`config/ferric-perf.toml`), which runs `ferric-perf` once at boot and shuts
+down; it needs no optional features and keeps the saved policy, so two images
+built with different kernel options can be compared.
 Use these catalog choices instead of a mismatching command-line `CONFIG_NAME`;
 see the book's [boot reproduction guide](../../docs/src/ferric-testing.md#reproducing-a-boot).
 
