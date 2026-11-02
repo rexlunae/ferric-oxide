@@ -3,7 +3,9 @@
 use core::fmt;
 use core::sync::atomic::{Ordering, fence};
 
-use super::{Peek, ReadError, Ring, Shared, Storage, ViewError, Words, keep_from};
+use super::{
+    POLICY_WORD, Peek, ReadError, Ring, Shared, Storage, ViewError, WhenFull, Words, keep_from,
+};
 use crate::record::MAX_RECORD_WORDS;
 
 /// How many times [`Observer::observe`] copies again after the producer overwrote the start
@@ -27,10 +29,14 @@ pub const OBSERVE_TRIES: usize = 8;
 ///   is the one written at that position: the producer stores a record's words after a
 ///   release fence, so a copy that read any word of a later push also sees (after its own
 ///   acquire fence) the `head` that push started at.
-/// - Before a push overwrites any word, the producer moves the ring's `oldest` past the
-///   records the word belongs to, whatever any reader has consumed, and the same release
-///   fence orders that store before the overwriting ones. Only the producer stores `oldest`.
-///   So every copied word from the `oldest` loaded after the copy on is whole, too.
+/// - Before a push of a ring that overwrites its oldest records
+///   ([`WhenFull::OverwriteOldest`], as its [`POLICY_WORD`] says) overwrites any word, the
+///   producer moves the ring's `oldest` past the records the word belongs to, whatever any
+///   reader has consumed, and the same release fence orders that store before the
+///   overwriting ones. Only the producer stores `oldest`. So every copied word from the
+///   `oldest` loaded after the copy on is whole, too. A ring that drops new records
+///   ([`WhenFull::DropNewest`]) reuses only words a reader consumed, so for it `tail` is that
+///   bound instead, and the producer does not maintain `oldest` (keeping its push cheap).
 ///
 /// A copy that starts at or after the lower of the two bounds is whole. One that does not was
 /// overtaken: the observer fell behind by more than the ring holds. It keeps the records from
@@ -160,6 +166,27 @@ impl<W: Words> Observer<W> {
         oldest
     }
 
+    /// The producer's policy for records that do not fit, from the ring's [`POLICY_WORD`].
+    pub fn full_policy(&self) -> WhenFull {
+        WhenFull::from_word(
+            self.ring
+                .storage
+                .words
+                .word(POLICY_WORD)
+                .load(Ordering::Acquire),
+        )
+    }
+
+    /// The bound below which the producer may have reused words, loaded after a copy: the
+    /// ring's `oldest` when it overwrites, which only the producer moves; its `tail` when it
+    /// drops new records, since it then reuses only words a reader consumed.
+    fn reuse_bound(&self, policy: WhenFull) -> u64 {
+        match policy {
+            WhenFull::OverwriteOldest => self.ring.storage.oldest().load(Ordering::Relaxed),
+            WhenFull::DropNewest => self.ring.storage.tail().load(Ordering::Relaxed),
+        }
+    }
+
     /// The records the producer dropped or overwrote.
     pub fn lost(&self) -> u64 {
         self.ring.lost()
@@ -185,18 +212,28 @@ impl<W: Words> Observer<W> {
     /// first record does not fit in `out`.
     pub fn observe(&self, from: u64, out: &mut [u8]) -> Result<Observed, ObserveError> {
         let capacity = self.ring.capacity() as u64;
+        let policy = self.full_policy();
         for _ in 0..OBSERVE_TRIES {
             let head = self.head();
             if from > head {
                 return Err(ObserveError::Ahead { from, head });
             }
-            let start = self.oldest().clamp(from, head);
+            let start = match policy {
+                // `oldest` is exact: never start before the oldest record still whole.
+                WhenFull::OverwriteOldest => self.oldest().clamp(from, head),
+                // `tail` is only a bound: records a reader consumed may still be whole, so
+                // start at `tail` only once `from` may have been reused.
+                WhenFull::DropNewest if from < first_whole(head, capacity) => {
+                    self.tail().clamp(from, head)
+                }
+                WhenFull::DropNewest => from,
+            };
             let copy = self.ring.copy_records(start, head, out);
             // Pairs with the release fence in `Ring::push`: a copied word of a later push
-            // makes that push's `head` and `oldest` visible now.
+            // makes that push's `head`, `tail` and `oldest` visible now.
             fence(Ordering::Acquire);
             let head_after = self.ring.storage.head().load(Ordering::Relaxed);
-            let oldest_after = self.ring.storage.oldest().load(Ordering::Relaxed);
+            let oldest_after = self.reuse_bound(policy);
             if start >= first_whole(head_after, capacity).min(oldest_after) {
                 return copy
                     .map(|peek| Observed {
