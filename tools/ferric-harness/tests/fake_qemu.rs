@@ -941,6 +941,10 @@ fn cli_up_commands_down_report() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("run: "));
+    // The run directory the harness made and the control socket are its user's alone.
+    let mode = |path: &Path| fs::metadata(path).expect("exists").permissions().mode() & 0o777;
+    assert_eq!(mode(&run), 0o700);
+    assert_eq!(mode(&run.join("control.sock")), 0o600);
 
     let run_args = |cmd: &[&str]| {
         let mut v = cmd.to_vec();

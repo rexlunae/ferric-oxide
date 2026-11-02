@@ -52,7 +52,23 @@ run:
   records the CPU time of each QEMU thread and KVM's statistics.
 - **Control socket.** `control.sock` takes one JSON request and returns one
   JSON reply per connection. Each connection gets its own thread, so a long
-  `expect` does not hold up a `shot`.
+  `expect` does not hold up a `shot`. Only the supervisor's own user can drive
+  the guest through it (see [Access](#access)).
+
+### Access
+
+Whoever reaches the sockets of a run can type into the guest, power it off or
+take screenshots, so a run is kept to the user who started it:
+
+- A run directory the harness creates is made `0700`. A directory that already
+  existed (an empty one given with `--run`) keeps its mode; QEMU's `qmp.sock`
+  and `serial.sock` then have the mode QEMU's umask gives them, so give `--run`
+  a private directory.
+- `control.sock` is made `0600` as soon as it is bound, before any connection
+  is accepted.
+- The supervisor reads each client's user with `SO_PEERCRED` and serves only
+  its own effective user. Any other client, root included, gets the error
+  `only uid <n> may use this run's control socket` and nothing else.
 
 The other commands are clients of the control socket. They find the run through
 `--run <dir>`, then `$FERRIC_HARNESS_RUN`, then the `build/harness/latest`

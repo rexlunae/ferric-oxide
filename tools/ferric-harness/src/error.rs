@@ -182,6 +182,13 @@ pub enum Error {
     /// The control protocol broke (a malformed or missing reply).
     #[error("control socket protocol error")]
     Protocol(#[source] serde_json::Error),
+    /// A control client that runs as another user than the supervisor, or whose user
+    /// could not be read.
+    #[error("only uid {owner} may use this run's control socket")]
+    PeerRefused {
+        /// The supervisor's effective user ID.
+        owner: u32,
+    },
     /// The control socket closed before replying.
     #[error("the supervisor closed the connection without replying")]
     NoReply,
@@ -236,7 +243,8 @@ impl Error {
             | Error::TraceNotEnabled
             | Error::TraceNotReady
             | Error::TraceRunning
-            | Error::TraceNotRunning => ErrorKind::BadRequest,
+            | Error::TraceNotRunning
+            | Error::PeerRefused { .. } => ErrorKind::BadRequest,
             Error::Screen(ScreenError::Predicate(_) | ScreenError::Regex(_)) => {
                 ErrorKind::BadRequest
             }

@@ -5,9 +5,14 @@
 //! the repository, never `/tmp` (a small tmpfs on some hosts, and a 10 GB image's snapshot
 //! overlay or a trace capture does not fit there). `build/harness/latest` points at the most
 //! recent run started there, so commands can omit `--run`.
+//!
+//! A run directory the harness creates is private (`0700`): it holds QEMU's QMP and serial
+//! sockets and the supervisor's control socket, which drive the guest. A directory that
+//! already exists keeps its mode.
 
-use std::fs;
+use std::fs::{self, DirBuilder};
 use std::io;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
@@ -27,18 +32,29 @@ impl RunDir {
         Self { root: root.into() }
     }
 
-    /// Creates the directory and its subdirectories.
+    /// The mode of a run directory the harness creates.
+    pub const MODE: u32 = 0o700;
+
+    /// Creates the directory, private ([`RunDir::MODE`]) unless it already exists, its
+    /// parents and its subdirectories.
     ///
     /// # Errors
     ///
     /// [`Error::Io`] when a directory cannot be created.
     pub fn create(&self) -> Result<(), Error> {
-        for dir in [
-            self.root.clone(),
-            self.shots_dir(),
-            self.tmp_dir(),
-            self.tftp_dir(),
-        ] {
+        let io = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| Error::Io { path, source }
+        };
+        if let Some(parent) = self.root.parent() {
+            fs::create_dir_all(parent).map_err(io(parent))?;
+        }
+        match DirBuilder::new().mode(Self::MODE).create(&self.root) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && self.root.is_dir() => {}
+            Err(source) => return Err(io(&self.root)(source)),
+        }
+        for dir in [self.shots_dir(), self.tmp_dir(), self.tftp_dir()] {
             fs::create_dir_all(&dir).map_err(|source| Error::Io { path: dir, source })?;
         }
         Ok(())
@@ -267,6 +283,27 @@ mod tests {
             fs::read_link(tmp.path().join(LATEST)).expect("link"),
             Path::new("two")
         );
+    }
+
+    #[test]
+    fn a_new_run_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mode = |path: &Path| fs::metadata(path).expect("exists").permissions().mode() & 0o777;
+        let run = RunDir::new(tmp.path().join("runs/new"));
+        run.create().expect("create");
+        assert_eq!(mode(run.root()), 0o700);
+        run.create().expect("create again");
+        // A directory the user made keeps the mode they gave it.
+        let theirs = tmp.path().join("theirs");
+        fs::create_dir(&theirs).expect("mkdir");
+        fs::set_permissions(&theirs, fs::Permissions::from_mode(0o750)).expect("chmod");
+        RunDir::new(&theirs).create().expect("create");
+        assert_eq!(mode(&theirs), 0o750);
+        assert!(RunDir::new(&theirs).shots_dir().is_dir());
+        let file = tmp.path().join("file");
+        fs::write(&file, "").expect("write");
+        assert!(matches!(RunDir::new(&file).create(), Err(Error::Io { .. })));
     }
 
     #[test]

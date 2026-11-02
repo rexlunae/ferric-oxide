@@ -6,8 +6,15 @@
 //! JSON: a [`Request`] (tagged by `cmd`) and a [`Reply`] (`{"ok": ...}` or
 //! `{"err": {"kind": ..., "message": ...}}`). Connections are served on their own threads,
 //! so a long `expect` does not hold up a `shot`.
+//!
+//! Only the supervisor's own user may drive the guest. The socket is made `0600` as soon as
+//! it is bound, before any connection is accepted, and every accepted connection's peer
+//! user (`SO_PEERCRED`) must be the supervisor's effective user ([`peer_permitted`]); any
+//! other client gets an [`Error::PeerRefused`] reply and nothing else.
 
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,6 +22,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rustix::net::sockopt::socket_peercred;
+use rustix::process::geteuid;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, ErrorKind, chain};
@@ -227,17 +236,44 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// Serves requests for `session` on `path` until the session's report is written and the
-/// requests in flight have been answered; then removes the socket.
+/// The mode of the control socket: its owner may connect, nobody else.
+pub const SOCKET_MODE: u32 = 0o600;
+
+/// Binds the control socket at `path` and makes it [`SOCKET_MODE`] before anything can be
+/// accepted on it.
 ///
 /// # Errors
 ///
-/// [`Error::Io`] when the socket cannot be bound.
-pub fn serve(session: &Session, path: &Path) -> Result<(), Error> {
-    let listener = UnixListener::bind(path).map_err(|source| Error::Io {
+/// [`Error::Io`] when the socket cannot be bound or its mode set (it is then removed).
+pub fn bind(path: &Path) -> Result<UnixListener, Error> {
+    let io = |source| Error::Io {
         path: path.to_path_buf(),
         source,
-    })?;
+    };
+    let listener = UnixListener::bind(path).map_err(io)?;
+    if let Err(source) = fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE)) {
+        // Nothing has been accepted yet; a socket others might reach is not left behind.
+        fs::remove_file(path).ok();
+        return Err(io(source));
+    }
+    Ok(listener)
+}
+
+/// Whether a client may drive the guest: its user, `peer_uid` (`None` when it could not be
+/// read), must be the supervisor's effective user, `owner_uid`.
+pub fn peer_permitted(peer_uid: Option<u32>, owner_uid: u32) -> bool {
+    peer_uid == Some(owner_uid)
+}
+
+/// Serves requests for `session` on `path` until the session's report is written and the
+/// requests in flight have been answered; then removes the socket. Only clients running as
+/// the supervisor's effective user are served (see the [module docs](self)).
+///
+/// # Errors
+///
+/// [`Error::Io`] when the socket cannot be bound or its mode set.
+pub fn serve(session: &Session, path: &Path) -> Result<(), Error> {
+    let listener = bind(path)?;
     let done = Arc::new(AtomicBool::new(false));
     let in_flight = InFlight::default();
     {
@@ -268,11 +304,18 @@ fn accept_loop(
     done: &AtomicBool,
     in_flight: &InFlight,
 ) {
+    let owner = geteuid().as_raw();
     for stream in listener.incoming() {
         if done.load(Ordering::Acquire) {
             return;
         }
         let Ok(stream) = stream else { continue };
+        let peer = socket_peercred(&stream).ok().map(|cred| cred.uid.as_raw());
+        if !peer_permitted(peer, owner) {
+            eprintln!("control: refused a client of uid {peer:?}");
+            reply(stream, Err(Error::PeerRefused { owner }).into());
+            continue;
+        }
         let session = session.clone();
         let guard = in_flight.enter();
         thread::spawn(move || {
@@ -290,14 +333,17 @@ fn serve_one(stream: UnixStream, session: &Session) {
     if BufReader::new(read_half).read_line(&mut line).unwrap_or(0) == 0 {
         return;
     }
-    let reply: Reply = match serde_json::from_str::<Request>(&line) {
+    let answer: Reply = match serde_json::from_str::<Request>(&line) {
         Ok(request) => handle(session, request).into(),
         Err(e) => Reply::Err(RemoteError {
             kind: ErrorKind::BadRequest,
             message: format!("malformed request: {e}"),
         }),
     };
-    let mut stream = stream;
+    reply(stream, answer);
+}
+
+fn reply(mut stream: UnixStream, reply: Reply) {
     if let Ok(mut text) = serde_json::to_string(&reply) {
         text.push('\n');
         // The client may have gone; nobody is left to tell.
@@ -375,6 +421,41 @@ mod tests {
             serde_json::to_string(&Reply::Ok(Output::Done)).expect("encode"),
             r#"{"ok":"done"}"#
         );
+    }
+
+    #[test]
+    fn only_the_owner_is_served() {
+        assert!(peer_permitted(Some(1000), 1000));
+        assert!(!peer_permitted(Some(1001), 1000));
+        assert!(
+            !peer_permitted(Some(0), 1000),
+            "not even root, through the socket"
+        );
+        assert!(!peer_permitted(None, 1000), "unknown credentials");
+        assert!(peer_permitted(Some(0), 0));
+        let refused: Reply = Err::<Output, _>(Error::PeerRefused { owner: 1000 }).into();
+        assert_eq!(
+            refused,
+            Reply::Err(RemoteError {
+                kind: ErrorKind::BadRequest,
+                message: "only uid 1000 may use this run's control socket".into()
+            })
+        );
+    }
+
+    #[test]
+    fn the_socket_is_private() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("control.sock");
+        let listener = bind(&path).expect("bind");
+        let mode = fs::metadata(&path).expect("socket").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // Its owner can still connect, and is who the socket reports.
+        let client = UnixStream::connect(&path).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        let peer = socket_peercred(&server).expect("credentials").uid.as_raw();
+        assert!(peer_permitted(Some(peer), geteuid().as_raw()));
+        drop(client);
     }
 
     #[test]
