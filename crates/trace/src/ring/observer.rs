@@ -156,9 +156,10 @@ impl<W: Words> Observer<W> {
         tail
     }
 
-    /// The ring's `oldest`: the first record the producer has not overwritten, where an
-    /// observer that fell behind resumes. The records from it up to [`Observer::head`] are what
-    /// an observer starting at 0 can still read.
+    /// The ring's `oldest`: on a ring that overwrites ([`Observer::full_policy`]), the first
+    /// record the producer has not overwritten, where an observer that fell behind resumes,
+    /// and the records from it up to [`Observer::head`] are what an observer starting at 0 can
+    /// still read. A ring that drops new records does not maintain it (it stays 0).
     pub fn oldest(&self) -> u64 {
         let oldest = self.ring.storage.oldest().load(Ordering::Relaxed);
         // Pairs with the release fence in `Ring::push`.
