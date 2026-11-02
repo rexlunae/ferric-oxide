@@ -108,7 +108,7 @@ full chain of causes.
 | `--display std\|none` | `std` | A VGA framebuffer read through QMP, or no display, like CI's smoke boots. Without a display the bootloader shows no menu |
 | `--boot-env KEY=VALUE` | none | A boot environment entry. Repeat for more |
 | `--boot-env-via fw-cfg\|keys` | `fw-cfg` | How the boot environment reaches the bootloader |
-| `--trace-ring-kib <n>` | 4096 | Host-visible ring size per CPU in trace mode. Must be a power of two |
+| `--trace-ring-kib <n>` | 4096 | Host-visible ring size per CPU in trace mode. Must be a power of two. Use 65536 for system-call events under load (see [Limits](#limits)) |
 | `--ferric-trace <path>`, `--no-trace-autostart` | `PATH`, then the newest `target/*/ferric-trace` | `follow` binary, and whether to start it when the rings are announced |
 | `--smp`, `--mem` | 4, 2048 MiB | vCPUs and guest RAM |
 | `--accel auto\|kvm\|tcg`, `--cpu <model>` | `auto` | KVM with `host,migratable=off` when `/dev/kvm` opens read-write, otherwise TCG with `max` |
@@ -401,8 +401,33 @@ no fw_cfg support, and their kernels were built with `kernel.trace`.
   ([#372](https://github.com/rexlunae/ferric-oxide/issues/372)). The harness
   saw the panic, stopped the run and failed the `crash` check.
 
-These parts have not run against a real guest yet: the fw_cfg path, trace mode
-and `follow` (none of these exist in the images yet), `--input usb`, the
+On 2 November 2026 the same host ran images built from this branch, with the
+catalog defaults plus `kernel.trace_mode = true` and
+`bootloader.fw_cfg_env = true` (so the normal kernel has no `kernel.trace`):
+
+- **`ferric-perf`, 2 GiB RAM, normal and trace mode, booted at the same time.**
+  Both passed every check in about 11 seconds. In normal mode the kernel
+  printed no `trace:` line. In trace mode the bootloader took
+  `FERRIC_KERNEL=trace` and `FERRIC_TRACE_HOST` from fw_cfg and loaded
+  `kernel-trace`, which logged `trace: trace-mode kernel` and its host rings at
+  `0x900000`. `follow` wrote the capture while the guest ran and stopped
+  cleanly when it powered off.
+- **Ring size.** With `FERRIC_TRACE=syscall,sched`, the benchmarks make
+  millions of system calls a second. Each costs about 88 bytes of trace, which
+  fills a 4 MiB ring in about 15 ms. At the default 4096 KiB the kernel
+  overwrote about 4.6 million records `follow` had not read (`stats.end`); with
+  `--trace-ring-kib 65536` it lost none (427 MB captured). The default suits
+  scheduler and scheme events. Use 65536 for system-call events under load,
+  and leave room in the guest's RAM for it (4 CPUs take 256 MiB).
+- **`ferric-smoke` in normal mode**: 55 passed, 32 skipped, 0 failed (the
+  trace tests skip: the normal kernel has no `kernel.trace` scheme).
+- **`ferric-smoke` in trace mode**: `trace-boot` failed because this profile
+  sets no `trace.boot`, and `trace-capture` failed because it maps the rings
+  in the guest (`capture --via map`), which host rings refuse (see
+  [Host-visible rings](ferric-tracing.md#host-visible-rings)). CI's smoke
+  profile has `kernel.trace` and `trace.boot = "sched"` in its normal kernel
+  and no host rings, so neither applies there.
+
+These parts have not run against a real guest yet: `--input usb`, the
 `vtd`/`amdvi` IOMMU options, and `report --a/--b` on runs of different images.
-`report` has been run on the reports listed above. Only x86_64 guests are
-supported.
+Only x86_64 guests are supported.

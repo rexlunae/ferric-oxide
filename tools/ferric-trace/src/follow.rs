@@ -18,7 +18,7 @@
 //! | File | Content |
 //! | --- | --- |
 //! | `INCOMPLETE` | present until the follower stops cleanly ([`crate::capture::INCOMPLETE`]) |
-//! | `clock` | the trace clock, from the directory |
+//! | `clock` | the trace clock, from the directory; for a TSC whose rate the kernel does not know, the rate measured against host time ([`measured_period_fs`]) once following ends |
 //! | `cpu<n>` | CPU n's records, appended as they are read |
 //! | `stats.start` | per CPU, the words in the ring when following began and the records the kernel had dropped by then (`lost_before`) |
 //! | `stats.end` | per CPU, the words left unread and `lost_before` plus the follower's own losses |
@@ -46,6 +46,7 @@ use std::time::Duration;
 
 use ferric_guest_ram::GuestRam;
 use ferric_trace::abi::{READ_MIN, StatsLine};
+use ferric_trace::clock::{Clock, ClockLine};
 use ferric_trace::host::{
     self, ClockSampleLine, DIRECTORY_MAGIC, DIRECTORY_WORDS, Directory, DirectoryError,
 };
@@ -417,14 +418,39 @@ impl CpuState<'_> {
     }
 }
 
+/// The shortest span of host time [`measured_period_fs`] measures the trace clock over.
+pub const MIN_MEASURED_SPAN: Duration = Duration::from_secs(1);
+
+/// The length of one tick of the trace clock in femtoseconds, measured from two
+/// [`HOST_CLOCK`] samples `(host ns, trace timestamp)`: the trace ticks between them against
+/// the host nanoseconds. `None` when they are less than [`MIN_MEASURED_SPAN`] apart or the
+/// clock did not move forward.
+///
+/// Each sample's timestamp is the newest record read at that poll, which is older than the
+/// host time by up to a poll interval, so over the minimum span the error is below about
+/// 1% for the default 10 ms interval, and it shrinks as the span grows.
+pub fn measured_period_fs(first: (u64, u64), last: (u64, u64)) -> Option<u64> {
+    let host_ns = last.0.checked_sub(first.0)?;
+    let ticks = last.1.checked_sub(first.1)?;
+    if host_ns < MIN_MEASURED_SPAN.as_nanos() as u64 || ticks == 0 {
+        return None;
+    }
+    let period = u128::from(host_ns) * 1_000_000 / u128::from(ticks);
+    u64::try_from(period).ok().filter(|&fs| fs > 0)
+}
+
 /// The rings of one directory being followed into a capture directory.
 pub struct Follower<'a> {
     ram: &'a GuestRam,
     out: PathBuf,
     phys: u64,
     generation: u64,
+    /// The directory's clock, as written to `clock` at the start.
+    clock: ClockLine,
     cpus: Vec<CpuState<'a>>,
     host_clock: BufWriter<File>,
+    /// The first and the latest [`HOST_CLOCK`] sample, for measuring an unknown TSC rate.
+    samples: Option<((u64, u64), (u64, u64))>,
     buf: Vec<u8>,
 }
 
@@ -472,8 +498,10 @@ impl<'a> Follower<'a> {
             out: out.to_owned(),
             phys,
             generation: directory.generation(),
+            clock: directory.clock(),
             cpus,
             host_clock,
+            samples: None,
             buf: vec![0; READ_BYTES],
         })
     }
@@ -578,6 +606,11 @@ impl<'a> Follower<'a> {
                 timestamp,
             };
             write!(self.host_clock, "{line}").map_err(io_error(&self.out.join(HOST_CLOCK)))?;
+            let sample = (now_ns, timestamp);
+            self.samples = Some(match self.samples {
+                None => (sample, sample),
+                Some((first, _)) => (first, sample),
+            });
         }
         Ok(Poll::Read)
     }
@@ -614,6 +647,22 @@ impl<'a> Follower<'a> {
         }
         let stats = self.out.join(STATS_END);
         fs::write(&stats, end).map_err(io_error(&stats))?;
+        // The TSC's rate is the one the kernel cannot always give; the tools would otherwise
+        // assume 1000 MHz. The TSC is invariant (the kernel chooses it only then), so it
+        // runs at one rate on every CPU.
+        if self.clock.clock == Clock::Tsc
+            && self.clock.period_fs.is_none()
+            && let Some(period_fs) = self
+                .samples
+                .and_then(|(first, last)| measured_period_fs(first, last))
+        {
+            let line = ClockLine {
+                clock: Clock::Tsc,
+                period_fs: Some(period_fs),
+            };
+            let clock = self.out.join(CLOCK);
+            fs::write(&clock, line.to_string()).map_err(io_error(&clock))?;
+        }
         let marker = self.out.join(INCOMPLETE);
         fs::remove_file(&marker).map_err(io_error(&marker))?;
         Ok(Summary {
@@ -668,6 +717,31 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> FollowError + '_ {
 
 #[cfg(test)]
 mod tests {
+
+    /// A 4.3 GHz TSC over 10 s of host time: 4.3e10 ticks, 232.56 fs a tick.
+    #[test]
+    fn the_tsc_period_is_measured_against_host_time() {
+        let first = (1_000_000_000, 5_000);
+        let last = (11_000_000_000, 5_000 + 43_000_000_000);
+        assert_eq!(super::measured_period_fs(first, last), Some(232_558));
+        let line = ClockLine {
+            clock: Clock::Tsc,
+            period_fs: super::measured_period_fs(first, last),
+        };
+        let mhz = line.ticks_per_us().unwrap();
+        assert!((mhz - 4300.0).abs() < 0.01, "{mhz}");
+    }
+
+    /// Too short a span, or a clock that did not move, measures nothing.
+    #[test]
+    fn a_short_or_still_span_measures_nothing() {
+        assert_eq!(
+            super::measured_period_fs((0, 0), (999_999_999, 4_000_000_000)),
+            None
+        );
+        assert_eq!(super::measured_period_fs((0, 7), (2_000_000_000, 7)), None);
+        assert_eq!(super::measured_period_fs((5, 9), (1, 3)), None);
+    }
     use super::*;
     use crate::capture::Capture;
     use ferric_guest_ram::RamLayout;
