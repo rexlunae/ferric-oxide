@@ -16,6 +16,8 @@ pub enum ObjectIoOperation {
     Open,
     /// Reading or validating the opened file's size.
     Stat,
+    /// Reading the start of the opened file, to decide how much of it to map.
+    Read,
     /// Mapping the opened file read-only.
     Map {
         /// Requested mapping length in bytes, before page rounding.
@@ -118,6 +120,7 @@ impl fmt::Display for DlError {
                 match operation {
                     ObjectIoOperation::Open => write!(f, "opening '{path}' failed"),
                     ObjectIoOperation::Stat => write!(f, "reading size of '{path}' failed"),
+                    ObjectIoOperation::Read => write!(f, "reading the headers of '{path}' failed"),
                     ObjectIoOperation::Map { size } => {
                         write!(f, "mapping '{path}' ({size} bytes) failed")
                     }
@@ -198,6 +201,10 @@ mod tests {
             (
                 ObjectIoOperation::Stat,
                 "reading size of '/lib/test.so' failed",
+            ),
+            (
+                ObjectIoOperation::Read,
+                "reading the headers of '/lib/test.so' failed",
             ),
             (
                 ObjectIoOperation::Map { size: 12345 },

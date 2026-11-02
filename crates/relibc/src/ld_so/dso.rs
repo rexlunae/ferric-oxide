@@ -3,10 +3,10 @@
 //! * <https://www.akkadia.org/drepper/dsohowto.pdf>
 
 use object::{
-    NativeEndian, Object, StringTable, SymbolIndex, U32, elf,
+    NativeEndian, StringTable, SymbolIndex, U32, elf,
     read::elf::{
-        Dyn as _, GnuHashTable, HashTable as SysVHashTable, ProgramHeader as _, Rel as _,
-        Rela as _, Sym as _, Version, VersionTable,
+        Dyn as _, FileHeader as _, GnuHashTable, HashTable as SysVHashTable, ProgramHeader as _,
+        Rel as _, Rela as _, Sym as _, Version, VersionTable,
     },
 };
 
@@ -14,6 +14,7 @@ use object::{
 use super::tcb::Tcb;
 use super::{
     debug::{_r_debug, RTLDDebug},
+    image::Image,
     linker::{__plt_resolve_trampoline, GLOBAL_SCOPE, Resolve, Scope, Symbol},
     tcb::Master,
 };
@@ -42,32 +43,27 @@ pub type Relr = usize;
 
 #[cfg(target_pointer_width = "32")]
 mod shim {
-    use object::{NativeEndian, elf, read::elf::ElfFile32};
+    use object::{NativeEndian, elf};
     pub type Dyn = elf::Dyn32<NativeEndian>;
     pub type Rel = elf::Rel32<NativeEndian>;
     pub type Rela = elf::Rela32<NativeEndian>;
     pub type Sym = elf::Sym32<NativeEndian>;
-    pub type FileHeader = elf::FileHeader32<NativeEndian>;
-    pub type ProgramHeader = elf::ProgramHeader32<NativeEndian>;
     pub type GnuHashHeader = elf::GnuHashHeader<NativeEndian>;
     pub type SysVHashHeader = elf::HashHeader<NativeEndian>;
-    pub type ElfFile<'a> = ElfFile32<'a, NativeEndian>;
 }
 
 #[cfg(target_pointer_width = "64")]
 mod shim {
-    use object::{NativeEndian, elf, read::elf::ElfFile64};
+    use object::{NativeEndian, elf};
     pub type Dyn = elf::Dyn64<NativeEndian>;
     pub type Rel = elf::Rel64<NativeEndian>;
     pub type Rela = elf::Rela64<NativeEndian>;
     pub type Sym = elf::Sym64<NativeEndian>;
-    pub type FileHeader = elf::FileHeader64<NativeEndian>;
-    pub type ProgramHeader = elf::ProgramHeader64<NativeEndian>;
     pub type GnuHashHeader = elf::GnuHashHeader<NativeEndian>;
     pub type SysVHashHeader = elf::HashHeader<NativeEndian>;
-    pub type ElfFile<'a> = ElfFile64<'a, NativeEndian>;
 }
 
+pub use super::image::{FileHeader, ProgramHeader};
 pub use shim::*;
 
 // TODO: missing from the `object` crate
@@ -447,7 +443,7 @@ impl DSO {
         tls_module_id: usize,
         tls_offset: usize,
     ) -> Result<(DSO, Option<Master>, Vec<ProgramHeader>), String> {
-        let elf = ElfFile::parse(data).map_err(|err| err.to_string())?;
+        let elf = Image::parse(data).map_err(|err| err.to_string())?;
         let (mmap, tcb_master, dynamic) =
             DSO::mmap_and_copy(path, &elf, data, base_addr, tls_offset)?;
 
@@ -505,7 +501,7 @@ impl DSO {
             recorded_image,
         };
 
-        Ok((dso, tcb_master, elf.elf_program_headers().to_vec()))
+        Ok((dso, tcb_master, elf.segments.to_vec()))
     }
 
     #[inline]
@@ -578,19 +574,19 @@ impl DSO {
 
     fn mmap_and_copy<'a>(
         path: &str,
-        elf: &ElfFile<'a>,
+        elf: &Image<'a>,
         data: &'a [u8],
         base_addr: Option<usize>,
         tls_offset: usize,
     ) -> Result<(MemoryMapHandle, Option<Master>, Dynamic<'static>), String> {
-        let endian = elf.endian();
+        let endian = NativeEndian;
         log::trace!("# {}", path);
         // data for struct LinkMap
         let mut l_ld = 0;
         // Calculate virtual memory bounds
         let bounds = {
             let mut bounds_opt: Option<(usize, usize)> = None;
-            for ph in elf.elf_program_headers() {
+            for ph in elf.segments {
                 let align = ph.p_align(endian);
                 if align == 0 {
                     // clang generated PT_GNU_STACK with 0 align
@@ -673,7 +669,7 @@ impl DSO {
 
         // Copy data
         let mut dynamic = None;
-        for ph in elf.elf_program_headers() {
+        for ph in elf.segments {
             match ph.p_type(endian) {
                 elf::PT_LOAD => {
                     if skip_load_segment_copy {
@@ -1413,8 +1409,8 @@ impl Drop for DSO {
     }
 }
 
-fn is_pie_enabled(elf: &ElfFile) -> bool {
-    elf.elf_header().e_type.get(elf.endian()) == elf::ET_DYN
+fn is_pie_enabled(elf: &Image) -> bool {
+    elf.header.e_type(NativeEndian) == elf::ET_DYN
 }
 
 fn basename(path: &str) -> &str {

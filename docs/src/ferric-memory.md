@@ -175,6 +175,22 @@ also reserves a main-stack guard. With `kernel.prot_none`, user access to a
 guard faults instead of reading ordinary mapped memory. The guard and ASLR
 image tests exercise these behaviors.
 
+## Loading dynamic objects
+
+`ld.so` maps only the start of each object that loading reads: up to the end of
+its program header table or of the last part of the file a program header
+covers, decided from the object's first 4 KiB (`crates/relibc/src/ld_so/`,
+`image::loaded_len`). The section headers and the sections no segment holds, such
+as debug information and the full symbol table, usually follow and stay
+unmapped; an object whose headers are not in its first 4 KiB is mapped whole.
+This matters because a scheme fills a file mapping when it is made: RedoxFS
+reads the whole range and keeps the buffer after the last unmap
+([#373](https://github.com/rexlunae/ferric-oxide/issues/373)). With
+`build.debug = true`, `cosmic-comp` is a 392 MiB file of which loading uses
+26 MiB, and mapping it and the libcosmic example whole ran a 2 GiB guest out of
+memory, which panics the kernel
+([#372](https://github.com/rexlunae/ferric-oxide/issues/372)).
+
 ## Mapping ranges stay inside user space
 
 User space ends at `USER_END_OFFSET` (2^47, `0x0000_8000_0000_0000`, on

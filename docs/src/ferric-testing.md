@@ -732,7 +732,8 @@ assumed to share this cause.
 
 ld.so's fatal message is followed by a second `[ld.so]:` line with the reason
 for the failing attempt: the path, original errno and exact operation (`open`,
-`fstat`, or `mmap`, including the requested mapping length), or the search paths
+`fstat`, the `pread` of the object's headers, or `mmap`, including the requested
+mapping length), or the search paths
 a library is in none of. Thus an `ENOMEM` while loading a library does not by
 itself establish physical memory exhaustion or even that `open` failed. The next
 occurrence names the file and error without `LD_DEBUG`. Context is carried
@@ -743,9 +744,22 @@ mapping ownership, error, fatal-message formatter and errno modules. It checks
 candidate order,
 successful fallback, missing and inaccessible libraries reaching the fatal
 output, isolation from a later parse/TLS failure, stable `dlerror` messages,
-and descriptor cleanup after failed stat/map operations. File descriptors are
-owned immediately after open, including on error paths; a successful mapping
-retains its descriptor until after unmap. Platform I/O, file guards, errno storage
+and descriptor cleanup after failed stat, header-read and map operations. File
+descriptors are owned immediately after open, including on error paths; a
+successful mapping retains its descriptor until after unmap. It also checks that
+only the length the loader asks for after reading the first 4 KiB is mapped, that
+a shorter file is read and mapped only to its end, and that an interrupted
+(`EINTR`) or short read of those 4 KiB is retried rather than failing the load.
+A scheme call can return `EINTR` with no signal handler involved: the kernel
+cancels a call whose context was woken, and the smoke image's last commands hit
+this at the end of every boot. The script builds the
+`object` crate for the host from relibc's own workspace and lockfile, so the
+harness also compiles `ld_so/image.rs` and checks which length an ELF object
+needs (`image::loaded_len`): on hand-built objects (segment contents, a note after
+the last load segment, a program header table that ends last, a segment past the
+end of the file, and headers the probe cannot parse, including `PN_XNUM`), and on
+the test binary itself, whose mapping must cover every segment and stop before
+its section headers. Platform I/O, file guards, errno storage
 and its message table use host adapters; this is not an end-to-end dynamic-link
 or guest-boot test.
 

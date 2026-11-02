@@ -170,6 +170,19 @@ keyboard and pointer input. This is a partial rendering observation, not a
 successful usability test or a measured performance result; the causes remain
 unresolved.
 
+With the default 2 GiB of `cargo xtask run`, the example then started only some
+of the time. Loading it and `cosmic-comp`, debug builds of 436 and 392 MiB,
+mapped both files whole, RedoxFS read and kept them
+([#373](https://github.com/rexlunae/ferric-oxide/issues/373)), and the guest
+ran out of memory, which panics the kernel
+([#372](https://github.com/rexlunae/ferric-oxide/issues/372)). `ld.so` now maps
+only the part of an object that loading reads, 18 and 26 MiB for these two (see
+[memory](./ferric-memory.md#loading-dynamic-objects)). On 1 November
+2026 that image, booted three times under KVM with four vCPUs and 2 GiB from a
+snapshot, panicked before the example appeared each time with main's `libc.so`.
+With only `libc.so` replaced by this loader, built with the same features, all
+three runs showed the example within 30 seconds and none panicked.
+
 The installed `orbital-wayland` script selects `COSMIC_BACKEND=winit`, starts `cosmic-comp`
 nested inside Orbital and then runs the libcosmic example. Mesa uses software
 rendering; the compositor recipe still records performance and keyboard-input
