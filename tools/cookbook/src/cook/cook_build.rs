@@ -638,14 +638,42 @@ fn native_sysroot_is_newer(stamp: Option<std::time::SystemTime>, packages: &[Pat
 // A native sysroot contains static relibc objects outside normal recipe deps.
 // Kernel/UEFI do not link them, and relibc itself creates the sysroot stamp.
 fn native_sysroot_modified(recipe_dir: &Path) -> Option<std::time::SystemTime> {
-    if matches!(
-        recipe_dir.file_name()?.to_str()?,
-        "relibc" | "kernel" | "bootloader"
-    ) {
+    if !links_native_sysroot(recipe_dir.file_name()?.to_str()?) {
         return None;
     }
     let stamp = std::env::var_os("FERRIC_NATIVE_SYSROOT_STAMP")?;
     fs::modified(Path::new(&stamp)).ok()
+}
+
+/// Whether the recipe `name` can link the native sysroot's objects: relibc makes
+/// them, and the kernels (Ferric Oxide's trace-mode one too) and the UEFI
+/// bootloader are freestanding.
+fn links_native_sysroot(name: &str) -> bool {
+    !matches!(name, "relibc" | "kernel" | "kernel-trace" | "bootloader")
+}
+
+/// Ferric Oxide: when the recipe last changed: the newest top-level file in its directory,
+/// so `recipe.toml` and anything its script reads from there (patches, lockfiles, a shared
+/// build script linked in) count. A symbolic link counts with the later of its own time and
+/// its target's, so pointing it at another, older file is a change too. Directories (the
+/// build's `source/` and `target/`) and the downloaded `source*` archives do not count.
+/// `None` when there is none to read.
+fn recipe_modified(recipe_dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::read_dir(recipe_dir)
+        .ok()?
+        .flatten()
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with("source"))
+        .filter_map(|entry| {
+            let target = std::fs::metadata(entry.path()).ok()?;
+            if !target.is_file() {
+                return None;
+            }
+            let link = std::fs::symlink_metadata(entry.path())
+                .ok()
+                .and_then(|link| link.modified().ok());
+            target.modified().ok().max(link)
+        })
+        .max()
 }
 
 fn build_is_source_newer(
@@ -667,7 +695,7 @@ fn build_is_source_newer(
         return false;
     };
     let mut recipe_is_newest = false;
-    if let Ok(recipe_modified) = fs::modified(&recipe_dir.join("recipe.toml"))
+    if let Some(recipe_modified) = recipe_modified(recipe_dir)
         && recipe_modified > source_modified
     {
         source_modified = recipe_modified;
@@ -1214,6 +1242,89 @@ mod tests {
                 "the shim passes no path for {fragment}: {script}"
             );
         }
+    }
+
+    #[test]
+    fn freestanding_recipes_ignore_the_native_sysroot() {
+        for name in ["relibc", "kernel", "kernel-trace", "bootloader"] {
+            assert!(!super::links_native_sysroot(name), "{name}");
+        }
+        for name in ["base", "kernel-tools", "ferric-trace"] {
+            assert!(super::links_native_sysroot(name), "{name}");
+        }
+    }
+
+    /// Sets a symbolic link's own modification time, not its target's.
+    fn touch_link(link: &std::path::Path, time: std::time::SystemTime) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let since = time.duration_since(std::time::UNIX_EPOCH).unwrap();
+        let spec = libc::timespec {
+            tv_sec: since.as_secs() as libc::time_t,
+            tv_nsec: since.subsec_nanos() as libc::c_long,
+        };
+        let times = [spec, spec];
+        let path = std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a NUL-terminated string and `times` two timespecs, both alive for
+        // the call; AT_SYMLINK_NOFOLLOW changes the link, not what it points at.
+        let status = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(status, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    /// Every file beside recipe.toml counts, through a symbolic link too, with the later of the
+    /// link's own time and its target's; directories and the downloaded source archive do not.
+    #[test]
+    fn a_recipe_changes_with_any_file_in_its_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let recipe = temp.path().join("recipe");
+        std::fs::create_dir(&recipe).unwrap();
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let at = |minutes: u64| base + std::time::Duration::from_secs(60 * minutes);
+        let touch = |path: &std::path::Path, time| {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(time))
+                .unwrap();
+        };
+        let toml = recipe.join("recipe.toml");
+        std::fs::write(&toml, "").unwrap();
+        touch(&toml, at(1));
+        assert_eq!(super::recipe_modified(&recipe), Some(at(1)));
+
+        // A link made before its target last changed: the target's time.
+        let shared = temp.path().join("build-shared.sh");
+        std::fs::write(&shared, "").unwrap();
+        touch(&shared, at(5));
+        let link = recipe.join("build-shared.sh");
+        std::os::unix::fs::symlink(&shared, &link).unwrap();
+        touch_link(&link, at(3));
+        assert_eq!(super::recipe_modified(&recipe), Some(at(5)));
+
+        // Pointed at another, older file later on: the link's own time.
+        let older = temp.path().join("older.sh");
+        std::fs::write(&older, "").unwrap();
+        touch(&older, at(2));
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&older, &link).unwrap();
+        touch_link(&link, at(7));
+        assert_eq!(super::recipe_modified(&recipe), Some(at(7)));
+
+        for name in ["source.tar", "source", "target"] {
+            let path = recipe.join(name);
+            if name == "source.tar" {
+                std::fs::write(&path, "").unwrap();
+            } else {
+                std::fs::create_dir(&path).unwrap();
+            }
+            touch(&path, at(9));
+        }
+        assert_eq!(super::recipe_modified(&recipe), Some(at(7)));
     }
 
     #[test]

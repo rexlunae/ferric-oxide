@@ -324,6 +324,35 @@ RUST_TARGET_PATH="$PWD/targets" RUSTDOCFLAGS="-D warnings" \
   -Z json-target-spec
 ```
 
+### Trace mode and the boot environment
+
+The [trace-mode kernel](ferric-tracing.md#trace-mode) and the
+[boot environment](ferric-tracing.md#setting-the-boot-environment) the bootloader
+builds are checked without booting:
+
+- `cargo test -p ferric-abi` covers `boot_env`: line classification, the
+  first-assignment rule, `FERRIC_KERNEL` and `FERRIC_BOOT_RESOLUTION` values,
+  and the preset buffer the bootloader merges fw_cfg lines into and the menu's
+  `t` key edits (merging, replacing, a full buffer left unchanged).
+- `cargo test -p ferric-fwcfg` runs the fw_cfg protocol against a fake device:
+  a byte fixture of a big-endian file directory, finding and reading the
+  harness's file, another device's signature, a file over the buffer, and a
+  directory count past the limit.
+- `cargo test -p ferric-config` checks `FERRIC_TRACE_KERNEL_FEATURES` (the
+  normal kernel untouched, `profiling` dropped, a traced image kernel's choices
+  kept, every feature declared in `crates/kernel/Cargo.toml`), the
+  `kernel-trace` package and flag exclusion, the rebuild fingerprints and
+  `fw_cfg_env` in `FERRIC_BOOTLOADER_FEATURES`.
+- host-tools builds the UEFI bootloader without and with
+  `kaslr fw_cfg_env`, and kernel-lints' `trace-mode` job builds the trace-mode
+  kernel from a generated configuration and checks it carries its
+  `trace: trace-mode kernel` line while the normal kernel's features have no
+  tracing.
+
+Loading the trace-mode kernel, the `t` key, the fw_cfg path under QEMU and
+user space's behaviour without the trace scheme need an image with
+`kernel.trace_mode` and a boot.
+
 ### x86-64 signal state
 
 `ferric-xstate-test` runs only when CPUID and XCR0 permit AVX-512. The controlled

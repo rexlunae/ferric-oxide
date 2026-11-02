@@ -1,0 +1,13 @@
+[package]
+name = "ferric-fwcfg"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Reads QEMU's firmware configuration device (fw_cfg) through a caller-supplied port interface; no_std"
+publish = false
+
+[dependencies]
+# Not inherited from the host workspace: the bootloader builds this crate through a symlink
+# outside that workspace, where `workspace = true` cannot be resolved. Keep the version in step
+# with the root Cargo.toml's [workspace.dependencies].
+simple_endian = { version = "0.4.11", default-features = false, features = ["derive", "integer_impls", "big_endian", "byte_impls", "io-core"] }

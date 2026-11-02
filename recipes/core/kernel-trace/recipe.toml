@@ -1,0 +1,21 @@
+# Ferric Oxide: the trace-mode kernel (kernel.trace_mode), installed as
+# usr/lib/boot/kernel-trace beside the image's normal kernel. The bootloader loads
+# it for FERRIC_KERNEL=trace in the boot environment or 't' in its resolution
+# menu; see docs/src/ferric-tracing.md.
+[source]
+# The kernel's source, built by its own copy with other features.
+path = "crates/kernel"
+
+[build]
+template = "custom"
+script = """
+source "${COOKBOOK_RECIPE}/build-kernel.sh"
+# ferric-config exports the image kernel's features plus tracing when
+# kernel.trace_mode is on, and leaves the variable unset otherwise.
+if [ -z "${FERRIC_TRACE_KERNEL_FEATURES}" ]
+then
+    echo "kernel-trace: FERRIC_TRACE_KERNEL_FEATURES is unset; turn on kernel.trace_mode in ferric.toml" >&2
+    exit 1
+fi
+ferric_kernel_build kernel-trace "${FERRIC_TRACE_KERNEL_FEATURES}"
+"""

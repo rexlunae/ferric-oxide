@@ -13,7 +13,7 @@
 //!   are copied with atomic loads, and a torn one is rejected by the reader.
 //!
 //! With `kernel.trace_crash_test`, writing `panic` to the scheme's `crash` file calls
-//! [`test_panic`], after which the panic handler resets the machine instead of halting, so CI
+//! `test_panic`, after which the panic handler resets the machine instead of halting, so CI
 //! can read the dump back on the next boot.
 
 use alloc::{sync::Arc, vec::Vec};
@@ -43,7 +43,7 @@ static SAVED: Once<Arc<[u8]>> = Once::new();
 /// Set by the first panic to dump, so a panic during the dump does not start another.
 static DUMPING: AtomicBool = AtomicBool::new(false);
 
-/// Set by [`test_panic`]: reset the machine once the dump is written.
+/// Set by `test_panic` (`trace_crash_test`): reset the machine once the dump is written.
 static RESET: AtomicBool = AtomicBool::new(false);
 
 /// The region's physical address: `trace.crash_base` (the build script checked it is a
@@ -153,7 +153,7 @@ pub fn dump(info: &PanicInfo) {
 }
 
 /// Whether the panic handler should reset the machine after the dump, as it does after
-/// [`test_panic`].
+/// `test_panic` (`trace_crash_test`).
 pub fn reset_after_panic() -> bool {
     RESET.load(Ordering::Acquire)
 }

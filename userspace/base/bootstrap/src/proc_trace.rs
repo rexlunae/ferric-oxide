@@ -6,7 +6,8 @@
 //! and the kernel stamps and stores it like its own records. The events are part of the
 //! `sched` subsystem, so they exist only in a kernel built with `kernel.trace_sched`; the
 //! first write to any other kernel fails with `EOPNOTSUPP` and procmgr stops writing. A
-//! kernel without `kernel.trace` has no trace scheme, and nothing is opened.
+//! kernel without `kernel.trace` has no trace scheme: nothing is opened, and recording an
+//! event makes no system call.
 //!
 //! A write for an event that is off costs one system call and stores nothing. Tracing never
 //! makes a process manager call fail: errors are logged and the records dropped.

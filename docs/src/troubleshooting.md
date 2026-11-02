@@ -500,7 +500,7 @@ They accept the following values:
 - `DEBUG` value: Detailed event monitoring to show how the service is being used.
 - `TRACE` value: Very verbose information which is only useful when debugging.
 
-Once you determine what you need press the `E` key to open the boot environment editor and add in the last lines and boot, for example:
+Once you determine what you need press the `E` key to open the boot environment editor and add in the last lines and boot (on a boot without a display, where there is no menu or editor, a bootloader built with `bootloader.fw_cfg_env` takes the same lines from QEMU instead; see [Setting the boot environment](./ferric-tracing.md#setting-the-boot-environment)), for example:
 
 ```
 default environment variables here
