@@ -21,7 +21,7 @@
 //! | `clock` | the trace clock, from the directory |
 //! | `cpu<n>` | CPU n's records, appended as they are read |
 //! | `stats.start` | per CPU, the words in the ring when following began and the records the kernel had dropped by then (`lost_before`) |
-//! | `stats.end` | per CPU, the words left unread and `lost_before` plus the follower's own losses |
+//! | `stats.end` | per CPU, the words left unread and the records lost: before following began (the larger of the kernel's count and the records in the words the first copy skipped, which include records a guest reader consumed before the kernel overwrote them) plus the follower's own losses |
 //! | [`HOST_CLOCK`] | samples tying host time to trace time, [`ClockSampleLine`]s |
 //!
 //! The rings overwrite their oldest records, so the kernel never waits: a follower that falls
@@ -135,8 +135,15 @@ pub struct CpuSummary {
     pub bytes: u64,
     /// The records saved.
     pub records: u64,
-    /// The records the kernel had dropped or overwritten before following began.
+    /// The records lost before following began: the larger of the kernel's count (records it
+    /// dropped, or overwrote before any reader took them) and the records estimated in
+    /// [`CpuSummary::lost_words_before`], which also holds records a guest reader consumed
+    /// before they were overwritten, which the kernel does not count. The kernel's records are
+    /// among those, so the two are not added.
     pub lost_before: u64,
+    /// The words the first copy skipped: everything the kernel had overwritten before
+    /// following began, whether a guest reader had consumed it or not.
+    pub lost_words_before: u64,
     /// The words the follower skipped because the kernel overwrote them first.
     pub lost_words: u64,
     /// The times it had to skip.
@@ -403,17 +410,29 @@ struct CpuState<'a> {
 }
 
 impl CpuState<'_> {
-    /// The estimated records lost while following.
-    fn lost_records(&self) -> u64 {
-        let words = u128::from(self.summary.lost_words);
+    /// The records `words` skipped words held, estimated from the mean length of the records
+    /// read (at least one when any word was skipped).
+    fn records_in(&self, words: u64) -> u64 {
+        let words = u128::from(words);
         let estimate = if self.summary.records == 0 || self.words == 0 {
             words.div_ceil(MAX_RECORD_WORDS as u128)
         } else {
             (words * u128::from(self.summary.records)).div_ceil(u128::from(self.words))
         };
-        u64::try_from(estimate)
-            .unwrap_or(u64::MAX)
+        u64::try_from(estimate).unwrap_or(u64::MAX)
+    }
+
+    /// The estimated records lost while following.
+    fn lost_records(&self) -> u64 {
+        self.records_in(self.summary.lost_words)
             .max(self.summary.skips)
+    }
+
+    /// The records lost before following began; see [`CpuSummary::lost_before`].
+    fn lost_before(&self) -> u64 {
+        self.summary
+            .lost_before
+            .max(self.records_in(self.summary.lost_words_before))
     }
 }
 
@@ -544,6 +563,8 @@ impl<'a> Follower<'a> {
             if state.started {
                 state.summary.lost_words += copy.skipped();
                 state.summary.skips += u64::from(copy.skipped() > 0);
+            } else {
+                state.summary.lost_words_before = copy.skipped();
             }
             state.started = true;
             let bytes = self.buf.get(..copy.len()).unwrap_or_default();
@@ -609,6 +630,7 @@ impl<'a> Follower<'a> {
         let mut cpus = Vec::with_capacity(self.cpus.len());
         for state in &mut self.cpus {
             state.summary.lost_records = state.lost_records();
+            state.summary.lost_before = state.lost_before();
             let pending = state.observer.head().saturating_sub(state.pos);
             end.push_str(
                 &StatsLine {
@@ -991,6 +1013,48 @@ mod tests {
             "{records} records of {in_ring} words"
         );
         assert_eq!(stats(&out.join(STATS_END))[0].pending, 0);
+    }
+
+    /// Records a guest reader consumed and the kernel then overwrote, all before following
+    /// began, are not in the kernel's `lost`; the follower still counts them as lost.
+    #[test]
+    fn records_consumed_and_overwritten_before_following_count_as_lost() {
+        let mut guest = Guest::new(RamLayout::q35(8 * MIB), 3 * MIB, 1, 4);
+        let mut drained = vec![0u8; 8192];
+        let mut pushed = Vec::new();
+        // Each round fits in the ring and is drained before the next, so the kernel never
+        // overwrites a record nobody read: its `lost` stays 0.
+        for _ in 0..4 {
+            pushed.extend(pairs(&mut guest, 0, 20));
+            while guest.rings[0].read(&mut drained).expect("fits") > 0 {}
+        }
+        assert_eq!(guest.rings[0].lost(), 0);
+        guest.sync();
+        let out_dir = tempfile::tempdir().expect("a directory");
+        let out = out_dir.path().join("trace");
+        let ram = guest.map();
+        let (phys, directory) = find_directory(&ram, Some(3 * MIB))
+            .expect("reads")
+            .expect("finds the directory");
+        create_output(&out).expect("created");
+        let follower = Follower::start(&ram, phys, &directory, &out).expect("starts");
+        let summary = follower.finish(StopReason::Duration).expect("finishes");
+
+        let kept = captured(&out)[&0].len();
+        let lost = (pushed.len() - kept) as u64;
+        let cpu = summary.cpus[0];
+        assert!(cpu.lost_words_before > 0);
+        assert!(
+            cpu.lost_before.abs_diff(lost) <= 1,
+            "estimated {} for {lost}",
+            cpu.lost_before
+        );
+        assert_eq!(
+            stats(&out.join(STATS_START))[0].lost,
+            0,
+            "the kernel's own count"
+        );
+        assert_eq!(stats(&out.join(STATS_END))[0].lost, cpu.lost_before);
     }
 
     #[test]
