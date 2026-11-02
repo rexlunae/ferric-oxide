@@ -98,6 +98,19 @@ allocator, before application processors start. It uses the final physical-map
 address. Mapping it during early serial setup would attempt to insert a 4 KiB
 mapping into the bootloader's huge-page mapping, before the allocator is ready.
 
+Kernel console output (`/scheme/debug`, which `logd` writes every finished log
+line to before it replies) goes to these UARTs one byte at a time. Each access
+to an emulated UART is a VM exit under KVM, so the 16550 driver avoids reading
+the line status before every byte where it can. A port-I/O COM port whose
+interrupt identification register reports working FIFOs (bits 6 and 7, a 16550A)
+takes 16 bytes each time it reports its transmitter empty. Memory-mapped UARTs
+(LPSS, `snps,dw-apb-uart`), whose FIFO depth those bits do not give, and ports
+without working FIFOs still wait before every byte (`devices/uart_tx.rs`, tested
+in `crates/kernel/tests`). Under KVM on a 4-vCPU guest this cut the median time
+of a 70-byte log line from 905 µs to 618 µs
+([#379](https://github.com/rexlunae/ferric-oxide/pull/379)). The remaining cost
+is one exit per byte written.
+
 ## Schemes, descriptors and services
 
 A scheme is a named service accessed through file descriptors. Scheme-rooted

@@ -45,6 +45,10 @@ mod records;
 mod spin_wait;
 #[path = "../src/memory/tlb.rs"]
 mod tlb;
+#[path = "../src/devices/uart_tx.rs"]
+mod uart_tx;
+#[cfg(test)]
+mod uart_tx_tests;
 
 #[cfg(test)]
 mod tlb_ack;
