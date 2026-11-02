@@ -496,9 +496,15 @@ fn read_secret() -> Result<String, Error> {
 
 /// Turns a terminal's echo off for as long as it lives, and back to what it was on drop. Does
 /// nothing when standard input is not a terminal.
+///
+/// A signal that would end the process while echo is off (SIGINT from Ctrl+C, SIGTERM,
+/// SIGHUP) would skip the drop and leave the terminal without echo, so while it lives a
+/// thread waits for them, restores the terminal, and then ends the process the way the signal
+/// would have ([`signal_hook::low_level::emulate_default_handler`]).
 struct NoEcho<'a> {
     stdin: &'a std::io::Stdin,
     saved: Option<rustix::termios::Termios>,
+    signals: Option<(signal_hook::iterator::Handle, thread::JoinHandle<()>)>,
 }
 
 impl<'a> NoEcho<'a> {
@@ -512,7 +518,12 @@ impl<'a> NoEcho<'a> {
                 quiet.local_modes.remove(LocalModes::ECHO);
                 tcsetattr(stdin, OptionalActions::Now, &quiet).is_ok()
             });
-        Self { stdin, saved }
+        let signals = saved.clone().and_then(restore_on_signal);
+        Self {
+            stdin,
+            saved,
+            signals,
+        }
     }
 
     /// Whether echo was turned off (standard input is a terminal that allowed it).
@@ -521,8 +532,44 @@ impl<'a> NoEcho<'a> {
     }
 }
 
+/// Starts the thread that restores `saved` and then ends the process when SIGINT, SIGTERM or
+/// SIGHUP arrives; `None` when the signals cannot be caught (echo still comes back on drop).
+fn restore_on_signal(
+    saved: rustix::termios::Termios,
+) -> Option<(signal_hook::iterator::Handle, thread::JoinHandle<()>)> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP]).ok()?;
+    let handle = signals.handle();
+    let thread = thread::Builder::new()
+        .name("secret-signals".to_owned())
+        .spawn(move || {
+            if let Some(signal) = signals.forever().next() {
+                // Best effort: the process is about to end either way.
+                if let Err(err) = rustix::termios::tcsetattr(
+                    std::io::stdin(),
+                    rustix::termios::OptionalActions::Now,
+                    &saved,
+                ) {
+                    eprintln!("ferric-harness: restoring the terminal's echo: {err}");
+                }
+                if let Err(err) = signal_hook::low_level::emulate_default_handler(signal) {
+                    eprintln!("ferric-harness: ending on signal {signal}: {err}");
+                    std::process::exit(128 + signal);
+                }
+            }
+        })
+        .ok()?;
+    Some((handle, thread))
+}
+
 impl Drop for NoEcho<'_> {
     fn drop(&mut self) {
+        if let Some((handle, thread)) = self.signals.take() {
+            handle.close();
+            if thread.join().is_err() {
+                eprintln!("ferric-harness: the secret's signal thread panicked");
+            }
+        }
         if let Some(saved) = &self.saved
             && let Err(err) =
                 rustix::termios::tcsetattr(self.stdin, rustix::termios::OptionalActions::Now, saved)
