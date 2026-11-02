@@ -674,22 +674,52 @@ fn powerdown_ignored_then_quit() {
     assert_eq!(report.ending.powerdown_wait_s, Some(0.5));
 }
 
+/// Writes an executable shell script standing in for `ferric-trace`.
+fn fake_ferric_trace(fixture: &Fixture, name: &str, body: &str) -> PathBuf {
+    let path = fixture.path(name);
+    fs::write(&path, format!("#!/bin/sh\necho \"$@\"\n{body}\n")).expect("script");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+    path
+}
+
+/// A `ferric-trace follow` that writes its capture directory (`--out`, the 9th argument)
+/// as the real one does: `INCOMPLETE` until SIGINT, then `stats.end`.
+const WHOLE_FOLLOW: &str = "out=$9\nmkdir -p \"$out\"\n: > \"$out/INCOMPLETE\"\n\
+    trap 'echo flushed; : > \"$out/stats.end\"; rm -f \"$out/INCOMPLETE\"; exit 0' INT TERM\n\
+    while :; do sleep 0.05; done";
+
+const TRACE_KERNEL: &str = "kernel::trace::imp:INFO -- trace: trace-mode kernel\r\n";
+const HOST_RINGS: &str =
+    "kernel::trace::imp:INFO -- trace: host rings at phys 0x7a000000, 4 CPUs x 4096 KiB\r\n";
+
+/// A trace-mode run of `script` with `follow` as its `ferric-trace`, brought down once
+/// `until` is on the console; returns its report.
+fn trace_run(
+    fixture: &Fixture,
+    name: &str,
+    follow: PathBuf,
+    script: &Value,
+    until: &str,
+) -> Report {
+    let mut config = fixture.config(name, script);
+    config.display = Display::None;
+    config.mode = Mode::Trace;
+    config.ferric_trace = Some(follow);
+    let session = Running::launch(config);
+    session
+        .expect(until, &Since::Start, Duration::from_secs(20))
+        .expect("console line");
+    session.down(Some(Duration::from_millis(300)));
+    Report::load(session.run().root()).expect("report")
+}
+
 #[test]
 fn trace_mode_starts_follow_and_cleans_up() {
     let fixture = Fixture::new();
-    let follow = fixture.path("ferric-trace");
-    fs::write(
-        &follow,
-        "#!/bin/sh\necho \"$@\"\ntrap 'echo flushed; exit 0' INT TERM\nwhile :; do sleep 0.05; done\n",
-    )
-    .expect("script");
-    fs::set_permissions(&follow, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let follow = fake_ferric_trace(&fixture, "ferric-trace", WHOLE_FOLLOW);
     let script = json!({
         "args_log": fixture.path("args.txt"),
-        "serial": [
-            {"text": "kernel::trace::imp:INFO -- trace: trace-mode kernel\r\n"},
-            {"text": "kernel::trace::imp:INFO -- trace: host rings at phys 0x7a000000, 4 CPUs x 4096 KiB\r\n"}
-        ]
+        "serial": [{"text": TRACE_KERNEL}, {"text": HOST_RINGS}]
     });
     let name = format!("trace-{}", std::process::id());
     let mut config = fixture.config(&name, &script);
@@ -721,6 +751,16 @@ fn trace_mode_starts_follow_and_cleans_up() {
     session.down(Some(Duration::from_millis(300)));
     let report = Report::load(session.run().root()).expect("report");
     assert_eq!(check(&report, "mode").status, CheckStatus::Pass);
+    assert_eq!(
+        check(&report, "trace").detail,
+        "host rings at 0x7a000000, 4 CPUs x 4096 KiB; 2 complete capture(s)"
+    );
+    assert_eq!(
+        report.verdict.result,
+        Outcome::Pass,
+        "{:#?}",
+        report.verdict
+    );
     let trace = report.trace.expect("trace info");
     assert_eq!(trace.host_rings.map(|r| r.phys), Some(0x7a00_0000));
     assert_eq!(trace.captures.len(), 2);
@@ -728,7 +768,8 @@ fn trace_mode_starts_follow_and_cleans_up() {
         trace
             .captures
             .iter()
-            .all(|c| c.exit.as_ref().is_some_and(|e| e.code == Some(0)))
+            .all(|c| c.exit.as_ref().is_some_and(|e| e.code == Some(0))
+                && c.files.is_some_and(|f| f.complete()))
     );
     assert!(!shm.exists(), "the RAM file is removed");
     let follow_log = fs::read_to_string(&log).expect("log");
@@ -746,6 +787,70 @@ fn trace_mode_starts_follow_and_cleans_up() {
     let args = fs::read_to_string(fixture.path("args.txt")).expect("args");
     assert!(args.contains("name=opt/org.ferric-oxide/boot-env,file="));
     assert!(args.contains(&format!("mem-path={},size=2048M,share=on", shm.display())));
+}
+
+/// A trace run passes only with a whole capture: not when the kernel announces no rings
+/// (it refused the ring size), not when `follow` fails, and not when it cannot start.
+#[test]
+fn trace_mode_fails_without_a_whole_capture() {
+    let fixture = Fixture::new();
+    let whole = fake_ferric_trace(&fixture, "ferric-trace", WHOLE_FOLLOW);
+    let no_rings = json!({
+        "serial": [{"text": TRACE_KERNEL}, {"text": "kernel::a:INFO -- booted\r\n"}],
+        "on_powerdown": "exit"
+    });
+    let report = trace_run(&fixture, "no-rings", whole, &no_rings, "booted");
+    assert_eq!(check(&report, "mode").status, CheckStatus::Pass);
+    let trace = check(&report, "trace");
+    assert_eq!(trace.status, CheckStatus::Fail);
+    assert!(trace.detail.contains("never announced its host rings"));
+    assert_eq!(report.verdict.result, Outcome::Fail);
+
+    let rings = json!({
+        "serial": [{"text": TRACE_KERNEL}, {"text": HOST_RINGS}],
+        "on_powerdown": "exit"
+    });
+    // `follow` gives up at once and leaves its capture marked INCOMPLETE.
+    let broken = fake_ferric_trace(
+        &fixture,
+        "ferric-trace-broken",
+        "mkdir -p \"$9\"\n: > \"$9/INCOMPLETE\"\nexit 3",
+    );
+    let report = trace_run(&fixture, "broken", broken, &rings, "host rings");
+    let trace = check(&report, "trace");
+    assert_eq!(trace.status, CheckStatus::Fail);
+    assert!(
+        trace
+            .detail
+            .ends_with("trace: follow exited with 3, the capture is marked INCOMPLETE, the capture has no stats.end"),
+        "{}",
+        trace.detail
+    );
+    assert_eq!(report.verdict.result, Outcome::Fail);
+
+    // The program is there but cannot run: the start fails, and so does the check.
+    let gone = fake_ferric_trace(&fixture, "ferric-trace-gone", WHOLE_FOLLOW);
+    let mut config = fixture.config("gone", &rings);
+    config.display = Display::None;
+    config.mode = Mode::Trace;
+    config.ferric_trace = Some(gone.clone());
+    fs::set_permissions(&gone, fs::Permissions::from_mode(0o644)).expect("chmod");
+    let session = Running::launch(config);
+    session
+        .expect("host rings", &Since::Start, Duration::from_secs(20))
+        .expect("rings");
+    session.down(Some(Duration::from_millis(300)));
+    let report = Report::load(session.run().root()).expect("report");
+    let trace = check(&report, "trace");
+    assert_eq!(trace.status, CheckStatus::Fail);
+    assert!(
+        trace
+            .detail
+            .starts_with("ferric-trace follow could not start: "),
+        "{}",
+        trace.detail
+    );
+    assert_eq!(report.trace.expect("trace info").start_failures.len(), 1);
 }
 
 #[test]

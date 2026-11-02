@@ -48,7 +48,7 @@ use crate::rundir::{self, RunDir};
 use crate::screen::{self, Image, PredicateState, ScreenPredicate, TextScreen};
 use crate::serial::{Eol, ExpectFailure, ExpectMatch, Line, SerialConsole, SerialCounts};
 use crate::stats::{self, Sample, VcpuThread};
-use crate::trace::{self, Follow};
+use crate::trace::{self, CaptureFiles, Follow};
 use crate::verdict::{self, Ending, Expectations, Outcome, StopReason};
 
 /// How long the harness waits for QEMU's sockets to appear.
@@ -224,6 +224,8 @@ struct State {
     smoke_dead_deadline: Option<Instant>,
     follow: Option<Follow>,
     captures: Vec<Capture>,
+    /// Why starting `follow` automatically failed, each time it did.
+    follow_start_failures: Vec<String>,
     shots: u32,
     scenario: Option<ScenarioReport>,
     report: Option<Report>,
@@ -989,10 +991,10 @@ impl Inner {
         if let Some(rings) = start_rings
             && let Err(e) = self.start_follow(Some(rings))
         {
-            self.log(&format!(
-                "cannot start ferric-trace follow: {}",
-                crate::error::chain(&e)
-            ));
+            // The verdict's trace check fails on it; the run itself goes on.
+            let why = crate::error::chain(&e);
+            self.log(&format!("cannot start ferric-trace follow: {why}"));
+            self.state().follow_start_failures.push(why);
         }
     }
 
@@ -1240,12 +1242,15 @@ impl Inner {
             dir: dir.clone(),
             started_ms: round_ms(Stamp::now().ms_since(self.origin)),
             exit: None,
+            files: None,
         });
         state.follow = Some(follow);
         Ok(TraceStatus { dir, exit: None })
     }
 
+    /// Records how the `follow` writing `dir` ended, and whether it left its capture whole.
     fn record_follow_exit(&self, dir: &Path, exit: trace::FollowExit) {
+        let files = CaptureFiles::read(dir);
         if let Some(capture) = self
             .state()
             .captures
@@ -1254,6 +1259,7 @@ impl Inner {
             .find(|c| c.dir == dir)
         {
             capture.exit = Some(exit);
+            capture.files = Some(files);
         }
     }
 
@@ -1387,21 +1393,24 @@ impl Inner {
             timeout_s: self.config.timeout_s,
         };
         let scenario_summary = state.scenario.as_ref().map(|s| s.summary.clone());
+        let trace = (self.config.mode == Mode::Trace).then(|| TraceInfo {
+            host_rings: facts.host_rings,
+            guest_ram: self.plan.shm.clone(),
+            captures: state.captures.clone(),
+            start_failures: state.follow_start_failures.clone(),
+        });
         let verdict = verdict::judge(
             Expectations {
                 mode: self.config.mode,
                 smoke: self.config.smoke,
                 reboot: self.config.reboot,
+                trace_autostart: self.config.trace_autostart,
             },
             &facts,
             &ending,
+            trace.as_ref(),
             scenario_summary.as_ref(),
         );
-        let trace = (self.config.mode == Mode::Trace).then(|| TraceInfo {
-            host_rings: facts.host_rings,
-            guest_ram: self.plan.shm.clone(),
-            captures: state.captures.clone(),
-        });
         Report {
             schema: SCHEMA,
             run: RunInfo {

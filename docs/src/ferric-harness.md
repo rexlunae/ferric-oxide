@@ -213,8 +213,9 @@ The report (`schema` 1) has these fields:
 - `verdict`: the result and each check with its status (`pass`, `fail`, `warn`
   or `skip`) and detail. The checks are `stop` (how the run ended), `exit`
   (QEMU's exit status), `crash`, `tests` (no `FERRIC_TEST_FAIL`), `smoke` (with
-  `--smoke`), `mode`, `shutdown` (the SHUTDOWN event's reason) and `scenario`.
-  A warning does not fail the run. The crash, loader and smoke rules are those
+  `--smoke`), `mode`, `trace` (see [Modes](#modes); `skip` in normal mode),
+  `shutdown` (the SHUTDOWN event's reason) and `scenario`. A warning does not
+  fail the run. The crash, loader and smoke rules are those
   of `boot-smoke.sh`, and its self-test cases are ported to the harness's
   tests.
 - `ending`: why and when the run stopped, QEMU's exit status, and how long
@@ -231,8 +232,10 @@ The report (`schema` 1) has these fields:
   thread CPU time (user and system) with KVM's per-vCPU counters (exits, halt
   exits, I/O and MMIO exits, interrupt injections and so on), the VM-wide
   counters, and the CPU time of every other QEMU thread.
-- `trace`: the host-ring announcement and each capture with the exit status of
-  `follow` (trace mode only).
+- `trace`: the host-ring announcement, each capture with the exit status of
+  `follow` and whether its directory was whole (`files`: an `INCOMPLETE`
+  marker, a `stats.end`), and why an automatic start of `follow` failed
+  (`start_failures`), in trace mode only.
 - `scenario`: each step with its start time, duration and detail (scenario runs
   only).
 
@@ -259,6 +262,16 @@ binary, and `--mode` chooses between the two kernels:
   it flushes, and then removes the RAM file. Before booting, the harness checks
   that `ferric-trace` has a `follow` subcommand
   (`ferric-trace follow --help`); a missing binary or subcommand is an error.
+
+  The `trace` check fails a trace run without a usable trace. The kernel must
+  have announced its host rings; it does not when it refused the ring size or
+  could not allocate the rings. With automatic start (the default), `follow`
+  must have started (a failure to start it is logged and fails the check),
+  and every capture must be whole: `follow` exited with 0 after SIGINT, without
+  being killed, and its directory has `stats.end` and no `INCOMPLETE` marker.
+  With `--no-trace-autostart` the announcement is enough, but a capture started
+  with `trace start` is held to the same rule. The detail names what is
+  missing.
 
 ## Boot environment
 

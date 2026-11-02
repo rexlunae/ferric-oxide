@@ -13,6 +13,9 @@
 //! stops it after QEMU has exited, so the last records are kept, and removes the RAM file
 //! afterwards.
 //!
+//! When `follow` has stopped, [`CaptureFiles::read`] notes whether its capture directory is
+//! whole (no `INCOMPLETE` marker, a `stats.end`), for the verdict's `trace` check.
+//!
 //! The `ferric-trace` binary is found with `--ferric-trace`, on `PATH`, or as
 //! `target/<profile>/ferric-trace` in the checkout (the newest). It is only needed in trace
 //! mode.
@@ -25,6 +28,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ferric_trace::capture;
 use rustix::process::{Pid, Signal, kill_process};
 use serde::{Deserialize, Serialize};
 
@@ -127,6 +131,30 @@ pub struct FollowExit {
     pub code: Option<i32>,
     /// It ignored SIGINT and was killed.
     pub killed: bool,
+}
+
+/// What a capture directory held once `follow` had stopped: whether it is whole.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureFiles {
+    /// The `INCOMPLETE` marker is still there: `follow` failed or was killed.
+    pub incomplete: bool,
+    /// `stats.end` was written, which `follow` does only when it reaches its end.
+    pub stats_end: bool,
+}
+
+impl CaptureFiles {
+    /// Looks at the capture directory `dir` (a missing directory has neither file).
+    pub fn read(dir: &Path) -> Self {
+        Self {
+            incomplete: dir.join(capture::INCOMPLETE).exists(),
+            stats_end: dir.join(capture::STATS_END).is_file(),
+        }
+    }
+
+    /// Whether the capture is whole: no `INCOMPLETE` marker, and a `stats.end`.
+    pub fn complete(self) -> bool {
+        !self.incomplete && self.stats_end
+    }
 }
 
 /// A running `ferric-trace follow`.
@@ -246,6 +274,20 @@ mod tests {
                 "--live"
             ]
         );
+    }
+
+    #[test]
+    fn capture_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("trace");
+        assert_eq!(CaptureFiles::read(&dir), CaptureFiles::default());
+        fs::create_dir(&dir).expect("mkdir");
+        fs::write(dir.join("INCOMPLETE"), "").expect("write");
+        let partial = CaptureFiles::read(&dir);
+        assert!(partial.incomplete && !partial.stats_end && !partial.complete());
+        fs::write(dir.join("stats.end"), "").expect("write");
+        fs::remove_file(dir.join("INCOMPLETE")).expect("remove");
+        assert!(CaptureFiles::read(&dir).complete());
     }
 
     #[test]

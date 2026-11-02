@@ -123,7 +123,7 @@ enum DecodeMode {
 
 /// The file `ferric-trace capture` writes into a capture directory before draining and removes
 /// once the capture is complete.
-pub const INCOMPLETE: &str = "INCOMPLETE";
+pub const INCOMPLETE: &str = ferric_trace::capture::INCOMPLETE;
 
 /// The file in a capture directory that holds the kernel's clock line, as `ferric-trace
 /// capture` copied it from the scheme's [`CLOCK_PATH`](ferric_trace::abi::CLOCK_PATH).

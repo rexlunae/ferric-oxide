@@ -8,11 +8,21 @@
 //! The mode check is what makes the trace mode a separate kernel: in [`Mode::Normal`] the run
 //! fails if any kernel line starts with `trace:` (a kernel built without `trace` prints
 //! none); in [`Mode::Trace`] it fails unless the kernel said `trace: trace-mode kernel`.
+//!
+//! The trace check is what makes a trace run worth its trace. In [`Mode::Trace`] it fails
+//! unless the kernel announced its host rings (`trace: host rings at phys ...`); with
+//! automatic start (the default) it also fails unless `ferric-trace follow` started, and
+//! every capture must have ended whole: `follow` exited with 0 on its own after SIGINT, and
+//! its directory has `stats.end` and no `INCOMPLETE` marker. Without automatic start a run
+//! needs no capture, but one started by hand is held to the same rule. The capture's state
+//! comes in as data ([`TraceInfo`]); the session reads the files, not this module.
 
 use serde::{Deserialize, Serialize};
 
 use crate::machine::Mode;
 use crate::observe::Facts;
+use crate::report::{Capture, TraceInfo};
+use crate::trace::FollowExit;
 
 /// A check's result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,13 +131,18 @@ pub struct Expectations {
     pub smoke: bool,
     /// Whether the guest may reset (QEMU without `-no-reboot`).
     pub reboot: bool,
+    /// Whether `ferric-trace follow` starts by itself when the rings are announced (trace
+    /// mode).
+    pub trace_autostart: bool,
 }
 
-/// Judges a run.
+/// Judges a run: `trace` is what the harness recorded of host tracing (`None` when it
+/// recorded nothing, as in normal mode).
 pub fn judge(
     expect: Expectations,
     facts: &Facts,
     ending: &Ending,
+    trace: Option<&TraceInfo>,
     scenario: Option<&ScenarioSummary>,
 ) -> Verdict {
     let mut checks = vec![
@@ -137,6 +152,7 @@ pub fn judge(
         tests_check(facts),
         smoke_check(expect, facts),
         mode_check(expect.mode, facts),
+        trace_check(expect, facts, trace),
         shutdown_check(expect.reboot, ending),
     ];
     if let Some(summary) = scenario {
@@ -282,6 +298,83 @@ fn mode_check(mode: Mode, facts: &Facts) -> Check {
     }
 }
 
+fn trace_check(expect: Expectations, facts: &Facts, trace: Option<&TraceInfo>) -> Check {
+    use CheckStatus::{Fail, Pass, Skip};
+    if expect.mode != Mode::Trace {
+        return check("trace", Skip, "normal mode");
+    }
+    let Some(rings) = facts.host_rings else {
+        return check(
+            "trace",
+            Fail,
+            "the kernel never announced its host rings (trace: host rings at phys ...)",
+        );
+    };
+    let (start_failures, captures) = trace.map_or((&[][..], &[][..]), |t| {
+        (&t.start_failures[..], &t.captures[..])
+    });
+    let mut problems: Vec<String> = start_failures
+        .iter()
+        .map(|why| format!("ferric-trace follow could not start: {why}"))
+        .collect();
+    if expect.trace_autostart && start_failures.is_empty() && captures.is_empty() {
+        problems.push("ferric-trace follow never started".to_owned());
+    }
+    problems.extend(captures.iter().filter_map(capture_problems));
+    if !problems.is_empty() {
+        return check("trace", Fail, problems.join("; "));
+    }
+    let announced = format!(
+        "host rings at {:#x}, {} CPUs x {} KiB",
+        rings.phys, rings.cpus, rings.kib
+    );
+    match captures.len() {
+        0 => check(
+            "trace",
+            Pass,
+            format!("{announced}; no capture (automatic start off)"),
+        ),
+        n => check(
+            "trace",
+            Pass,
+            format!("{announced}; {n} complete capture(s)"),
+        ),
+    }
+}
+
+/// What is wrong with one capture, if anything: how `follow` ended and what its directory
+/// lacks.
+fn capture_problems(capture: &Capture) -> Option<String> {
+    let mut problems = Vec::new();
+    match &capture.exit {
+        None => problems.push("follow had not stopped".to_owned()),
+        Some(FollowExit { killed: true, .. }) => {
+            problems.push("follow ignored SIGINT and was killed".to_owned());
+        }
+        Some(FollowExit { code: Some(0), .. }) => {}
+        Some(FollowExit {
+            code: Some(code), ..
+        }) => {
+            problems.push(format!("follow exited with {code}"));
+        }
+        Some(FollowExit { code: None, .. }) => {
+            problems.push("follow was killed by a signal".to_owned());
+        }
+    }
+    match capture.files {
+        None => problems.push("the capture was not checked".to_owned()),
+        Some(files) => {
+            if files.incomplete {
+                problems.push("the capture is marked INCOMPLETE".to_owned());
+            }
+            if !files.stats_end {
+                problems.push("the capture has no stats.end".to_owned());
+            }
+        }
+    }
+    (!problems.is_empty()).then(|| format!("{}: {}", capture.dir.display(), problems.join(", ")))
+}
+
 fn shutdown_check(reboot: bool, ending: &Ending) -> Check {
     use CheckStatus::{Fail, Pass, Warn};
     let Some(reason) = ending.shutdown_reason.as_deref() else {
@@ -337,6 +430,8 @@ fn scenario_check(summary: &ScenarioSummary) -> Check {
 mod tests {
     use super::*;
     use crate::observe::Observer;
+    use crate::trace::CaptureFiles;
+    use std::path::PathBuf;
 
     fn facts(text: &str) -> Facts {
         let mut observer = Observer::new(false);
@@ -364,10 +459,11 @@ mod tests {
         mode: Mode::Normal,
         smoke: true,
         reboot: false,
+        trace_autostart: true,
     };
 
     fn verdict(text: &str, ending: &Ending) -> Verdict {
-        judge(SMOKE, &facts(text), ending, None)
+        judge(SMOKE, &facts(text), ending, None, None)
     }
 
     fn failed(v: &Verdict) -> Vec<String> {
@@ -477,6 +573,7 @@ mod tests {
             mode: Mode::Normal,
             smoke: false,
             reboot: false,
+            trace_autostart: true,
         };
         let trace = Expectations {
             mode: Mode::Trace,
@@ -485,12 +582,179 @@ mod tests {
         let plain = facts("kernel::a:INFO -- hello\n");
         let traced =
             facts("kernel::a:INFO -- hello\nkernel::trace::imp:INFO -- trace: trace-mode kernel\n");
-        assert_eq!(judge(normal, &plain, &ok, None).result, Outcome::Pass);
-        assert_eq!(failed(&judge(normal, &traced, &ok, None)), ["mode"]);
-        assert_eq!(failed(&judge(trace, &plain, &ok, None)), ["mode"]);
-        assert_eq!(judge(trace, &traced, &ok, None).result, Outcome::Pass);
+        assert_eq!(judge(normal, &plain, &ok, None, None).result, Outcome::Pass);
+        assert_eq!(failed(&judge(normal, &traced, &ok, None, None)), ["mode"]);
+        let mode = |v: Verdict| {
+            v.checks
+                .into_iter()
+                .find(|c| c.name == "mode")
+                .map(|c| c.status)
+        };
+        assert_eq!(
+            mode(judge(trace, &plain, &ok, None, None)),
+            Some(CheckStatus::Fail)
+        );
+        assert_eq!(
+            mode(judge(trace, &traced, &ok, None, None)),
+            Some(CheckStatus::Pass)
+        );
         let silent = Facts::default();
-        assert_eq!(failed(&judge(normal, &silent, &ok, None)), ["mode"]);
+        assert_eq!(failed(&judge(normal, &silent, &ok, None, None)), ["mode"]);
+    }
+
+    fn capture(name: &str, code: Option<i32>, killed: bool, files: CaptureFiles) -> Capture {
+        Capture {
+            dir: PathBuf::from(format!("/run/{name}")),
+            started_ms: 1.0,
+            exit: Some(FollowExit { code, killed }),
+            files: Some(files),
+        }
+    }
+
+    const WHOLE: CaptureFiles = CaptureFiles {
+        incomplete: false,
+        stats_end: true,
+    };
+
+    fn traced(captures: Vec<Capture>, start_failures: &[&str]) -> TraceInfo {
+        TraceInfo {
+            host_rings: None,
+            guest_ram: None,
+            captures,
+            start_failures: start_failures.iter().map(|&s| s.to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn trace_checks() {
+        let ok = exited(0);
+        let auto = Expectations {
+            mode: Mode::Trace,
+            smoke: false,
+            reboot: false,
+            trace_autostart: true,
+        };
+        let manual = Expectations {
+            trace_autostart: false,
+            ..auto
+        };
+        let kernel = "kernel::trace::imp:INFO -- trace: trace-mode kernel\n";
+        let no_rings = facts(kernel);
+        let rings = facts(&format!(
+            "{kernel}kernel::trace::imp:INFO -- trace: host rings at phys 0x7a000000, 4 CPUs x 4096 KiB\n"
+        ));
+        let trace = |expect, facts: &Facts, info: Option<&TraceInfo>| {
+            judge(expect, facts, &ok, info, None)
+                .checks
+                .into_iter()
+                .find(|c| c.name == "trace")
+                .expect("a trace check")
+        };
+
+        // The kernel refused the ring size: no announcement, no capture.
+        let c = trace(auto, &no_rings, Some(&traced(Vec::new(), &[])));
+        assert_eq!(c.status, CheckStatus::Fail);
+        assert!(
+            c.detail.contains("never announced its host rings"),
+            "{}",
+            c.detail
+        );
+        assert_eq!(trace(manual, &no_rings, None).status, CheckStatus::Fail);
+
+        let whole = traced(vec![capture("trace", Some(0), false, WHOLE)], &[]);
+        let c = trace(auto, &rings, Some(&whole));
+        assert_eq!(c.status, CheckStatus::Pass, "{}", c.detail);
+        assert_eq!(
+            c.detail,
+            "host rings at 0x7a000000, 4 CPUs x 4096 KiB; 1 complete capture(s)"
+        );
+        assert_eq!(
+            judge(auto, &rings, &ok, Some(&whole), None).result,
+            Outcome::Pass
+        );
+
+        let c = trace(auto, &rings, Some(&traced(Vec::new(), &[])));
+        assert_eq!(
+            (c.status, c.detail.as_str()),
+            (CheckStatus::Fail, "ferric-trace follow never started")
+        );
+        let c = trace(
+            auto,
+            &rings,
+            Some(&traced(Vec::new(), &["cannot run ferric-trace: not found"])),
+        );
+        assert_eq!(c.status, CheckStatus::Fail);
+        assert_eq!(
+            c.detail,
+            "ferric-trace follow could not start: cannot run ferric-trace: not found"
+        );
+
+        let failed_follow = traced(
+            vec![capture(
+                "trace",
+                Some(1),
+                false,
+                CaptureFiles {
+                    incomplete: true,
+                    stats_end: false,
+                },
+            )],
+            &[],
+        );
+        let c = trace(auto, &rings, Some(&failed_follow));
+        assert_eq!(c.status, CheckStatus::Fail);
+        assert_eq!(
+            c.detail,
+            "/run/trace: follow exited with 1, the capture is marked INCOMPLETE, the capture has no stats.end"
+        );
+        let killed = traced(vec![capture("trace", None, true, WHOLE)], &[]);
+        assert!(
+            trace(auto, &rings, Some(&killed))
+                .detail
+                .contains("ignored SIGINT and was killed")
+        );
+        let signalled = traced(vec![capture("trace", None, false, WHOLE)], &[]);
+        assert!(
+            trace(auto, &rings, Some(&signalled))
+                .detail
+                .contains("killed by a signal")
+        );
+        // A later capture does not make up for an earlier broken one.
+        let second = traced(
+            vec![
+                capture("trace", Some(0), false, WHOLE),
+                capture(
+                    "trace.2",
+                    Some(0),
+                    false,
+                    CaptureFiles {
+                        incomplete: false,
+                        stats_end: false,
+                    },
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            trace(auto, &rings, Some(&second)).detail,
+            "/run/trace.2: the capture has no stats.end"
+        );
+
+        // Without automatic start the announcement is enough, but a capture taken by hand
+        // must still be whole.
+        let c = trace(manual, &rings, Some(&traced(Vec::new(), &[])));
+        assert_eq!(c.status, CheckStatus::Pass, "{}", c.detail);
+        assert!(c.detail.ends_with("no capture (automatic start off)"));
+        assert_eq!(
+            trace(manual, &rings, Some(&failed_follow)).status,
+            CheckStatus::Fail
+        );
+
+        let normal = Expectations {
+            mode: Mode::Normal,
+            ..auto
+        };
+        assert_eq!(trace(normal, &no_rings, None).status, CheckStatus::Skip);
     }
 
     #[test]
@@ -499,25 +763,26 @@ mod tests {
             mode: Mode::Normal,
             smoke: false,
             reboot: false,
+            trace_autostart: true,
         };
         let f = facts("kernel::a:INFO -- hello\n");
         let reset = Ending {
             shutdown_reason: Some("guest-reset".to_owned()),
             ..exited(0)
         };
-        assert_eq!(failed(&judge(normal, &f, &reset, None)), ["shutdown"]);
+        assert_eq!(failed(&judge(normal, &f, &reset, None, None)), ["shutdown"]);
         let reboot = Expectations {
             reboot: true,
             ..normal
         };
-        assert_eq!(judge(reboot, &f, &reset, None).result, Outcome::Pass);
+        assert_eq!(judge(reboot, &f, &reset, None, None).result, Outcome::Pass);
         let quit = Ending {
             stop: StopReason::Down,
             shutdown_reason: Some("host-qmp-quit".to_owned()),
             powerdown_wait_s: Some(20.0),
             ..exited(0)
         };
-        let v = judge(normal, &f, &quit, None);
+        let v = judge(normal, &f, &quit, None, None);
         assert_eq!(v.result, Outcome::Pass);
         assert!(v.checks.iter().any(|c| c.status == CheckStatus::Warn));
     }
@@ -528,6 +793,7 @@ mod tests {
             mode: Mode::Normal,
             smoke: false,
             reboot: false,
+            trace_autostart: true,
         };
         let f = facts("kernel::a:INFO -- hello\n");
         let bad = ScenarioSummary {
@@ -535,7 +801,7 @@ mod tests {
             total: 3,
             failed: Some((2, "expect timed out".to_owned())),
         };
-        let v = judge(normal, &f, &exited(0), Some(&bad));
+        let v = judge(normal, &f, &exited(0), None, Some(&bad));
         assert_eq!(failed(&v), ["scenario"]);
         let good = ScenarioSummary {
             ran: 3,
@@ -543,7 +809,7 @@ mod tests {
             failed: None,
         };
         assert_eq!(
-            judge(normal, &f, &exited(0), Some(&good)).result,
+            judge(normal, &f, &exited(0), None, Some(&good)).result,
             Outcome::Pass
         );
     }

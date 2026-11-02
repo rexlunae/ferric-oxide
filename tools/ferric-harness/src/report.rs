@@ -28,7 +28,7 @@ use crate::markers::{BenchRecord, Marker};
 use crate::observe::{Facts, HostRings};
 use crate::serial::SerialCounts;
 use crate::stats::StatsSummary;
-use crate::trace::FollowExit;
+use crate::trace::{CaptureFiles, FollowExit};
 use crate::verdict::{Ending, Outcome, ScenarioSummary, Verdict};
 
 /// The report format version.
@@ -181,6 +181,10 @@ pub struct TraceInfo {
     pub guest_ram: Option<PathBuf>,
     /// Each `follow` run.
     pub captures: Vec<Capture>,
+    /// Why starting `follow` automatically failed, each time it did, as the harness logged
+    /// it.
+    #[serde(default)]
+    pub start_failures: Vec<String>,
 }
 
 /// One `ferric-trace follow` run.
@@ -192,6 +196,9 @@ pub struct Capture {
     pub started_ms: f64,
     /// How it ended (absent while running).
     pub exit: Option<FollowExit>,
+    /// Whether its directory was whole once it had ended (absent while running).
+    #[serde(default)]
+    pub files: Option<CaptureFiles>,
 }
 
 /// One scenario step's result.

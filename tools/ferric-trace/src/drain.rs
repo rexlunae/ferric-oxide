@@ -50,10 +50,10 @@ use crate::capture::INCOMPLETE;
 pub const AGAIN_RETRIES: u32 = 200;
 
 /// The name of the `stats` snapshot taken before draining.
-pub const STATS_START: &str = "stats.start";
+pub const STATS_START: &str = ferric_trace::capture::STATS_START;
 
 /// The name of the `stats` snapshot taken after draining.
-pub const STATS_END: &str = "stats.end";
+pub const STATS_END: &str = ferric_trace::capture::STATS_END;
 
 /// How long to wait after an `EAGAIN` read.
 const AGAIN_WAIT: Duration = Duration::from_millis(5);
