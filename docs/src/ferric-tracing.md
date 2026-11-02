@@ -1155,10 +1155,13 @@ next, the CPU count, the clock and its tick length (what a capture's `clock`
 file holds), then each ring's offset from the directory and length. The kernel
 writes the magic last, with release ordering.
 
-Readers in the guest still drain the same rings through `kernel.trace/cpu/<n>`
-(`ferric-trace capture`), and what they consume does not change what the host
-reads. They cannot map them: the region's pages are not frames a mapping can
-hold, so `mmap` fails with `EINVAL` and `capture --via auto` reads instead.
+The host is the rings' only reader. Reading `kernel.trace/cpu/<n>` in the
+guest (`ferric-trace capture`) fails with `EBUSY`: a drain moves the ring's
+`tail`, which an observer that fell more than a ring behind takes as the oldest
+record still whole, so it would skip records the ring still holds. Mapping
+them fails with `EINVAL`, because the region's pages are not frames a mapping
+can hold ([#378](https://github.com/rexlunae/ferric-oxide/issues/378)). Use
+`follow` on the host instead, or boot without `FERRIC_TRACE_HOST`.
 
 ### Following from the host
 
