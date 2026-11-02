@@ -149,43 +149,60 @@ mod image;
 /// on this test binary, a real ELF file with section headers after its segments.
 mod image_tests {
     use super::{image::loaded_len, mmap_file::PROBE_LEN};
+    use object::{
+        NativeEndian as E, U16, U32, U64,
+        elf::{self, FileHeader64, Ident, ProgramHeader64},
+        pod::bytes_of,
+        read::elf::{FileHeader as _, ProgramHeader as _},
+    };
 
-    const PT_LOAD: u32 = 1;
-    const PT_DYNAMIC: u32 = 2;
-    const PT_NOTE: u32 = 4;
+    const HEADER_SIZE: usize = size_of::<FileHeader64<E>>();
+    const SEGMENT_SIZE: usize = size_of::<ProgramHeader64<E>>();
 
-    /// A 64-bit little-endian ELF header at the start of a `len`-byte object, with its
-    /// program header table at `phoff` holding `segments` as (type, offset, file size).
+    /// An ELF header at the start of a `len`-byte object, with its program header table at
+    /// `phoff` holding `segments` as (type, offset, file size), and four section headers at
+    /// the end of the file.
     fn object(phoff: usize, phnum: u16, segments: &[(u32, u64, u64)], len: usize) -> Vec<u8> {
+        let u64_of = |n: usize| U64::new(E, u64::try_from(n).unwrap());
         let mut bytes = vec![0; len];
-        bytes[..4].copy_from_slice(b"\x7fELF");
-        bytes[4] = 2; // ELFCLASS64
-        bytes[5] = 1; // ELFDATA2LSB
-        bytes[6] = 1; // EV_CURRENT
-        let put16 =
-            |b: &mut Vec<u8>, at: usize, v: u16| b[at..at + 2].copy_from_slice(&v.to_le_bytes());
-        let put32 =
-            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
-        let put64 =
-            |b: &mut Vec<u8>, at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
-        put16(&mut bytes, 16, 3); // ET_DYN
-        put16(&mut bytes, 18, 62); // EM_X86_64
-        put32(&mut bytes, 20, 1);
-        put64(&mut bytes, 32, phoff as u64);
-        put64(&mut bytes, 40, (len - 64 * 4) as u64); // section headers at the end
-        put16(&mut bytes, 52, 64);
-        put16(&mut bytes, 54, 56);
-        put16(&mut bytes, 56, phnum);
-        put16(&mut bytes, 58, 64);
-        put16(&mut bytes, 60, 4);
+        let header = FileHeader64::<E> {
+            e_ident: Ident {
+                magic: elf::ELFMAG,
+                class: elf::ELFCLASS64,
+                data: elf::ELFDATA2LSB,
+                version: elf::EV_CURRENT,
+                os_abi: elf::ELFOSABI_SYSV,
+                abi_version: 0,
+                padding: [0; 7],
+            },
+            e_type: U16::new(E, elf::ET_DYN),
+            e_machine: U16::new(E, elf::EM_X86_64),
+            e_version: U32::new(E, elf::EV_CURRENT.into()),
+            e_entry: U64::new(E, 0),
+            e_phoff: u64_of(phoff),
+            e_shoff: u64_of(len - 4 * 64),
+            e_flags: U32::new(E, 0),
+            e_ehsize: U16::new(E, HEADER_SIZE as u16),
+            e_phentsize: U16::new(E, SEGMENT_SIZE as u16),
+            e_phnum: U16::new(E, phnum),
+            e_shentsize: U16::new(E, 64),
+            e_shnum: U16::new(E, 4),
+            e_shstrndx: U16::new(E, 0),
+        };
+        bytes[..HEADER_SIZE].copy_from_slice(bytes_of(&header));
         for (i, &(kind, offset, size)) in segments.iter().enumerate() {
-            let at = phoff + i * 56;
-            put32(&mut bytes, at, kind);
-            put64(&mut bytes, at + 8, offset);
-            put64(&mut bytes, at + 16, offset);
-            put64(&mut bytes, at + 32, size);
-            put64(&mut bytes, at + 40, size);
-            put64(&mut bytes, at + 48, 0x1000);
+            let segment = ProgramHeader64::<E> {
+                p_type: U32::new(E, kind),
+                p_flags: U32::new(E, elf::PF_R),
+                p_offset: U64::new(E, offset),
+                p_vaddr: U64::new(E, offset),
+                p_paddr: U64::new(E, offset),
+                p_filesz: U64::new(E, size),
+                p_memsz: U64::new(E, size),
+                p_align: U64::new(E, 0x1000),
+            };
+            let at = phoff + i * SEGMENT_SIZE;
+            bytes[at..at + SEGMENT_SIZE].copy_from_slice(bytes_of(&segment));
         }
         bytes
     }
@@ -201,72 +218,71 @@ mod image_tests {
     #[test]
     fn the_mapping_ends_with_the_last_segment_contents() {
         let segments = [
-            (PT_LOAD, 0, 0x2000),
-            (PT_LOAD, 0x2000, 0x1800),
-            (PT_DYNAMIC, 0x3000, 0x100),
+            (elf::PT_LOAD, 0, 0x2000),
+            (elf::PT_LOAD, 0x2000, 0x1800),
+            (elf::PT_DYNAMIC, 0x3000, 0x100),
         ];
-        let bytes = object(64, table(&segments), &segments, 1 << 20);
+        let bytes = object(HEADER_SIZE, table(&segments), &segments, 1 << 20);
         assert_eq!(loaded_len(probe(&bytes), bytes.len()), 0x3800);
     }
 
     #[test]
     fn every_program_header_counts_not_only_load_segments() {
-        let segments = [(PT_LOAD, 0, 0x2000), (PT_NOTE, 0x5000, 0x20)];
-        let bytes = object(64, table(&segments), &segments, 1 << 20);
+        let segments = [(elf::PT_LOAD, 0, 0x2000), (elf::PT_NOTE, 0x5000, 0x20)];
+        let bytes = object(HEADER_SIZE, table(&segments), &segments, 1 << 20);
         assert_eq!(loaded_len(probe(&bytes), bytes.len()), 0x5020);
     }
 
     #[test]
     fn the_program_header_table_counts_when_it_ends_last() {
-        let segments = [(PT_LOAD, 0, 0x100)];
+        let segments = [(elf::PT_LOAD, 0, 0x100)];
         let bytes = object(0x800, table(&segments), &segments, 1 << 20);
-        assert_eq!(loaded_len(probe(&bytes), bytes.len()), 0x800 + 56);
+        assert_eq!(loaded_len(probe(&bytes), bytes.len()), 0x800 + SEGMENT_SIZE);
     }
 
     #[test]
     fn a_segment_past_the_end_of_the_file_maps_only_the_file() {
-        let segments = [(PT_LOAD, 0, 0x3800)];
-        let bytes = object(64, table(&segments), &segments, 0x2000);
+        let segments = [(elf::PT_LOAD, 0, 0x3800)];
+        let bytes = object(HEADER_SIZE, table(&segments), &segments, 0x2000);
         assert_eq!(loaded_len(probe(&bytes), bytes.len()), 0x2000);
     }
 
     /// Whatever the probe cannot parse maps the whole file, so the full parse reports it.
     #[test]
     fn unparsable_headers_map_the_whole_file() {
-        let segments = [(PT_LOAD, 0, 0x2000)];
+        let segments = [(elf::PT_LOAD, 0, 0x2000)];
         let size = 1 << 20;
         let not_elf = vec![0x55; size];
         assert_eq!(loaded_len(probe(&not_elf), size), size);
-        let truncated = object(64, table(&segments), &segments, size);
+        let truncated = object(HEADER_SIZE, table(&segments), &segments, size);
         assert_eq!(loaded_len(&truncated[..32], size), size);
-        let past_probe = object(PROBE_LEN + 64, table(&segments), &segments, size);
+        let past_probe = object(PROBE_LEN + HEADER_SIZE, table(&segments), &segments, size);
         assert_eq!(loaded_len(probe(&past_probe), size), size);
         // PN_XNUM: the real count is in section header 0, at the end of the file.
-        let extended = object(64, 0xffff, &segments, size);
+        let extended = object(HEADER_SIZE, elf::PN_XNUM, &segments, size);
         assert_eq!(loaded_len(probe(&extended), size), size);
     }
 
-    /// This test binary is a real ELF object; the mapping covers every segment and stops
-    /// before the section header table.
+    /// This test binary is a real ELF object: the mapping covers every segment and the
+    /// program header table, and stops before the section header table.
     #[test]
     fn a_real_object_maps_its_segments_and_not_its_section_headers() {
         let bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
-        let u16_at =
-            |at: usize| usize::from(u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()));
-        let u64_at = |at: usize| {
-            usize::try_from(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())).unwrap()
-        };
-        let (phoff, phentsize, phnum, shoff) = (u64_at(32), u16_at(54), u16_at(56), u64_at(40));
-        let expected = (0..phnum)
-            .map(|i| phoff + i * phentsize)
-            .map(|at| u64_at(at + 8) + u64_at(at + 32))
-            .fold(phoff + phnum * phentsize, usize::max);
-        let len = loaded_len(probe(&bytes), bytes.len());
-        assert_eq!(len, expected);
+        let header = FileHeader64::<E>::parse(&*bytes).unwrap();
+        let segments = header.program_headers(E, &*bytes).unwrap();
+        let len = u64::try_from(loaded_len(probe(&bytes), bytes.len())).unwrap();
+        for segment in segments {
+            let (offset, size) = segment.file_range(E);
+            assert!(
+                offset + size <= len,
+                "segment {offset:#x}+{size:#x} past {len:#x}"
+            );
+        }
+        assert!(header.e_phoff(E) + size_of_val(segments) as u64 <= len);
+        let shoff = header.e_shoff(E);
         assert!(
-            len <= shoff && shoff < bytes.len(),
-            "{len} {shoff} {}",
-            bytes.len()
+            len <= shoff && shoff < bytes.len() as u64,
+            "{len:#x} {shoff:#x}"
         );
     }
 }
