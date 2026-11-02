@@ -93,6 +93,14 @@ pub fn is_reserved() -> bool {
     REGION.is_completed()
 }
 
+/// Whether CPU `cpu`'s ring is a host ring, in the region: one the host follows and nothing
+/// in the guest may consume. A CPU past the region's rings has an ordinary ring.
+pub fn is_host_ring(cpu: usize) -> bool {
+    REGION
+        .get()
+        .is_some_and(|host| host.layout.entry(cpu).is_some())
+}
+
 /// The number of rings in the region, 0 without one.
 pub fn cpus() -> usize {
     REGION.get().map_or(0, |host| host.layout.cpus())
