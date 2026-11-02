@@ -1163,6 +1163,14 @@ fn cli_up_commands_down_report() {
     assert!(out.status.success());
     let out = run_args(&["expect", "assword", "--timeout", "20"]);
     assert!(out.status.success());
+    // Standard input that ends before a line sends nothing, rather than an empty password.
+    let out = harness_with_stdin(&["serial", "send", "--secret", "--run", run_s.as_str()], "");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("secret"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = harness_with_stdin(
         &["serial", "send", "--secret", "--run", run_s.as_str()],
         "password\n",

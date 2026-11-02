@@ -465,19 +465,71 @@ fn verdict_exit(outcome: Option<Outcome>) -> ExitCode {
     }
 }
 
-/// One line of standard input, without its line ending: `serial send --secret`'s text.
+/// One line of standard input, without its line ending: `serial send --secret`'s text. When
+/// standard input is a terminal, its echo is off while the line is read ([`NoEcho`]), so the
+/// secret is not shown or kept in the terminal's scrollback.
 ///
 /// # Errors
 ///
-/// [`Error::SecretInput`] when standard input cannot be read.
+/// [`Error::SecretInput`] when standard input cannot be read, or ends before a line (no
+/// secret is sent then, rather than an empty one).
 fn read_secret() -> Result<String, Error> {
+    let stdin = std::io::stdin();
+    let echo = NoEcho::on(&stdin);
     let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .map_err(Error::SecretInput)?;
+    let read = stdin.read_line(&mut line).map_err(Error::SecretInput)?;
+    let quiet = echo.active();
+    drop(echo);
+    if quiet {
+        // The newline the user typed was not echoed either.
+        eprintln!();
+    }
+    if read == 0 {
+        return Err(Error::SecretInput(std::io::Error::from(
+            std::io::ErrorKind::UnexpectedEof,
+        )));
+    }
     let len = line.trim_end_matches(['\n', '\r']).len();
     line.truncate(len);
     Ok(line)
+}
+
+/// Turns a terminal's echo off for as long as it lives, and back to what it was on drop. Does
+/// nothing when standard input is not a terminal.
+struct NoEcho<'a> {
+    stdin: &'a std::io::Stdin,
+    saved: Option<rustix::termios::Termios>,
+}
+
+impl<'a> NoEcho<'a> {
+    fn on(stdin: &'a std::io::Stdin) -> Self {
+        use rustix::termios::{LocalModes, OptionalActions, isatty, tcgetattr, tcsetattr};
+        let saved = isatty(stdin)
+            .then(|| tcgetattr(stdin).ok())
+            .flatten()
+            .filter(|saved| {
+                let mut quiet = saved.clone();
+                quiet.local_modes.remove(LocalModes::ECHO);
+                tcsetattr(stdin, OptionalActions::Now, &quiet).is_ok()
+            });
+        Self { stdin, saved }
+    }
+
+    /// Whether echo was turned off (standard input is a terminal that allowed it).
+    fn active(&self) -> bool {
+        self.saved.is_some()
+    }
+}
+
+impl Drop for NoEcho<'_> {
+    fn drop(&mut self) {
+        if let Some(saved) = &self.saved
+            && let Err(err) =
+                rustix::termios::tcsetattr(self.stdin, rustix::termios::OptionalActions::Now, saved)
+        {
+            eprintln!("ferric-harness: restoring the terminal's echo: {err}");
+        }
+    }
 }
 
 fn main() -> ExitCode {
