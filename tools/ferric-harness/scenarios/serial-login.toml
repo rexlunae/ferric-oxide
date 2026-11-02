@@ -17,7 +17,7 @@ send = "root"
 expect = "assword"
 
 [[step]]
-send = "password"
+send-secret = "password"
 
 [[step]]
 expect = "root:~# "

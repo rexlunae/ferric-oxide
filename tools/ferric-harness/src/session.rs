@@ -49,7 +49,7 @@ use crate::report::{
 };
 use crate::rundir::{self, RunDir};
 use crate::screen::{self, Image, PredicateState, ScreenPredicate, TextScreen};
-use crate::serial::{Eol, ExpectFailure, ExpectMatch, Line, SerialConsole, SerialCounts};
+use crate::serial::{Eol, ExpectFailure, ExpectMatch, Line, Secrecy, SerialConsole, SerialCounts};
 use crate::stats::{self, Sample, VcpuThread};
 use crate::trace::{self, CaptureFiles, Follow};
 use crate::verdict::{self, Ending, Expectations, Outcome, StopReason};
@@ -682,17 +682,16 @@ impl Session {
         }
     }
 
-    /// Writes `text` and `eol` to the serial console.
+    /// Writes `text` and `eol` to the serial console; with [`Secrecy::Secret`] the input
+    /// log records `text` only as `<redacted N bytes>`.
     ///
     /// # Errors
     ///
     /// [`Error::GuestExited`] when the console is closed.
-    pub fn serial_send(&self, text: &str, eol: Eol) -> Result<(), Error> {
-        let mut bytes = text.as_bytes().to_vec();
-        bytes.extend_from_slice(eol.bytes());
+    pub fn serial_send(&self, text: &str, eol: Eol, secrecy: Secrecy) -> Result<(), Error> {
         self.inner
             .serial
-            .send(&bytes)
+            .send(text.as_bytes(), eol, secrecy)
             .map_err(|_| Error::GuestExited)
     }
 

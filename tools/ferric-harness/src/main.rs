@@ -22,7 +22,7 @@ use ferric_harness::machine::{
 use ferric_harness::report::{self, Report, ScenarioReport};
 use ferric_harness::rundir::{self, RunDir};
 use ferric_harness::scenario::{self, Scenario};
-use ferric_harness::serial::Eol;
+use ferric_harness::serial::{Eol, Secrecy};
 use ferric_harness::session::{Finish, Session, Since};
 use ferric_harness::trace;
 use ferric_harness::verdict::{Check, Outcome};
@@ -253,6 +253,9 @@ enum SerialCmd {
         /// The line ending.
         #[arg(long, value_enum, default_value_t = Eol::Cr)]
         eol: Eol,
+        /// Send the text (a password) but log it only as `<redacted N bytes>`.
+        #[arg(long)]
+        secret: bool,
     },
 }
 
@@ -524,8 +527,15 @@ fn dispatch(command: Cmd) -> Result<ExitCode, Error> {
         }
         Cmd::Serial {
             run,
-            action: SerialCmd::Send { text, eol },
-        } => request_output(&run.dir(), &Request::SerialSend { text, eol }),
+            action: SerialCmd::Send { text, eol, secret },
+        } => {
+            let secrecy = if secret {
+                Secrecy::Secret
+            } else {
+                Secrecy::Logged
+            };
+            request_output(&run.dir(), &Request::SerialSend { text, eol, secrecy })
+        }
         Cmd::Expect {
             run,
             pattern,
@@ -1012,8 +1022,17 @@ mod tests {
             cli.command,
             Cmd::Serial {
                 run: RunArg { run: Some(_) },
-                ..
+                action: SerialCmd::Send { secret: false, .. },
             }
+        ));
+        let cli = Cli::try_parse_from(["ferric-harness", "serial", "send", "--secret", "pw"])
+            .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Cmd::Serial {
+                action: SerialCmd::Send { secret: true, ref text, .. },
+                ..
+            } if text == "pw"
         ));
         let cli = Cli::try_parse_from(["ferric-harness", "pointer", "button", "left", "--down"])
             .expect("parse");

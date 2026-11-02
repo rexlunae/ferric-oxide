@@ -38,16 +38,17 @@
 //! ```no_run
 //! use std::time::Duration;
 //! use ferric_harness::machine::LaunchConfig;
-//! use ferric_harness::serial::Eol;
+//! use ferric_harness::serial::{Eol, Secrecy};
 //! use ferric_harness::session::{Session, Since};
 //!
 //! let config = LaunchConfig::new("build/x86_64/desktop/harddrive.img".into(),
 //!                                std::env::current_dir()?.join("build/harness/example"));
 //! let session = Session::launch(config)?;
 //! session.expect("login: $", &Since::Cursor, Duration::from_secs(300))?;
-//! session.serial_send("root", Eol::Cr)?;
+//! session.serial_send("root", Eol::Cr, Secrecy::Logged)?;
 //! session.expect("assword", &Since::Cursor, Duration::from_secs(10))?;
-//! session.serial_send("password", Eol::Cr)?;
+//! // A secret is sent as given and logged as `<redacted 8 bytes>`.
+//! session.serial_send("password", Eol::Cr, Secrecy::Secret)?;
 //! let report = session.down(None);
 //! println!("{:?}", report.verdict.map(|v| v.result));
 //! # Ok::<(), Box<dyn std::error::Error>>(())

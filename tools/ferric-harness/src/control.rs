@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, ErrorKind, chain};
 use crate::input::PointerAction;
 use crate::report::Mark;
-use crate::serial::Eol;
+use crate::serial::{Eol, Secrecy};
 use crate::session::{
     DownResult, ExpectResult, Session, ShotInfo, Since, Status, TextShot, TraceStatus,
 };
@@ -75,6 +75,9 @@ pub enum Request {
         text: String,
         /// The line ending appended.
         eol: Eol,
+        /// Whether the text may be logged; a secret is logged as `<redacted N bytes>`.
+        #[serde(default)]
+        secrecy: Secrecy,
     },
     /// Wait for a regular expression on the serial console.
     Expect {
@@ -191,8 +194,8 @@ pub fn handle(session: &Session, request: Request) -> Result<Output, Error> {
             session.pointer(action)?;
             Output::Done
         }
-        Request::SerialSend { text, eol } => {
-            session.serial_send(&text, eol)?;
+        Request::SerialSend { text, eol, secrecy } => {
+            session.serial_send(&text, eol, secrecy)?;
             Output::Done
         }
         Request::Expect {
@@ -411,6 +414,16 @@ mod tests {
         };
         let text = serde_json::to_string(&p).expect("encode");
         assert_eq!(serde_json::from_str::<Request>(&text).expect("decode"), p);
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"cmd":"serial-send","text":"root","eol":"cr"}"#)
+                .expect("decode"),
+            Request::SerialSend {
+                text: "root".into(),
+                eol: Eol::Cr,
+                secrecy: Secrecy::Logged
+            },
+            "text is logged unless the request says otherwise"
+        );
         assert_eq!(
             serde_json::to_string(&Request::TraceStart).expect("encode"),
             r#"{"cmd":"trace-start"}"#

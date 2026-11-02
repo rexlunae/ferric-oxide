@@ -100,7 +100,7 @@ covers every module.
 | `pointer abs <x> <y> [--raw]` | Moves the absolute pointer, in screen pixels or, with `--raw`, in QEMU axis units (0 to 0x7fff) |
 | `pointer rel <dx> <dy>` | Relative motion, which ps2d ignores while it uses the absolute vmmouse |
 | `pointer button <left\|right\|middle\|wheel-up\|wheel-down> [--click\|--down\|--up]` | A button click (the default), press or release |
-| `serial send <text> [--eol cr\|lf\|crlf\|none]` | Writes to the serial console, followed by a carriage return by default |
+| `serial send <text> [--eol cr\|lf\|crlf\|none] [--secret]` | Writes to the serial console, followed by a carriage return by default. With `--secret` (a password) the text is sent as given but logged only as `<redacted N bytes>` |
 | `expect <regex> [--timeout s] [--since cursor\|start\|now\|<mark>]` | Waits for a multi-line regular expression on the console. By default the search starts just past the previous match; every match, even one found by searching from an earlier `--since` point, sets where the next default search starts |
 | `mark <name>` | Records a named time and console offset in the report. `expect --since <name>` starts the search at the mark |
 | `wait-screen <predicate> [--timeout s]` | Waits until the screen matches `text:<s>`, `regex:<re>`, `changed`, `stable[:<ms>]` or `nonblank` |
@@ -186,6 +186,8 @@ timeout = 300
 [[step]]
 send = "root"              # serial input; `eol` = "cr" (default), "lf", "crlf", "none"
 [[step]]
+send-secret = "password"   # like send, but logged and reported as <redacted 8 bytes>
+[[step]]
 type = "echo hi\n"         # keyboard
 [[step]]
 key = ["meta_l-f2"]        # a combination or a list of them
@@ -213,7 +215,8 @@ wait-exit = true           # wait for the guest to power off by itself
 `tools/ferric-harness/scenarios/` contains two scenarios. `serial-login.toml`
 logs in on the serial console, checks a command's output and reads VT 2.
 `typed-boot-env.toml` checks that a typed boot environment entry reaches
-`/scheme/sys/env`. A host test parses every shipped scenario.
+`/scheme/sys/env`. Both send the password with `send-secret`. A host test
+parses every shipped scenario.
 
 ## Run directory and report
 
@@ -223,7 +226,7 @@ logs in on the serial console, checks a command's output and reads VT 2.
 | `qemu-args.txt`, `qemu.log` | QEMU's command line (one argument per line) and its output |
 | `supervisor.log` | The supervisor's own log (`up` only) |
 | `serial.log`, `serial.jsonl` | Raw console bytes, and console lines with `mono_ns`, wall time and text |
-| `serial-input.jsonl` | Text the harness sent to the serial console, with timestamps |
+| `serial-input.jsonl` | Text the harness sent to the serial console, with timestamps. Secret text (`serial send --secret`, `send-secret`) appears only as `<redacted N bytes>`, N being its length without the line ending |
 | `qmp-events.jsonl` | QMP events, with timestamps |
 | `stats.jsonl` | Periodic statistics samples |
 | `shots/` | Screenshots, including the ones `text` takes |
@@ -267,7 +270,7 @@ The report (`schema` 1) has these fields:
   marker, a `stats.end`), and why an automatic start of `follow` failed
   (`start_failures`), in trace mode only.
 - `scenario`: each step with its start time, duration and detail (scenario runs
-  only).
+  only). A `send-secret` step is described as `send <redacted N bytes>`.
 
 ## Modes
 

@@ -25,7 +25,7 @@ use ferric_harness::machine::{Display, LaunchConfig, Mode, OnCrash};
 use ferric_harness::markers::Marker;
 use ferric_harness::report::{Report, ScenarioReport};
 use ferric_harness::scenario::{self, Scenario};
-use ferric_harness::serial::Eol;
+use ferric_harness::serial::{Eol, Secrecy};
 use ferric_harness::session::{Finish, Session, Since};
 use ferric_harness::verdict::{CheckStatus, Outcome, StopReason};
 use serde_json::{Value, json};
@@ -468,16 +468,22 @@ fn desktop_session_end_to_end() {
     session
         .expect("login: $", &Since::Cursor, wait)
         .expect("login prompt");
-    session.serial_send("root", Eol::Cr).expect("send");
+    session
+        .serial_send("root", Eol::Cr, Secrecy::Logged)
+        .expect("send");
     session
         .expect("assword: $", &Since::Cursor, wait)
         .expect("password prompt");
-    session.serial_send("password", Eol::Cr).expect("send");
+    session
+        .serial_send("password", Eol::Cr, Secrecy::Secret)
+        .expect("send");
     session
         .expect("^root:~# $", &Since::Cursor, wait)
         .expect("shell");
     let mark = session.mark("shell");
-    session.serial_send("echo hi", Eol::Cr).expect("send");
+    session
+        .serial_send("echo hi", Eol::Cr, Secrecy::Logged)
+        .expect("send");
     let m = session
         .expect("^hi$", &Since::Mark("shell".into()), wait)
         .expect("output");
@@ -599,6 +605,11 @@ fn desktop_session_end_to_end() {
 
     let jsonl = fs::read_to_string(session.run().serial_jsonl()).expect("jsonl");
     assert!(jsonl.contains("\"text\":\"Arrow keys and enter select mode\""));
+    // The password reached the guest (it answered with a shell) but no log holds it.
+    let input = fs::read_to_string(session.run().serial_input_jsonl()).expect("input log");
+    assert!(input.contains("\"<redacted 8 bytes>\\r\""), "{input}");
+    assert!(input.contains("\"root\\r\""), "{input}");
+    assert!(!input.contains("password"), "{input}");
     assert!(!session.run().qmp_sock().exists());
 }
 
@@ -618,7 +629,9 @@ fn expect_since_a_mark_moves_the_cursor_back() {
     let wait = Duration::from_secs(20);
     session.expect("ready", &Since::Start, wait).expect("ready");
     session.mark("before");
-    session.serial_send("go", Eol::Cr).expect("send");
+    session
+        .serial_send("go", Eol::Cr, Secrecy::Logged)
+        .expect("send");
     let end = session.expect("^end$", &Since::Cursor, wait).expect("end");
     let first = session
         .expect(r"^alpha \d$", &Since::Mark("before".into()), wait)
@@ -1036,6 +1049,13 @@ fn cli_up_commands_down_report() {
     assert!(out.status.success());
     let out = run_args(&["expect", "assword", "--timeout", "20"]);
     assert!(out.status.success());
+    let out = run_args(&["serial", "send", "--secret", "password"]);
+    assert!(out.status.success());
+    let out = run_args(&["expect", "root:~# $", "--timeout", "20"]);
+    assert!(out.status.success(), "the guest got the secret");
+    let input = fs::read_to_string(run.join("serial-input.jsonl")).expect("input log");
+    assert!(input.contains("<redacted 8 bytes>"), "{input}");
+    assert!(!input.contains("password"), "{input}");
     let out = run_args(&["expect", "never-printed", "--timeout", "0.2"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no match for"));
@@ -1163,7 +1183,7 @@ send = "root"
 [[step]]
 expect = "assword"
 [[step]]
-send = "password"
+send-secret = "password"
 [[step]]
 expect = "^root:~# $"
 [[step]]
@@ -1194,6 +1214,22 @@ key = "ret"
             .contains("redox login")
     );
     assert!(run.join("shots/end.png").exists());
+    // The secret got the guest to its shell, and no artifact or output of the run holds it.
+    assert_eq!(scenario.steps[3].action, "send <redacted 8 bytes>");
+    for (what, text) in [
+        ("stdout", String::from_utf8_lossy(&out.stdout).into_owned()),
+        ("stderr", String::from_utf8_lossy(&out.stderr).into_owned()),
+        (
+            "serial-input.jsonl",
+            fs::read_to_string(run.join("serial-input.jsonl")).expect("input log"),
+        ),
+        (
+            "report.json",
+            fs::read_to_string(run.join("report.json")).expect("report"),
+        ),
+    ] {
+        assert!(!text.contains("password"), "{what}: {text}");
+    }
 
     // A failing step fails the run.
     let (out, run) = cli_run(

@@ -26,7 +26,7 @@ H=target/debug/ferric-harness
 # and build/harness/latest points at the newest run.
 $H up build/x86_64/desktop/harddrive.img --mem 4096
 $H expect 'login:' --timeout 300
-$H serial send root && $H expect assword && $H serial send password
+$H serial send root && $H expect assword && $H serial send --secret password
 $H serial send 'echo hi_$((6*7))' && $H expect hi_42
 $H key meta_l-f2           # Super+F2: VT 2, fbcond's text login
 $H text                    # the screen's text

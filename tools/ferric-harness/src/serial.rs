@@ -12,7 +12,8 @@
 //! - hands each line to a callback (the session's [`crate::observe::Observer`]).
 //!
 //! [`SerialConsole::send`] writes to the console (COM1 receive), which reaches the kernel's
-//! debug scheme and the serial getty.
+//! debug scheme and the serial getty, and logs what it wrote to `serial-input.jsonl`; text
+//! sent as [`Secrecy::Secret`] (a password) is logged only as `<redacted N bytes>`.
 //!
 //! Offsets into the clean text are absolute (they count every clean byte since boot), so a
 //! mark taken earlier stays meaningful. The text kept in memory is capped at
@@ -237,6 +238,28 @@ impl Eol {
     }
 }
 
+/// Whether text sent to the console may appear in the run's logs, report and messages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Secrecy {
+    /// Logged as sent.
+    #[default]
+    Logged,
+    /// Sent as given but shown only as `<redacted N bytes>` (a password).
+    Secret,
+}
+
+impl Secrecy {
+    /// How `text` appears in logs, the report and messages: as it is, or for a secret
+    /// `<redacted N bytes>`, where N is its length in bytes.
+    pub fn shown(self, text: &[u8]) -> String {
+        match self {
+            Secrecy::Logged => String::from_utf8_lossy(text).into_owned(),
+            Secrecy::Secret => format!("<redacted {} bytes>", text.len()),
+        }
+    }
+}
+
 /// Counters for status and reports.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct SerialCounts {
@@ -441,21 +464,27 @@ impl SerialConsole {
         }
     }
 
-    /// Writes `bytes` to the console and logs them, stamped, to `serial-input.jsonl`.
+    /// Writes `text` and `eol` to the console and logs them, stamped, to
+    /// `serial-input.jsonl`, with `text` as [`Secrecy::shown`] gives it.
     ///
     /// # Errors
     ///
     /// The socket's write error (QEMU has exited, say).
-    pub fn send(&self, bytes: &[u8]) -> io::Result<()> {
+    pub fn send(&self, text: &[u8], eol: Eol, secrecy: Secrecy) -> io::Result<()> {
         let stamp = Stamp::now();
+        let mut bytes = Vec::with_capacity(text.len() + eol.bytes().len());
+        bytes.extend_from_slice(text);
+        bytes.extend_from_slice(eol.bytes());
         self.writer
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .write_all(bytes)?;
+            .write_all(&bytes)?;
+        let mut shown = secrecy.shown(text);
+        shown.push_str(&String::from_utf8_lossy(eol.bytes()));
         let record = serde_json::json!({
             "t_ms": round_ms(stamp.ms_since(self.origin)),
             "mono_ns": stamp.mono_ns,
-            "text": String::from_utf8_lossy(bytes),
+            "text": shown,
         });
         writeln!(
             self.input_log
@@ -502,6 +531,16 @@ mod tests {
         assert_eq!(clean(&["αβγ\t⏎".as_bytes()]), "αβγ\t⏎");
         // A broken sequence does not eat the next line.
         assert_eq!(clean(&[b"\x1b[12\nnext"]), "\nnext");
+    }
+
+    #[test]
+    fn secrets_are_shown_redacted() {
+        assert_eq!(Secrecy::Logged.shown(b"root"), "root");
+        assert_eq!(Secrecy::Secret.shown(b"password"), "<redacted 8 bytes>");
+        assert_eq!(
+            Secrecy::Secret.shown("pässword".as_bytes()),
+            "<redacted 9 bytes>"
+        );
     }
 
     #[test]
@@ -556,10 +595,18 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
 
-        console.send(b"root\r").expect("send");
+        console
+            .send(b"root", Eol::Cr, Secrecy::Logged)
+            .expect("send");
         let mut got = [0u8; 5];
         qemu.read_exact(&mut got).expect("read");
         assert_eq!(&got, b"root\r");
+        console
+            .send(b"hunter2", Eol::Crlf, Secrecy::Secret)
+            .expect("send a secret");
+        let mut got = [0u8; 9];
+        qemu.read_exact(&mut got).expect("read");
+        assert_eq!(&got, b"hunter2\r\n", "the guest gets the secret");
 
         let mark = console.offset();
         qemu.write_all(b"root\r\nPassword: \r\n# ok\r\n")
@@ -602,5 +649,7 @@ mod tests {
         );
         let input = std::fs::read_to_string(dir.path().join("input.jsonl")).expect("input");
         assert!(input.contains("root\\r"));
+        assert!(input.contains("\"<redacted 7 bytes>\\r\\n\""), "{input}");
+        assert!(!input.contains("hunter2"), "{input}");
     }
 }

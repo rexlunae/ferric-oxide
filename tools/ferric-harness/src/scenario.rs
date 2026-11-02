@@ -17,7 +17,7 @@
 //! [[step]]
 //! expect = "assword"
 //! [[step]]
-//! send = "password"
+//! send-secret = "password"      # like send, but logged as <redacted 8 bytes>
 //! [[step]]
 //! type = "echo hi\n"            # keyboard (US layout)
 //! [[step]]
@@ -57,7 +57,7 @@ use crate::input::{self, Button, ButtonAction, InputError, PointerAction};
 use crate::report::StepResult;
 use crate::rundir::{self, NotFileName};
 use crate::screen::{ScreenError, ScreenPredicate};
-use crate::serial::Eol;
+use crate::serial::{Eol, Secrecy};
 use crate::session::{Session, Since};
 use crate::verdict::ScenarioSummary;
 
@@ -84,7 +84,7 @@ pub enum ScenarioError {
     },
     /// A step with no action.
     #[error(
-        "step {0} has no action (expect, send, type, key, pointer, shot, text, wait, sleep, mark, trace-start, trace-stop, wait-exit)"
+        "step {0} has no action (expect, send, send-secret, type, key, pointer, shot, text, wait, sleep, mark, trace-start, trace-stop, wait-exit)"
     )]
     NoAction(usize),
     /// A step with several actions.
@@ -187,6 +187,7 @@ struct StepSpec {
     expect: Option<String>,
     since: Option<String>,
     send: Option<String>,
+    send_secret: Option<String>,
     eol: Option<Eol>,
     #[serde(rename = "type")]
     type_text: Option<String>,
@@ -229,6 +230,8 @@ pub enum Action {
         text: String,
         /// The line ending.
         eol: Eol,
+        /// Whether the text may be logged and reported (`send-secret` steps may not).
+        secrecy: Secrecy,
     },
     /// Type on the keyboard.
     Type(String),
@@ -261,11 +264,20 @@ pub enum Action {
 }
 
 impl Action {
-    /// A short description for logs and the report.
+    /// A short description for logs and the report; a secret's text is redacted.
     pub fn describe(&self) -> String {
         match self {
             Action::Expect { pattern, .. } => format!("expect {pattern:?}"),
-            Action::Send { text, .. } => format!("send {text:?}"),
+            Action::Send {
+                text,
+                secrecy: Secrecy::Logged,
+                ..
+            } => format!("send {text:?}"),
+            Action::Send {
+                text,
+                secrecy: Secrecy::Secret,
+                ..
+            } => format!("send {}", Secrecy::Secret.shown(text.as_bytes())),
             Action::Type(text) => format!("type {text:?}"),
             Action::Key(keys) => format!("key {}", keys.join(" ")),
             Action::Pointer(p) => format!("pointer {p:?}"),
@@ -356,14 +368,14 @@ fn convert(step: usize, spec: StepSpec, default_timeout: f64) -> Result<Step, Sc
         };
         actions.push(("expect", Action::Expect { pattern, since }));
     }
-    if let Some(text) = spec.send {
-        actions.push((
-            "send",
-            Action::Send {
-                text,
-                eol: spec.eol.unwrap_or_default(),
-            },
-        ));
+    for (name, text, secrecy) in [
+        ("send", spec.send, Secrecy::Logged),
+        ("send-secret", spec.send_secret, Secrecy::Secret),
+    ] {
+        if let Some(text) = text {
+            let eol = spec.eol.unwrap_or_default();
+            actions.push((name, Action::Send { text, eol, secrecy }));
+        }
     }
     if let Some(text) = spec.type_text {
         input::type_events(&text).map_err(|e| invalid(e.into()))?;
@@ -536,8 +548,8 @@ fn execute(session: &Session, step: &Step) -> Result<String, Error> {
             let m = session.expect(pattern, since, step.timeout)?;
             Ok(format!("matched {:?} at {:.0} ms", m.matched.text, m.t_ms))
         }
-        Action::Send { text, eol } => {
-            session.serial_send(text, *eol)?;
+        Action::Send { text, eol, secrecy } => {
+            session.serial_send(text, *eol, *secrecy)?;
             Ok(String::new())
         }
         Action::Type(text) => {
@@ -633,7 +645,7 @@ timeout = 300
 [[step]]
 send = "root"
 [[step]]
-send = "x"
+send-secret = "x"
 eol = "none"
 [[step]]
 type = "Echo hi\n"
@@ -680,9 +692,12 @@ since = "m"
             s.steps[2].action,
             Action::Send {
                 text: "x".into(),
-                eol: Eol::None
+                eol: Eol::None,
+                secrecy: Secrecy::Secret
             }
         );
+        assert_eq!(s.steps[2].action.describe(), "send <redacted 1 bytes>");
+        assert_eq!(s.steps[1].action.describe(), "send \"root\"");
         assert_eq!(
             s.steps[6].action,
             Action::Pointer(PointerAction::Abs {
@@ -733,6 +748,10 @@ since = "m"
         ));
         assert!(matches!(
             parse("[[step]]\nexpect = \"a\"\nsend = \"b\"\n"),
+            Err(ScenarioError::ManyActions { step: 1, .. })
+        ));
+        assert!(matches!(
+            parse("[[step]]\nsend = \"a\"\nsend-secret = \"b\"\n"),
             Err(ScenarioError::ManyActions { step: 1, .. })
         ));
         assert!(matches!(
