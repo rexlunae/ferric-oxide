@@ -130,7 +130,7 @@ without `profiling`, which cannot be combined with tracing. Both kernels use the
 same `kernel-config.toml` and link arguments, every option that rebuilds the
 kernel rebuilds the trace-mode kernel too, and like the kernel it never gets
 the user-space CPU flags (`cpu.flags_exclude`). The kernel recipes
-share their build in `recipes/core/kernel/build-kernel.sh`.
+share their build in `recipes/core/kernel/build-kernel.sh`, which `recipes/core/kernel-trace` links to, so editing it rebuilds both kernels.
 
 The bootloader loads the trace-mode kernel when the boot environment has
 `FERRIC_KERNEL=trace`, and the normal one for `FERRIC_KERNEL=normal` or
