@@ -3,18 +3,27 @@
 //!
 //! Each CPU's ring is in the shared layout of `ferric_trace::ring` (a header page, then the
 //! data pages), in frames the kernel allocates once and keeps, so `kernel.trace` can map them
-//! read-only into a reader. The kernel is the only writer of those words: the ring's size
+//! read-only into a reader, or, with host rings (`kernel.trace_host`, the `host` module), in
+//! the region a host reads. The kernel is the only writer of those words: the ring's size
 //! lives in the `Ring` itself, and the counters it reads back from the header are ones it
 //! stored, masked to the data before use. A reader that hands back a position goes through
 //! `Ring::commit_to`, which takes only a record boundary between `tail` and `head`.
 //!
-//! A full ring drops new records, unless the kernel keeps crash dumps (`kernel.trace_crash`):
-//! then it overwrites its oldest ones (`WhenFull::OverwriteOldest`), so a dump holds the last
-//! records before a panic even when nobody reads the rings.
+//! A full ring drops new records, unless the kernel keeps crash dumps (`kernel.trace_crash`)
+//! or the ring is a host ring: then it overwrites its oldest ones
+//! (`WhenFull::OverwriteOldest`), so a dump holds the last records before a panic even when
+//! nobody reads the rings, and a host reader never holds the kernel up.
+//!
+//! The rings are made when the first event is turned on at run time, or by `kmain`. When
+//! events are on from boot (or host rings are asked for), [`init_boot`] makes the boot
+//! CPU's ring before it turns them on, and [`init_cpus`] the other CPUs' before they start,
+//! so no record from boot is lost, provided the trace clock can be chosen that early (see
+//! `clock::choice_early`).
 
 use alloc::{boxed::Box, vec::Vec};
 use core::{fmt, sync::atomic::AtomicU64};
 
+use ferric_abi::boot_env::FERRIC_TRACE;
 use ferric_trace::{
     abi::{UserRecord, CPU_RING_WORDS},
     filter::{Filter, FilterError, Loaded, Slot},
@@ -123,26 +132,58 @@ pub fn control(spec: &str, on: bool, mode: Mode) -> Result<usize, ControlError<'
 }
 
 /// The value of `key` in the boot environment (`KEY=VALUE` lines).
-fn env_value<'a>(env: &'a [u8], key: &str) -> Option<&'a str> {
+pub(super) fn env_value<'a>(env: &'a [u8], key: &str) -> Option<&'a str> {
     env.split(|&b| b == b'\n')
         .find_map(|line| line.strip_prefix(key.as_bytes())?.strip_prefix(b"="))
         .and_then(|value| core::str::from_utf8(value).ok())
         .map(str::trim)
 }
 
+/// The selections of events to turn on at boot: the build-time default (`trace.boot` in the
+/// kernel's `config.toml`) and the boot environment's `FERRIC_TRACE`, with their names.
+fn boot_sources(env: &[u8]) -> [(&'static str, &str); 2] {
+    [
+        ("trace.boot", option_env!("FERRIC_TRACE_BOOT").unwrap_or("")),
+        (FERRIC_TRACE, env_value(env, FERRIC_TRACE).unwrap_or("")),
+    ]
+}
+
+/// Whether rings are wanted from boot: events are selected to turn on at boot, or host rings
+/// were reserved.
+pub fn rings_wanted_at_boot(env: &[u8]) -> bool {
+    host_reserved() || boot_sources(env).iter().any(|(_, spec)| !spec.is_empty())
+}
+
+/// Whether host rings were reserved.
+fn host_reserved() -> bool {
+    #[cfg(feature = "trace_host")]
+    return super::host::is_reserved();
+    #[cfg(not(feature = "trace_host"))]
+    false
+}
+
 /// Turns on the events the build-time default (`trace.boot` in the kernel's `config.toml`) and
 /// the boot environment's `FERRIC_TRACE` select. Runs on the BSP before the other CPUs start.
-/// The trace-mode kernel (`trace_mode`) first logs the line `trace: trace-mode kernel`.
+///
+/// When rings are wanted from boot ([`rings_wanted_at_boot`]), it first makes the boot CPU's
+/// ring (and every host ring), if the clock can be chosen this early; otherwise records
+/// before `kmain` makes the rings are dropped, as it logs. The trace-mode kernel
+/// (`trace_mode`) first logs the line `trace: trace-mode kernel`.
 pub fn init_boot(env: &[u8]) {
     // The harness's proof that the bootloader loaded the trace-mode kernel. Written without
     // `info!`'s module prefix, so the log line is exactly this text.
     #[cfg(feature = "trace_mode")]
     crate::println!("trace: trace-mode kernel");
-    let sources = [
-        ("trace.boot", option_env!("FERRIC_TRACE_BOOT").unwrap_or("")),
-        ("FERRIC_TRACE", env_value(env, "FERRIC_TRACE").unwrap_or("")),
-    ];
-    for (source, spec) in sources {
+    if rings_wanted_at_boot(env) {
+        if super::clock::choice_early().is_some() {
+            make_rings(1);
+        } else {
+            crate::info!(
+                "trace: records before kmain are not kept: the trace clock waits for the HPET"
+            );
+        }
+    }
+    for (source, spec) in boot_sources(env) {
         if spec.is_empty() {
             continue;
         }
@@ -207,7 +248,18 @@ impl FramePages {
         Ok(Self { frames, pages })
     }
 
-    /// The frames, header first.
+    /// A ring's pages in the host ring region: `words`, a whole number of pages. They are
+    /// not frames a grant can hold, so it has no frames to map.
+    #[cfg(feature = "trace_host")]
+    fn region(words: &'static [AtomicU64]) -> Self {
+        let (pages, _) = words.as_chunks::<WORDS_PER_PAGE>();
+        Self {
+            frames: &[],
+            pages: pages.iter().collect(),
+        }
+    }
+
+    /// The frames, header first; none for a host ring, which cannot be mapped into a reader.
     pub fn frames(&self) -> &'static [RaiiFrame] {
         self.frames
     }
@@ -247,16 +299,53 @@ static RINGS: [Once<CpuRing>; MAX_CPU_COUNT as usize] =
 pub fn init_rings() {
     // The clock is picked before the first ring exists, so every record has its timestamps.
     super::clock::choice();
-    for (cpu, ring) in RINGS.iter().enumerate().take(crate::cpu_count() as usize) {
+    make_rings(crate::cpu_count() as usize);
+}
+
+/// Makes the rings of the first `count` CPUs, which the boot CPU is about to start, if
+/// [`init_boot`] made the boot CPU's ring: then records from boot are kept, the other CPUs'
+/// included. Called on the boot CPU before it starts the others.
+pub fn init_cpus(count: usize) {
+    if ring(LogicalCpuId::BSP).is_some() {
+        make_rings(count);
+    }
+}
+
+/// Makes a ring for each of the first `count` CPUs that has none, and for every CPU the host
+/// ring region holds, then publishes the region's directory. The clock must be chosen.
+fn make_rings(count: usize) {
+    #[cfg(feature = "trace_host")]
+    let count = count.max(super::host::cpus());
+    for (cpu, ring) in RINGS.iter().enumerate().take(count) {
         let made = ring.try_call_once(|| {
-            Ring::shared(FramePages::allocate()?)
-                .map(|ring| ring.when_full(WHEN_FULL))
-                .map_err(RingInitError::Layout)
+            #[cfg(feature = "trace_host")]
+            if let Some(words) = super::host::ring_words(cpu) {
+                return host_ring(words);
+            }
+            frame_ring()
         });
         if let Err(err) = made {
             crate::warn!("trace: no ring for CPU {cpu}: {err}");
         }
     }
+    #[cfg(feature = "trace_host")]
+    super::host::publish();
+}
+
+/// A new ring in frames of its own.
+fn frame_ring() -> Result<CpuRing, RingInitError> {
+    Ring::shared(FramePages::allocate()?)
+        .map(|ring| ring.when_full(WHEN_FULL))
+        .map_err(RingInitError::Layout)
+}
+
+/// A new ring in `words` of the host ring region, which overwrites its oldest records when
+/// full: a host reader never consumes, so the ring must not wait for one.
+#[cfg(feature = "trace_host")]
+fn host_ring(words: &'static [AtomicU64]) -> Result<CpuRing, RingInitError> {
+    Ring::shared(FramePages::region(words))
+        .map(|ring| ring.when_full(WhenFull::OverwriteOldest))
+        .map_err(RingInitError::Layout)
 }
 
 /// CPU `cpu`'s ring, if it has one.

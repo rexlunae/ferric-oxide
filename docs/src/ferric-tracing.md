@@ -29,6 +29,7 @@ what is on at run time.
 | `kernel.trace_crash` | `false` | Reserves the crash region: a panic leaves its message and the newest records for the next boot ([Crash dump](#crash-dump)) |
 | `kernel.trace_crash_base` | `"0x4000000"` | The crash region's physical address, written to the kernel `config.toml` as `trace.crash_base` |
 | `kernel.trace_crash_test` | `false` | Testing only: writing `panic` to `kernel.trace/crash` panics the kernel and resets the machine after the dump |
+| `kernel.trace_host` | `false` | Lets `FERRIC_TRACE_HOST=<KiB per CPU>` in the boot environment put the rings where a host reads them out of a VM's RAM ([Host-visible rings](#host-visible-rings)) |
 | `kernel.log_persist` | `false` | Keeps the kernel log in reserved RAM too, so the next boot serves its end as `/scheme/sys/log_previous` ([Persistent kernel log](#persistent-kernel-log)); needs no `kernel.trace` |
 | `kernel.log_persist_base` | `"0x4010000"` | The persistent log region's physical address, written to the kernel `config.toml` as `log.persist_base` |
 | `kernel.trace_mode` | `false` | Also builds the trace-mode kernel, `usr/lib/boot/kernel-trace`, which the bootloader loads for `FERRIC_KERNEL=trace` ([Trace mode](#trace-mode)); needs no `kernel.trace` |
@@ -48,6 +49,16 @@ subsystem (`syscall`, `sched`, `scheme`, `mm`, `irq`, `iommu`) or an event name 
 ([Setting the boot environment](#setting-the-boot-environment)). Both are
 applied on the bootstrap processor before the other CPUs start, and the kernel
 logs `trace: <event> on from boot (<source>)` for each event that is on.
+
+When either selects events, the bootstrap processor's ring is made before the
+tracepoints are patched, and the other CPUs' rings before the bootstrap
+processor starts them, so the records of device, ACPI, IOMMU and AP bring-up
+are kept. That needs the [trace clock](#timestamps) chosen that early: an
+invariant TSC is known from CPUID, and a KVM clock is set up on the bootstrap
+processor early for it. A machine whose clock would be the HPET (QEMU without
+KVM, for one) keeps records only from `kmain` on, because the HPET runs only
+once ACPI is read; the kernel then logs `trace: records before kmain are not
+kept: the trace clock waits for the HPET`.
 
 ```toml
 [kernel]
@@ -698,21 +709,34 @@ A record is a sequence of little-endian 64-bit words:
 Event ids and names come from `ferric_trace::kernel::CATALOG`. Decoders use
 that same catalog, and `ferric_trace::record::Records` decodes a buffer.
 
-Each CPU has a 64 KiB ring, created when the CPUs are counted or on the first
-run-time enable. When a ring is full, new records are dropped and counted, or,
-with `kernel.trace_crash`, the oldest are overwritten and counted (see
-[Crash dump](#crash-dump)).
+Each CPU has a 64 KiB ring, created when the CPUs are counted, on the first
+run-time enable, or at boot when events are on from boot (see
+[Enabling it](#enabling-it)). When a ring is full, new records are dropped and
+counted, or, with `kernel.trace_crash` and for host-visible rings, the oldest
+are overwritten and counted (see [Crash dump](#crash-dump) and
+[Host-visible rings](#host-visible-rings), whose rings have the size the boot
+environment gives).
 The ring sits in kernel-allocated pages in the shared layout of
-`ferric_trace::ring`: a 4 KiB header page (magic `FOTRACE1`, layout version,
-data length, and `head`, `tail` and `lost` on cache lines of their own), then
-the data pages.
+`ferric_trace::ring`: a 4 KiB header page (magic `FOTRACE1`, layout version
+2, data length, `head`, `tail`, `lost`, `oldest` and the ring's policy for
+records that do not fit, each on a cache line of its own), then the data pages.
+A ring that overwrites its oldest records (host-visible rings, and every ring
+with `kernel.trace_crash`) keeps `oldest`: the first record whose words the
+kernel has not overwritten. Only the kernel stores it, moving it record by
+record before it writes over older records, whether a reader has consumed them
+or not, so the records from `oldest` up to `head` are always whole. A ring that
+drops new records reuses only words a reader consumed, so its `tail` bounds
+that instead, and it skips the `oldest` bookkeeping on every record; a host
+observer reads the policy word to know which bound applies. Version 2 added
+`oldest` and the policy word, and readers refuse other versions.
 
 ### Timestamps
 
 Records on different CPUs are merged by timestamp, so the clock must agree
 across CPUs. The kernel picks one clock for the whole boot, before the first
 ring exists (`crates/kernel/src/trace/clock.rs`, with the rule in
-`ferric_trace::clock::choose`):
+`ferric_trace::clock::choose`), at boot when rings are made then, otherwise at
+`kmain` or the first run-time enable:
 
 1. **`tsc`**, when CPUID leaf `0x8000_0007` reports an invariant TSC (EDX bit
    8; Intel SDM Vol. 3B, 18.17.1, and AMD APM Vol. 3, `Fn8000_0007_EDX`
@@ -744,6 +768,7 @@ over ([Capabilities](#capabilities)). The paths are defined in
 | `events` | One line per compiled-in event: `<id> <name> <subsystem> <level> <on\|off>` | `enable <selection>` or `disable <selection>` patches the tracepoints live; `filter <event> <filter\|none>` sets or removes an argument filter ([Argument filters](#argument-filters)) |
 | `stats` | One line per CPU: `cpu <n> pending <words> lost <records>` | — |
 | `clock` | One line: `clock <tsc\|kvmclock\|hpet> period_fs <femtoseconds\|unknown>` ([Timestamps](#timestamps)) | — |
+| `host` | Empty, or with [host-visible rings](#host-visible-rings) one line: `phys 0x<hex> cpus <n> kib <KiB per CPU>` | — |
 | `filters` | One line per filtered event, the command that sets it: `filter <event> <filter>` | — |
 | `cpu/<n>` | Drains whole records from CPU n's ring | `commit <end>` consumes a mapped read up to `end` |
 | `crash` | The previous boot's crash dump, from any offset (`kernel.trace_crash`; it exists only when there is one) | `panic` panics the kernel, with `kernel.trace_crash_test` only |
@@ -854,7 +879,9 @@ without a system call per batch:
   offset 0 with `PROT_READ` and `MAP_SHARED`. The kernel refuses `PROT_WRITE`
   (`EACCES`), a mapping without `PROT_READ`, a partial or a private mapping
   (`EINVAL`) and a fixed address (`EOPNOTSUPP`). `mprotect` cannot make the
-  mapping writable later.
+  mapping writable later. A [host-visible ring](#host-visible-rings) cannot be
+  mapped (`EINVAL`), because its pages are not frames a mapping can hold; it is
+  read instead (`ferric-trace capture --via auto` does that by itself).
 - `ferric_trace::ring::View` checks the header and copies whole records from
   the mapping. Each copy reports its end position.
 - Writing `commit <end>` to the descriptor lets the kernel reuse the words up
@@ -1089,6 +1116,177 @@ time since the first record. Later times use the capture's clock and
 and the start time (its first eight bytes; OTLP/JSON encodes the id in base64), so two
 captures sent to one backend keep separate traces. The mapping is described in
 `tools/ferric-trace/src/otlp.rs`.
+
+## Host-visible rings
+
+With `kernel.trace_host`, a host reads the trace rings straight out of a
+virtual machine's RAM while the guest runs: nothing runs in the guest to get
+the records out, there is no interrupt, VM exit, system call or guest I/O for
+it, and it works before the guest has a network, and after it hangs. The
+host never writes guest memory.
+
+### In the kernel
+
+`kernel.trace_host` (Cargo feature `trace_host`, which needs `trace`) does
+nothing on its own. Booted with `FERRIC_TRACE_HOST=<KiB per CPU>` in the boot
+environment, a power of two from 4 to 1048576 (4096, 4 MiB per CPU, is a good
+start), the kernel:
+
+1. takes one physically contiguous region from the boot-time allocator, after
+   the ACPI tables are mapped and before the frame allocator gets the rest of
+   memory, sized for the CPUs the MADT lists (as the APs it will start):
+   a 4 KiB directory page, then one ring per CPU, each a 4 KiB header page
+   and the data (`crates/kernel/src/trace/host.rs`, `reserved.rs`);
+2. makes every CPU's ring there, in the shared layout of
+   [Records and rings](#records-and-rings), overwriting its oldest records when
+   full, so a reader can never hold the kernel up; the rings are made before
+   the other CPUs start (as with [boot-time events](#enabling-it)), so a
+   follower sees boot from the device and ACPI setup on, unless the clock is
+   the HPET;
+3. once the rings exist and the [trace clock](#timestamps) is chosen, writes
+   the directory and logs where it is:
+
+```text
+trace: host rings at phys 0x2a00000, 4 CPUs x 4096 KiB
+```
+
+A value that is not such a size, or a region no free area of RAM holds in one
+run, is logged (`trace: FERRIC_TRACE_HOST="..." ignored: ...`) and leaves host
+rings off, with all of memory still free; the kernel then traces as without
+`trace_host`. So `FERRIC_TRACE_HOST` in the boot environment is only a
+request; what the kernel did is in `kernel.trace/host`
+(`ferric_trace::host::HostRingsLine`), readable with the same access as
+`clock`: empty without host rings (also on a kernel without `trace_host`),
+otherwise one line with the region's physical address, the number of host
+rings and their size:
+
+```text
+phys 0x2a00000 cpus 4 kib 4096
+```
+
+The region stays in use for the whole boot, and the boot-time
+allocator gives up the rest of any free area too small for the region on its
+way to one large enough, which the kernel logs (`reserved: <n> KiB of free RAM
+left unused ...`). Rings that fit in the first free area avoid that.
+
+The directory format is `ferric_trace::host` (`crates/trace/src/host.rs`):
+64-bit words in the CPU's byte order, the magic `FOTRDIR1`, a version, the
+directory's own physical address, a value that differs from one boot to the
+next, the CPU count, the clock and its tick length (what a capture's `clock`
+file holds), then each ring's offset from the directory and length. The kernel
+writes the magic last, with release ordering.
+
+Readers in the guest drain host rings like any other. Reading
+`kernel.trace/cpu/<n>` (`ferric-trace capture`, the trace tests and
+benchmarks) and writing `commit` to it work as for an ordinary ring. The host
+still sees everything they consume. A host observer never relies on `tail`.
+When it falls more than a ring behind, it resumes at the ring's `oldest`
+word, which only the kernel moves, so a guest reader's drain cannot hide
+records from it. Each reader therefore gets every record the kernel did not
+overwrite before that reader read it. Mapping host rings fails with `EINVAL`,
+because the region's pages are not frames a mapping can hold
+([#378](https://github.com/rexlunae/ferric-oxide/issues/378)), so
+`ferric-trace capture --via map` does not work on them. `--via auto` and
+`--via read` do. Guest tests decide from `kernel.trace/host`, not from the
+boot environment. When the file holds a line, `ferric-trace-test` first runs
+`trace-host-read`, which checks that a read of CPU 0's ring returns records
+and that `commit` is accepted. It then runs its other steps but skips the
+three that map the rings: `trace-mmap`, `trace-mapping` and `trace-clock`.
+The smoke script skips `trace-capture`, which captures through the mappings,
+when `ferric-trace-test host-rings` exits 0.
+
+### Following from the host
+
+Give QEMU the guest's RAM as a shared file, under `/dev/shm` (not `/tmp`):
+
+```sh
+qemu-system-x86_64 -machine q35,memory-backend=ram \
+    -object memory-backend-file,id=ram,mem-path=/dev/shm/guest-ram,size=2048M,share=on \
+    -m 2048 ...
+```
+
+boot the trace kernel with `FERRIC_TRACE_HOST=4096` (and the events to record
+in `FERRIC_TRACE`, or turn them on later through `kernel.trace/events`), and
+on the host, after the `trace: host rings at phys` line:
+
+```sh
+ferric-trace follow --guest-ram /dev/shm/guest-ram --phys 0x2a00000 --out run/trace --live
+```
+
+`follow` (Linux hosts only; `tools/ferric-trace/src/follow.rs`) maps the file
+privately from a read-only descriptor (`crates/guest-ram`), so even a stray
+store could only change its own copy of a page, and follows each ring with
+`ferric_trace::ring::Observer`. The observer keeps its own position in the
+ring and copies from there to `head`. It judges from `head` and `oldest`
+whether the kernel overwrote words it copied, and when it did, it keeps or
+copies again from `oldest`, the oldest record still whole. It reports the words
+it skipped, which are exactly those the kernel overwrote before it read them.
+What guest readers consumed is never skipped. It needs only relaxed loads and
+fences, which are sound on memory mapped like this.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--guest-ram <file>` | — | The guest's RAM file |
+| `--out <dir>` | — | The capture directory; it must not exist |
+| `--phys <hex>` | scan | The directory's address from the kernel's line. Without it, `follow` scans the pages of the file that hold data (it asks the file system with `SEEK_DATA`, so it does not allocate the file's holes) for the magic, and takes a page only if its address field is where it was found, so a copy of the directory elsewhere is not taken for it |
+| `--ram-mib <n>` | the file's size | The guest's RAM, for q35's placement of it: RAM below 2.75 GiB lies below 4 GiB; larger RAM keeps 2 GiB there and continues at 4 GiB, which the file holds right after the first 2 GiB. Checked against QEMU 10.2.1 on 2 November 2026 by writing markers into the shared file and reading the guest-physical addresses with the monitor's `xp`, for 2560, 2816 (the threshold), 4096 and 8192 MiB |
+| `--interval-ms <n>` | 10 | Time between polls |
+| `--live` | off | One line a second on standard output, see below |
+| `--duration <s>` | until stopped | Stop after following this long |
+
+It writes the [capture directory format](#reading-a-capture-on-the-host), so
+`text`, `counts`, `perfetto` and `otlp` read the result, with `--partial` while
+`follow` still runs:
+
+| File | Content |
+| --- | --- |
+| `INCOMPLETE` | Present until `follow` stops cleanly |
+| `clock` | The trace clock, from the directory |
+| `cpu<n>` | CPU n's records, appended as they are read |
+| `stats.start` | Per CPU, the words in the ring when following began and the records lost before then, written after the first poll (which comes right after following starts, so "before" means before that poll; a guest that boots again before it gets the kernel's count alone): the larger of the kernel's count and the records in the words the first copy skipped, which include records a guest reader consumed before the kernel overwrote them. It is a lower bound: the kernel does not say how much of its count is records it dropped without writing, which the skip does not hold |
+| `stats.end` | Per CPU, the words left unread, and the records lost: those of `stats.start` plus `follow`'s own losses |
+| `host-clock` | Samples `host_ns <ns> cpu <n> head <position> timestamp <ticks>`: the host's `CLOCK_MONOTONIC` when it had read CPU n's ring up to `head`, and the timestamp of the record that ends there, at most one per CPU each 100 ms. The record was written between the previous poll of that ring and `host_ns`, so the samples tie trace time to host time (the clock serial-line timestamps use) to within a poll interval |
+
+`counts` reports the losses as `lost_before` and `lost_during`. The rings
+overwrite, so a follower that falls more than a ring behind (a burst bigger
+than the ring between two polls) loses records. It knows the words it had to
+skip exactly, and estimates the records from the mean record length it read on
+that CPU (at least one per skip); `follow` prints both at the end and warns
+when there were any. Larger rings or a shorter interval avoid them.
+
+The `--live` line counts each event's records so far and its rate over the
+last second, busiest first:
+
+```text
+live t_s=12.0 records=48211 rate=4031 lost=0 syscall.enter=20012/1673 syscall.exit=20011/1673 sched.switch=812/71
+```
+
+`follow` stops on SIGINT or SIGTERM, after `--duration`, when the RAM file is
+removed, or when the guest boots again (the directory's magic or boot value
+changes, or a ring starts over), and in every case reads the rings a last time,
+writes `stats.end` and removes `INCOMPLETE`. A second SIGINT or SIGTERM ends
+it at once (status 130 or 143), for a stop that hangs. If the `--live` lines
+cannot be written (a closed pipe), it saves the capture the same way and then
+fails. Stopped before it found the directory, it fails and leaves only
+`INCOMPLETE` in the directory. One run follows one boot.
+
+Limits:
+
+- Linux hosts only, and QEMU's q35 placement of RAM (or a file whose RAM all
+  lies below 4 GiB). Another machine type needs the reader's
+  `ferric_guest_ram::RamLayout::split`; the command has no option for it yet.
+- On a machine whose trace clock is the HPET (QEMU without KVM), the rings
+  start at `kmain`, so boot before it is not recorded.
+- The ring size is per CPU and fixed for the boot. A ring that wraps between
+  two polls loses its oldest records, and the follower can only estimate how
+  many.
+- No CI job boots a kernel with host rings yet. The kernel side is built,
+  documented and linted with `trace_host`; the reader is tested on RAM files
+  the kernel's own ring producer filled (`cargo test -p ferric-trace-cli`,
+  including `tests/follow.rs`, which runs the command and stops it with
+  SIGTERM, `cargo test -p ferric-guest-ram`, and the tests of
+  `ferric_trace::host` and `ferric_trace::ring::Observer`, one of which races
+  a producer thread).
 
 ## TLB and address-space switch counters
 
@@ -1547,7 +1745,10 @@ native clock calibration or the Phase S adoption criteria.
   the next driver, so the rings it drains are not yet anyone else's. The smoke script then runs
   `ferric-trace capture --via map` (through the mapping, which fails if a
   ring does not map) and `ferric-trace text` on the result, and prints
-  `FERRIC_TEST_PASS trace-capture` if both succeed. When `/scheme` lists no
+  `FERRIC_TEST_PASS trace-capture` if both succeed. With
+  [host-visible rings](#host-visible-rings), which cannot be mapped yet, it
+  prints `FERRIC_TEST_SKIP trace-capture` (it asks
+  `ferric-trace-test host-rings`). When `/scheme` lists no
   `kernel.trace` it prints `FERRIC_TEST_SKIP trace-capture` instead, as on the
   `trace-overhead` job's baseline image, which requires that skip.
 - **Overhead.** `ferric-trace-bench` and the `trace-overhead` job (see
@@ -1772,7 +1973,10 @@ is refused the file.
 
 - Tracepoints for the interrupts the kernel handles
   itself (the timer, IPIs).
-- Live viewing on the target and Perfetto's protobuf format.
+- Live viewing on the target and Perfetto's protobuf format. A host can watch
+  a virtual machine live ([Host-visible rings](#host-visible-rings)).
+- In-guest mapping of host-visible rings, and a ring size for the ordinary
+  rings set at boot.
 - Architectures other than x86_64.
 - A `ferric-trace` option to work through a capability descriptor it was
   given; the tool opens the scheme by path, as root.

@@ -91,6 +91,19 @@
 //! kernel without `mm.page_fault`. Without a `kernel.trace` scheme (a kernel built without
 //! the `trace` feature) it prints `FERRIC_TEST_SKIP trace` and exits zero.
 //!
+//! When the kernel's `host` file reports host-visible rings (`ferric_trace::host`), the run
+//! starts with `trace-host-read`: a read of CPU 0's ring drains whole records, and `commit`
+//! is accepted, as for any ring (what the guest consumes stays visible to the host, which
+//! follows the producer's `oldest`). The steps above then run, except the three that map the
+//! rings, `trace-mmap`, `trace-mapping` and `trace-clock`, which print
+//! `FERRIC_TEST_SKIP <step>: host-visible rings cannot be mapped (#378)`. The file, not the
+//! boot environment's `FERRIC_TRACE_HOST`, decides, since the kernel can refuse that request;
+//! a malformed line fails as `trace-host`.
+//!
+//! `ferric-trace-test host-rings` prints nothing and exits 0 when the `host` file reports
+//! host-visible rings, 1 otherwise, for scripts such as the smoke image's `trace-capture`
+//! step, which maps the rings.
+//!
 //! `ferric-trace-test crash` runs the crash-dump test instead (`kernel.trace_crash`): on a
 //! crash-test kernel's first boot it panics the kernel on purpose (`trace-crash-armed`), and on
 //! the boot after it checks the dump that panic left (`trace-crash-read`); see `redox::crash`.

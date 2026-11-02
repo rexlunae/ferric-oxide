@@ -29,6 +29,8 @@
 //!   read: its layout, a writer that copies the newest records of each ring, and a parser.
 //! - [`tlb`] holds the kernel's per-CPU TLB, CR3 and shootdown counters (`kernel.tlb_stats`)
 //!   and the line format of `/scheme/sys/tlb`, which serves them.
+//! - [`host`] is the region of host-visible rings (`kernel.trace_host`): the directory page a
+//!   host finds them by in a guest's RAM, which it then follows with a [`ring::Observer`].
 //! - `config` (feature `config`) is the initfs `trace.toml` that bootstrap applies before
 //!   `init` starts.
 //!
@@ -69,6 +71,7 @@ pub mod config;
 pub mod crash;
 mod event;
 pub mod filter;
+pub mod host;
 pub mod kernel;
 pub mod klog;
 mod level;

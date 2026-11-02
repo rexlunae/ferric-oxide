@@ -19,6 +19,9 @@ use ferric_trace_cli::flamegraph::{Folded, Symbolizer};
 use ferric_trace_cli::profile::{self, Run};
 use ferric_trace_cli::{drain, otlp, perfetto, svg, text};
 
+#[cfg(target_os = "linux")]
+mod follow_cmd;
+
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
@@ -164,6 +167,10 @@ enum Cmd {
         #[arg(long, default_value = "0")]
         start_unix_ns: u64,
     },
+    /// On the host: follow a guest's host-visible trace rings (kernel.trace_host) out of its
+    /// RAM file as it runs, into a capture directory
+    #[cfg(target_os = "linux")]
+    Follow(follow_cmd::FollowArgs),
 }
 
 /// Why the command failed.
@@ -193,6 +200,9 @@ enum CliError {
         #[source]
         source: io::Error,
     },
+    #[cfg(target_os = "linux")]
+    #[error("follow failed")]
+    Follow(#[from] follow_cmd::FollowCmdError),
 }
 
 fn run(cli: Cli) -> Result<(), CliError> {
@@ -326,6 +336,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             };
             write_output(output, &otlp::to_json(&capture, options))
         }
+        #[cfg(target_os = "linux")]
+        Cmd::Follow(args) => Ok(follow_cmd::run(args)?),
     }
 }
 

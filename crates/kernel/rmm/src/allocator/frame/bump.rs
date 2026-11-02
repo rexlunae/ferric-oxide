@@ -62,6 +62,28 @@ impl<A: Arch> BumpAllocator<A> {
     pub fn offset(&self) -> usize {
         self.usage().used().data() * A::PAGE_SIZE
     }
+    /// Ferric Oxide: the free bytes [`FrameAllocator::allocate`] would pass over, and never
+    /// hand out, to allocate `count` contiguous frames: the rest of each area too small for
+    /// them before the first that holds them. `None` when no remaining area holds them, or
+    /// `count` is zero or too large; `allocate` would then fail, and it would also have used
+    /// up every area on the way, so ask first before a large request that may not fit.
+    pub fn skipped_before_fit(&self, count: FrameCount) -> Option<usize> {
+        let req_size = count
+            .data()
+            .checked_mul(A::PAGE_SIZE)
+            .filter(|&size| size > 0)?;
+        let (areas, mut off) = self.cur_areas;
+        let mut skipped = 0usize;
+        for area in areas {
+            let free = area.size.saturating_sub(off);
+            if free >= req_size {
+                return Some(skipped);
+            }
+            skipped = skipped.saturating_add(free);
+            off = 0;
+        }
+        None
+    }
 }
 
 // SAFETY: Under the memory-area ownership contract, advancing the cursor gives
@@ -157,6 +179,42 @@ mod tests {
             assert!(exhausted.allocate_one().is_none());
             assert_eq!(exhausted.usage().free().data(), 0);
         }
+    }
+
+    #[test]
+    fn skipped_before_fit_predicts_allocate_without_consuming() {
+        let _machine = machine();
+        // SAFETY: The test owns the disjoint mapped areas under the machine guard.
+        let mut allocator = unsafe { BumpAllocator::<EmulateArch>::new(&AREAS, 0) };
+        let one = FrameCount::new(1);
+        let two = FrameCount::new(2);
+        assert_eq!(allocator.skipped_before_fit(one), Some(0));
+        // Two frames fit only in the second area, past the first area's one free frame.
+        assert_eq!(allocator.skipped_before_fit(two), Some(PAGE));
+        for count in [0, 3, usize::MAX / PAGE + 1] {
+            assert_eq!(allocator.skipped_before_fit(FrameCount::new(count)), None);
+        }
+        assert_eq!(allocator.usage().used().data(), 0, "asking takes nothing");
+        assert_eq!(allocator.abs_offset(), AREAS[0].base);
+
+        // (The emulated machine zeroes one page at a time, so allocate frames singly.)
+        assert_eq!(allocator.allocate_one(), Some(AREAS[0].base));
+        assert_eq!(allocator.skipped_before_fit(two), Some(0));
+        assert_eq!(allocator.allocate_one(), Some(AREAS[1].base));
+        assert_eq!(allocator.skipped_before_fit(one), Some(0));
+        assert_eq!(allocator.skipped_before_fit(two), None);
+        assert_eq!(allocator.usage().used().data(), 2, "asking takes nothing");
+    }
+
+    /// The failure `skipped_before_fit` lets a caller avoid: a request no area holds uses up
+    /// every area.
+    #[test]
+    fn a_request_no_area_holds_exhausts_the_allocator() {
+        let _machine = machine();
+        // SAFETY: The test owns the disjoint mapped areas under the machine guard.
+        let mut allocator = unsafe { BumpAllocator::<EmulateArch>::new(&AREAS, 0) };
+        assert_eq!(allocator.allocate(FrameCount::new(3)), None);
+        assert!(allocator.allocate_one().is_none());
     }
 
     #[test]

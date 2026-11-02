@@ -9,6 +9,7 @@
 //! | [`STATS_PATH`] | one [`StatsLine`] per CPU | — |
 //! | [`FILTERS_PATH`] | one [`FilterLine`] per filtered event, written as the command that sets it (a [`FilterBusyLine`] for one that could not be read) | — |
 //! | [`CLOCK_PATH`] | one [`ClockLine`](crate::clock::ClockLine): the clock behind the timestamps | — |
+//! | [`HOST_PATH`] | empty, or one [`HostRingsLine`](crate::host::HostRingsLine) when the CPUs' rings are [host-visible](crate::host) | — |
 //! | `cpu/<n>` ([`Path::Cpu`]) | drains whole records from CPU n's ring, in the [`record`](crate::record) format; 0 bytes when it is empty | a [`CpuCommand`]: `commit <end>` |
 //! | [`CRASH_PATH`] | the previous boot's crash dump | [`CRASH_TEST_COMMAND`], on a crash-test kernel |
 //! | `cap/read`, `cap/control` ([`Path::Cap`]) | — (a capability) | — |
@@ -26,7 +27,8 @@
 //! without a system call per batch. To let the kernel reuse what it has read, the reader
 //! writes `commit <end>` to the descriptor, `end` being the [`Peek::end`] of its last copy;
 //! the kernel accepts only the end of a record between its own `tail` and `head`, and returns
-//! `EINVAL` otherwise and `EAGAIN` while another reader of that CPU is reading.
+//! `EINVAL` otherwise and `EAGAIN` while another reader of that CPU is reading. A ring in the
+//! host-visible region ([`host`](crate::host)) cannot be mapped (`EINVAL`); read it instead.
 //!
 //! The kernel stays the only writer of the mapped words, and it never takes a value from them
 //! that it did not store itself: the ring's size and its counters are kept in the kernel, so
@@ -91,6 +93,12 @@ pub const FILTERS_PATH: &str = "filters";
 
 /// The file naming the clock record timestamps come from ([`crate::clock`]).
 pub const CLOCK_PATH: &str = "clock";
+
+/// The file saying whether the kernel has [host-visible rings](crate::host): empty without
+/// them, else one [`HostRingsLine`](crate::host::HostRingsLine). This, not the boot
+/// environment's request, says what the kernel did: it can refuse the request and keep
+/// ordinary rings.
+pub const HOST_PATH: &str = "host";
 
 /// The crash dump the previous boot's panic left ([`crate::crash`]), with `kernel.trace_crash`.
 ///
@@ -187,6 +195,8 @@ pub enum Path {
     Filters,
     /// [`CLOCK_PATH`].
     Clock,
+    /// [`HOST_PATH`].
+    Host,
     /// `cpu/<n>`: the records of CPU `n`.
     Cpu(u32),
     /// [`CRASH_PATH`].
@@ -206,6 +216,7 @@ impl Path {
             STATS_PATH => Some(Path::Stats),
             FILTERS_PATH => Some(Path::Filters),
             CLOCK_PATH => Some(Path::Clock),
+            HOST_PATH => Some(Path::Host),
             CRASH_PATH => Some(Path::Crash),
             EMIT_PATH => Some(Path::Emit),
             other => {
@@ -697,6 +708,8 @@ mod tests {
         assert_eq!(Path::parse("/stats/"), Some(Path::Stats));
         assert_eq!(Path::parse("filters"), Some(Path::Filters));
         assert_eq!(Path::parse("clock"), Some(Path::Clock));
+        assert_eq!(Path::parse("/host"), Some(Path::Host));
+        assert_eq!(Path::parse("hosts"), None);
         assert_eq!(Path::parse("crash"), Some(Path::Crash));
         assert_eq!(Path::parse("/emit"), Some(Path::Emit));
         assert_eq!(Path::parse("cpu/0"), Some(Path::Cpu(0)));

@@ -10,9 +10,16 @@
 //! - `filters`: one line per filtered event, written as the command that sets its filter.
 //! - `clock`: the clock record timestamps come from and its tick length
 //!   (`ferric_trace::clock::ClockLine`), chosen once at boot (`trace::clock`).
+//! - `host`: with host-visible rings (`trace_host`, `trace::host`), one
+//!   `ferric_trace::host::HostRingsLine` saying where the region is, its rings and their size;
+//!   empty without them, which includes a boot whose `FERRIC_TRACE_HOST` the kernel refused.
 //! - `cpu/<n>`: reading drains whole records from CPU n's ring; 0 bytes when it is empty, and
 //!   `EINVAL` when the buffer cannot hold the next record, and `EAGAIN` while another reader
 //!   is reading that CPU. Records are consumed only once the copy to the caller succeeded.
+//!   Host-visible rings (`trace_host`) are read and committed here like any other: what a
+//!   reader in the guest consumes stays visible to the host, which follows the producer's
+//!   `oldest` position, not `tail` (`ferric_trace::ring::Observer`). They cannot be mapped
+//!   (`EINVAL`): the region's pages are not frames a grant can hold.
 //!   `mmap` of the descriptor (`PROT_READ`, `MAP_SHARED`, the whole `CPU_MAP_BYTES` from offset
 //!   0) maps the ring itself read-only, header page and data; writing `commit <end>` then
 //!   consumes it up to `end`, under the same one-reader lock as a read.
@@ -45,11 +52,16 @@
 //!   the event and its argument count, and stores the record if the event is on
 //!   (`trace::emit_user`); it vouches for the record's time and CPU, not its arguments.
 //!
-//! `events`, `stats`, `clock`, `filters` and `crash` are read from a snapshot taken at the first read of each open, as in
-//! the `sys` scheme. Opening by path is for root only (with control access): traces leak
-//! timing and kernel addresses.
+//! `events`, `stats`, `clock`, `host`, `filters` and `crash` are read from a snapshot taken at
+//! the first read of each open, as in the `sys` scheme. Opening by path is for root only (with
+//! control access): traces leak timing and kernel addresses.
 
-use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    collections::BTreeMap,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use core::{
     fmt::Write,
     sync::atomic::{AtomicUsize, Ordering},
@@ -61,6 +73,7 @@ use ferric_trace::{
         UserRecord, CPU_MAP_BYTES,
     },
     filter::Loaded,
+    host::HostRingsLine,
 };
 use spin::{Mutex, MutexGuard};
 use syscall::{
@@ -99,14 +112,15 @@ enum Text {
     Stats,
     Filters,
     Clock,
+    Host,
     Crash,
 }
 
 /// An open handle.
 #[derive(Clone)]
 enum Handle {
-    /// `events`, `stats`, `clock`, `filters` or `crash`, with the snapshot its reads come
-    /// from once taken, and the access it was opened with.
+    /// `events`, `stats`, `clock`, `host`, `filters` or `crash`, with the snapshot its reads
+    /// come from once taken, and the access it was opened with.
     Text {
         text: Text,
         snapshot: Option<Arc<[u8]>>,
@@ -168,6 +182,11 @@ fn render(text: Text) -> Arc<[u8]> {
         Text::Clock => {
             let _ = write!(out, "{}", trace::clock::choice().line());
         }
+        Text::Host => {
+            if let Some(line) = host_rings() {
+                out = line.to_string();
+            }
+        }
     }
     Arc::from(out.into_bytes())
 }
@@ -177,6 +196,18 @@ fn crash_dump() -> Option<Arc<[u8]>> {
     #[cfg(feature = "trace_crash")]
     return trace::crash::saved();
     #[cfg(not(feature = "trace_crash"))]
+    None
+}
+
+/// Ferric Oxide: the `host` file's line, when the kernel has host-visible rings.
+#[cfg(feature = "trace_host")]
+fn host_rings() -> Option<HostRingsLine> {
+    trace::host::line()
+}
+
+/// Without `trace_host` there are no host rings.
+#[cfg(not(feature = "trace_host"))]
+fn host_rings() -> Option<HostRingsLine> {
     None
 }
 
@@ -228,6 +259,7 @@ fn open(path: &str, access: Access) -> Result<OpenResult> {
         Path::Stats => (Text::Stats, InternalFlags::POSITIONED),
         Path::Filters => (Text::Filters, InternalFlags::POSITIONED),
         Path::Clock => (Text::Clock, InternalFlags::POSITIONED),
+        Path::Host => (Text::Host, InternalFlags::POSITIONED),
         Path::Crash if crash_exists() => (Text::Crash, InternalFlags::POSITIONED),
         Path::Crash => return Err(Error::new(ENOENT)),
         Path::Cpu(cpu) if cpu < crate::cpu_count() => {
@@ -467,7 +499,7 @@ impl KernelScheme for TraceScheme {
                 ..
             } => require_control(access).and_then(|()| crash_command(buf)),
             Handle::Text {
-                text: Text::Stats | Text::Clock | Text::Filters,
+                text: Text::Stats | Text::Clock | Text::Host | Text::Filters,
                 ..
             }
             | Handle::Cap(_) => Err(Error::new(EBADF)),
@@ -545,6 +577,9 @@ impl KernelScheme for TraceScheme {
             Handle::Text {
                 text: Text::Clock, ..
             } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::CLOCK_PATH),
+            Handle::Text {
+                text: Text::Host, ..
+            } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::HOST_PATH),
             Handle::Text {
                 text: Text::Crash, ..
             } => alloc::format!("/scheme/kernel.trace/{}", ferric_trace::abi::CRASH_PATH),
