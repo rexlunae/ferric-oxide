@@ -56,6 +56,11 @@
 //!   the words it is copying and the producer can reuse them; [`View::peek`] checks `tail`
 //!   after each copy and retries a copy it overtook.
 //!
+//! An [`Observer`] reads the same layout without handing anything back to anyone: it keeps
+//! its own position, ignores what other readers consume, and judges from `head` whether the
+//! producer overwrote what it copied. A host reading a guest's rings out of its RAM is one
+//! ([`host`](crate::host)).
+//!
 //! The header, in words: [`SHARED_MAGIC`] at [`MAGIC_WORD`], [`SHARED_VERSION`] at
 //! [`VERSION_WORD`], the data length at [`DATA_WORDS_WORD`], and `head`, `tail` and `lost` at
 //! [`HEAD_WORD`], [`TAIL_WORD`] and [`LOST_WORD`], each on a 64-byte line of its own, so the
@@ -73,6 +78,10 @@ use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 use crate::EventId;
 use crate::record::{Header, MAX_RECORD_WORDS, WORD_BYTES};
+
+mod observer;
+
+pub use observer::{OBSERVE_TRIES, ObserveError, Observed, Observer};
 
 /// Words, by index: the memory a [`Storage`] is made of.
 ///
@@ -396,6 +405,42 @@ impl<W: Words> Ring<Shared<W>> {
         self.storage.words()
     }
 
+    /// The shared ring a reader finds in `words`, after checking its header, for a reader
+    /// that never pushes. The header is loaded relaxed with an acquire fence after the magic,
+    /// which pairs with [`Ring::shared`]'s release store of it and, unlike an acquire load,
+    /// is allowed on memory mapped read-only.
+    fn read_shared(words: W) -> Result<Self, ViewError> {
+        if words.len() <= SHARED_HEADER_WORDS
+            || words.word(MAGIC_WORD).load(Ordering::Relaxed) != SHARED_MAGIC
+        {
+            return Err(ViewError::BadMagic);
+        }
+        fence(Ordering::Acquire);
+        let found = words.word(VERSION_WORD).load(Ordering::Relaxed);
+        if found != SHARED_VERSION {
+            return Err(ViewError::Version { found });
+        }
+        let data_words = words.word(DATA_WORDS_WORD).load(Ordering::Relaxed);
+        let available = words.len() - SHARED_HEADER_WORDS;
+        let bad = ViewError::BadLength {
+            data_words,
+            available,
+        };
+        if data_words != available as u64 {
+            return Err(bad);
+        }
+        let mask = data_mask(available).map_err(|_| bad)?;
+        Ok(Self {
+            mask,
+            // A reader never pushes.
+            when_full: WhenFull::DropNewest,
+            storage: Shared {
+                words,
+                data_len: available,
+            },
+        })
+    }
+
     /// Moves `tail` to `end`, a position a reader got from a [`View`]'s [`Peek::end`] and
     /// passed back. Only the consumer may call this. A position at or below `tail` leaves the
     /// ring as it is, as [`Ring::commit`] does with an older peek.
@@ -623,6 +668,12 @@ impl<S: Storage> Ring<S> {
     /// [`Ring::peek`] from position `tail`.
     fn peek_from(&self, tail: u64, out: &mut [u8]) -> Result<Peek, ReadError> {
         let head = self.storage.head().load(Ordering::Acquire);
+        self.copy_records(tail, head, out)
+    }
+
+    /// Copies the whole records from position `tail` up to `head`, a value of `head` the
+    /// caller loaded, that fit into `out`.
+    fn copy_records(&self, tail: u64, head: u64, out: &mut [u8]) -> Result<Peek, ReadError> {
         let mut pos = tail;
         let mut written = 0;
         while pos < head {
@@ -839,35 +890,8 @@ impl<W: Words> View<W> {
     ///
     /// [`ViewError`] when the header is not one this reader understands.
     pub fn new(words: W) -> Result<Self, ViewError> {
-        if words.len() <= SHARED_HEADER_WORDS
-            || words.word(MAGIC_WORD).load(Ordering::Acquire) != SHARED_MAGIC
-        {
-            return Err(ViewError::BadMagic);
-        }
-        let found = words.word(VERSION_WORD).load(Ordering::Relaxed);
-        if found != SHARED_VERSION {
-            return Err(ViewError::Version { found });
-        }
-        let data_words = words.word(DATA_WORDS_WORD).load(Ordering::Relaxed);
-        let available = words.len() - SHARED_HEADER_WORDS;
-        let bad = ViewError::BadLength {
-            data_words,
-            available,
-        };
-        if data_words != available as u64 {
-            return Err(bad);
-        }
-        let mask = data_mask(available).map_err(|_| bad)?;
         Ok(Self {
-            ring: Ring {
-                mask,
-                // A view never pushes.
-                when_full: WhenFull::DropNewest,
-                storage: Shared {
-                    words,
-                    data_len: available,
-                },
-            },
+            ring: Ring::read_shared(words)?,
         })
     }
 
