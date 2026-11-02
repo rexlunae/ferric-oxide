@@ -639,9 +639,10 @@ impl<S: Storage> Ring<S> {
         if oldest >= needed {
             return;
         }
-        // The producer keeps `oldest` within a ring of `head`; one further behind was
-        // scribbled, and is no record boundary: drop everything before `head` from it.
-        let from = if head - oldest > self.capacity() as u64 {
+        // The producer keeps `oldest` within a ring of `head`; one further behind (or past
+        // `head`, which wraps to a huge distance) was scribbled, and is no record boundary:
+        // drop everything before `head` from it.
+        let from = if head.wrapping_sub(oldest) > self.capacity() as u64 {
             head
         } else {
             oldest
