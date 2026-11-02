@@ -1,8 +1,9 @@
 //! A single-producer, single-consumer ring of records.
 //!
-//! A ring is a power-of-two run of `AtomicU64` data words and three counters: `head` (the next
-//! word the producer writes), `tail` (the next word the consumer reads) and `lost` (records the
-//! producer dropped because the ring was full). `head` and `tail` only grow; a word's slot is its
+//! A ring is a power-of-two run of `AtomicU64` data words and four counters: `head` (the next
+//! word the producer writes), `tail` (the next word the consumer reads), `lost` (records the
+//! producer dropped because the ring was full) and `oldest` (the first record whose words the
+//! producer has not overwritten). `head`, `tail` and `oldest` only grow; a word's slot is its
 //! position modulo the data length, so a record can wrap around the end.
 //!
 //! The producer writes a record's words with relaxed stores and then publishes them by storing
@@ -25,7 +26,16 @@
 //!   growing and `tail` moving under them. `lost` is then an upper bound: a record a reader
 //!   had copied and checked just before the producer overwrote it is delivered and counted.
 //!
-//! Either way a reader copies first and checks afterwards: after copying, [`Ring::peek`] (and
+//! Either way, before the producer writes over the words of older records, it moves `oldest`
+//! past them, record by record, whoever has read them (see [`Ring::push`]); only the
+//! producer stores `oldest`. So the records from `oldest` up to `head` are always whole, and
+//! `head - oldest` never exceeds the ring's capacity. Consumers move `tail` independently: a
+//! consumer that drained the ring leaves `tail` past records whose words are still intact,
+//! and `oldest` stays at the first of them. `lost` counts what the producer dropped or
+//! overwrote before a consumer took it; records overwritten after a consumer took them are
+//! not lost to that consumer, so they are not counted.
+//!
+//! A reader copies first and checks afterwards: after copying, [`Ring::peek`] (and
 //! [`View::peek`]) loads `tail` again, and if it moved past the copy's start, the words before
 //! the new `tail` may have been reused under the copy. Positions at or after the new `tail` were
 //! not, so the copy keeps the records from there on, when the walk it made lands on that
@@ -57,14 +67,15 @@
 //!   after each copy and retries a copy it overtook.
 //!
 //! An [`Observer`] reads the same layout without handing anything back to anyone: it keeps
-//! its own position, ignores what other readers consume, and judges from `head` whether the
-//! producer overwrote what it copied. A host reading a guest's rings out of its RAM is one
-//! ([`host`](crate::host)).
+//! its own position, ignores what other readers consume, and judges from `head` and `oldest`
+//! whether the producer overwrote what it copied. A host reading a guest's rings out of its
+//! RAM is one ([`host`](crate::host)).
 //!
 //! The header, in words: [`SHARED_MAGIC`] at [`MAGIC_WORD`], [`SHARED_VERSION`] at
-//! [`VERSION_WORD`], the data length at [`DATA_WORDS_WORD`], and `head`, `tail` and `lost` at
-//! [`HEAD_WORD`], [`TAIL_WORD`] and [`LOST_WORD`], each on a 64-byte line of its own, so the
-//! producer's stores to `head` and the consumer's to `tail` do not share a cache line.
+//! [`VERSION_WORD`], the data length at [`DATA_WORDS_WORD`], and `head`, `tail`, `lost` and
+//! `oldest` at [`HEAD_WORD`], [`TAIL_WORD`], [`LOST_WORD`] and [`OLDEST_WORD`], each on a
+//! 64-byte line of its own, so the producer's stores to `head` and the consumer's to `tail`
+//! do not share a cache line.
 //!
 //! A producer never trusts the counters it reads back, beyond what keeps its own accesses in
 //! bounds: every slot is a position masked to the data length, so a scribbled counter can only
@@ -124,6 +135,9 @@ pub trait Storage {
     fn tail(&self) -> &AtomicU64;
     /// The records dropped.
     fn lost(&self) -> &AtomicU64;
+    /// The first position whose record the producer has not overwritten; only the producer
+    /// stores it.
+    fn oldest(&self) -> &AtomicU64;
     /// The number of data words, a power of two.
     fn data_len(&self) -> usize;
     /// Data word `index`, below [`Storage::data_len`].
@@ -136,6 +150,7 @@ pub struct Inline<D> {
     head: AtomicU64,
     tail: AtomicU64,
     lost: AtomicU64,
+    oldest: AtomicU64,
     data: D,
 }
 
@@ -149,6 +164,9 @@ impl<D: Words> Storage for Inline<D> {
     fn lost(&self) -> &AtomicU64 {
         &self.lost
     }
+    fn oldest(&self) -> &AtomicU64 {
+        &self.oldest
+    }
     fn data_len(&self) -> usize {
         self.data.len()
     }
@@ -160,8 +178,9 @@ impl<D: Words> Storage for Inline<D> {
 /// [`SHARED_MAGIC`]: the first word of a shared ring, `b"FOTRACE1"` as a little-endian word.
 pub const SHARED_MAGIC: u64 = u64::from_le_bytes(*b"FOTRACE1");
 
-/// The version of the shared layout, at [`VERSION_WORD`].
-pub const SHARED_VERSION: u64 = 1;
+/// The version of the shared layout, at [`VERSION_WORD`]. Version 2 added [`OLDEST_WORD`],
+/// which an [`Observer`] relies on.
+pub const SHARED_VERSION: u64 = 2;
 
 /// The words of a shared ring's header, ahead of its data: one 4 KiB page.
 pub const SHARED_HEADER_WORDS: usize = 512;
@@ -178,6 +197,9 @@ pub const HEAD_WORD: usize = 8;
 pub const TAIL_WORD: usize = 16;
 /// The header word holding `lost`.
 pub const LOST_WORD: usize = 24;
+/// The header word holding `oldest`: the first record whose words the producer has not
+/// overwritten. Only the producer stores it.
+pub const OLDEST_WORD: usize = 32;
 
 /// Counters and data both in one run of words, [`SHARED_HEADER_WORDS`] of header first:
 /// [`Ring::shared`], and the words a [`View`] reads.
@@ -203,6 +225,9 @@ impl<W: Words> Storage for Shared<W> {
     }
     fn lost(&self) -> &AtomicU64 {
         self.words.word(LOST_WORD)
+    }
+    fn oldest(&self) -> &AtomicU64 {
+        self.words.word(OLDEST_WORD)
     }
     fn data_len(&self) -> usize {
         self.data_len
@@ -358,6 +383,7 @@ impl<D: Words> Ring<Inline<D>> {
                 head: AtomicU64::new(0),
                 tail: AtomicU64::new(0),
                 lost: AtomicU64::new(0),
+                oldest: AtomicU64::new(0),
                 data,
             },
         })
@@ -386,6 +412,7 @@ impl<W: Words> Ring<Shared<W>> {
             (HEAD_WORD, 0),
             (TAIL_WORD, 0),
             (LOST_WORD, 0),
+            (OLDEST_WORD, 0),
         ] {
             words.word(index).store(value, Ordering::Relaxed);
         }
@@ -551,28 +578,41 @@ impl<S: Storage> Ring<S> {
         }
     }
 
+    /// The first position at which the record of `words` words the producer is about to write
+    /// at `head` overwrites nothing: everything before it is about to be overwritten.
+    fn overwrite_end(&self, head: u64, words: u64) -> u64 {
+        // `data_mask` checked that the ring holds the longest record, so this is at most `head`.
+        head.wrapping_add(words)
+            .saturating_sub(self.capacity() as u64)
+    }
+
+    /// Walks the whole records from `from`, a record boundary whose records the producer has not
+    /// overwritten, to the first boundary at or after `to`, which is at most `head`, and returns
+    /// it with the number of records passed. Only the producer may call this: its records are
+    /// whole, so their headers are too.
+    fn pass_records(&self, from: u64, to: u64, head: u64) -> (u64, u64) {
+        let mut pos = from;
+        let mut passed = 0;
+        while pos < to {
+            match Header::decode(self.slot(pos).load(Ordering::Relaxed)) {
+                Ok(header) => pos = pos.saturating_add(header.words() as u64),
+                // Not a record (only possible if two producers raced): pass everything.
+                Err(_) => pos = head,
+            }
+            // A scribbled length cannot take the walk past `head`.
+            pos = pos.min(head);
+            passed += 1;
+        }
+        (pos, passed)
+    }
+
     /// Moves `tail` past the oldest whole records until `words` more fit before `head`, and
     /// counts them as lost. Only the producer may call this.
     fn make_room(&self, head: u64, words: u64) {
-        // `data_mask` checked that the ring holds the longest record, so this is at most `head`.
-        let needed = head
-            .wrapping_add(words)
-            .saturating_sub(self.capacity() as u64);
+        let needed = self.overwrite_end(head, words);
         let mut tail = self.storage.tail().load(Ordering::Acquire);
         while tail < needed {
-            // Only this producer writes records, so the headers from `tail` on are whole.
-            let mut pos = tail;
-            let mut dropped = 0;
-            while pos < needed {
-                match Header::decode(self.slot(pos).load(Ordering::Relaxed)) {
-                    Ok(header) => pos = pos.saturating_add(header.words() as u64),
-                    // Not a record (only possible if two producers raced): drop everything.
-                    Err(_) => pos = head,
-                }
-                // A scribbled length cannot take `tail` past `head`.
-                pos = pos.min(head);
-                dropped += 1;
-            }
+            let (pos, dropped) = self.pass_records(tail, needed, head);
             // The consumer may commit meanwhile; then count from where it stopped. The release
             // fence in `Ring::push` orders this store before the stores that reuse the words.
             match self.storage.tail().compare_exchange_weak(
@@ -590,7 +630,36 @@ impl<S: Storage> Ring<S> {
         }
     }
 
+    /// Moves `oldest` past the records a record of `words` words written at `head` overwrites,
+    /// wherever `tail` is. Only the producer may call this.
+    fn advance_oldest(&self, head: u64, words: u64) {
+        let needed = self.overwrite_end(head, words);
+        // Only the producer stores `oldest`, so a relaxed load sees its own last store.
+        let oldest = self.storage.oldest().load(Ordering::Relaxed);
+        if oldest >= needed {
+            return;
+        }
+        // The producer keeps `oldest` within a ring of `head`; one further behind was
+        // scribbled, and is no record boundary: drop everything before `head` from it.
+        let from = if head - oldest > self.capacity() as u64 {
+            head
+        } else {
+            oldest
+        };
+        let (pos, _) = self.pass_records(from, needed, head);
+        // The release fence in `Ring::push` orders this store before the stores that overwrite
+        // the words it moved past.
+        self.storage.oldest().store(pos, Ordering::Relaxed);
+    }
+
     /// Appends the record of `event` at `timestamp` with `args`. Only the producer may call this.
+    ///
+    /// Before it writes over the words of older records, whether a consumer has read them or
+    /// not, it moves `oldest` past them, reading their lengths from the headers still there:
+    /// only once the ring has wrapped, and usually past one record. That store, like the one
+    /// to `tail` when the ring overwrites unread records, comes before a release fence that
+    /// precedes the record's stores, so a reader that copied any of the new words and then
+    /// fences sees the moved `oldest`.
     ///
     /// # Errors
     ///
@@ -613,10 +682,11 @@ impl<S: Storage> Ring<S> {
                 WhenFull::OverwriteOldest => self.make_room(head, words),
             }
         }
-        // Pairs with the acquire fence in `Ring::peek_checked`: a reader that sees one of the
-        // stores below then sees a `tail` at least this one (the consumer's, or the one
-        // `make_room` just stored), so it knows the words may be reused under it. On x86_64
-        // this emits no instruction.
+        self.advance_oldest(head, words);
+        // Pairs with the acquire fences in `Ring::peek_checked` and `Observer::observe`: a
+        // reader that sees one of the stores below then sees a `tail` at least this one (the
+        // consumer's, or the one `make_room` just stored) and the `oldest` just stored, so it
+        // knows the words may be reused under it. On x86_64 this emits no instruction.
         fence(Ordering::Release);
         self.slot(head).store(header.encode(), Ordering::Relaxed);
         self.slot(head.wrapping_add(1))
@@ -1388,9 +1458,170 @@ mod tests {
         ring.push(EventId::new(1), 9, &[4]).expect("room");
         assert_eq!(mem[HEAD_WORD].load(Ordering::Relaxed), 3);
         assert_eq!(mem[TAIL_WORD].load(Ordering::Relaxed), 0);
+        assert_eq!(mem[OLDEST_WORD].load(Ordering::Relaxed), 0);
         // The data start after the header.
         assert_eq!(mem[SHARED_HEADER_WORDS + 1].load(Ordering::Relaxed), 9);
         assert_eq!(ring.words().len(), SHARED_HEADER_WORDS + 64);
+    }
+
+    /// The shared header's layout is an ABI between the kernel and readers built apart from it
+    /// (a host's `ferric-trace follow`): pin it.
+    #[test]
+    fn shared_header_layout_is_pinned() {
+        assert_eq!(SHARED_MAGIC.to_le_bytes(), *b"FOTRACE1");
+        assert_eq!(SHARED_VERSION, 2);
+        assert_eq!(
+            [
+                MAGIC_WORD,
+                VERSION_WORD,
+                DATA_WORDS_WORD,
+                HEAD_WORD,
+                TAIL_WORD,
+                LOST_WORD,
+                OLDEST_WORD
+            ],
+            [0, 1, 2, 8, 16, 24, 32]
+        );
+        assert_eq!(SHARED_HEADER_WORDS, 512);
+        let mem = words(SHARED_HEADER_WORDS + 16);
+        for word in &mem {
+            word.store(0xdead, Ordering::Relaxed);
+        }
+        let ring = Ring::shared(&mem[..])
+            .expect("valid")
+            .when_full(WhenFull::OverwriteOldest);
+        // Five 4-word records into 16 words: the first is overwritten.
+        for t in 0..5 {
+            ring.push(EventId::new(1), t, &[t, t]).expect("room");
+        }
+        let header: Vec<u64> = mem[..40]
+            .iter()
+            .map(|w| w.load(Ordering::Relaxed))
+            .collect();
+        let mut expected = std::vec![0xdead; 40];
+        for (index, value) in [
+            (0, u64::from_le_bytes(*b"FOTRACE1")),
+            (1, 2),
+            (2, 16),
+            (8, 20),
+            (16, 4),
+            (24, 1),
+            (32, 4),
+        ] {
+            expected[index] = value;
+        }
+        assert_eq!(header, expected);
+    }
+
+    /// `oldest`, read straight from the storage.
+    fn oldest<S: Storage>(ring: &Ring<S>) -> u64 {
+        ring.storage.oldest().load(Ordering::Relaxed)
+    }
+
+    /// `head`, read straight from the storage.
+    fn head<S: Storage>(ring: &Ring<S>) -> u64 {
+        ring.storage.head().load(Ordering::Relaxed)
+    }
+
+    /// The record boundaries of `lengths`, pushed one after another from 0.
+    fn boundaries(lengths: &[u64]) -> Vec<u64> {
+        lengths
+            .iter()
+            .scan(0, |pos, &len| {
+                let start = *pos;
+                *pos += len;
+                Some(start)
+            })
+            .collect()
+    }
+
+    /// Pushes records of 2 to 10 words in turn and checks `oldest` after each: a record
+    /// boundary, the first one the newest push did not overwrite, never past `head` and never
+    /// more than a ring behind it.
+    fn check_oldest(when_full: WhenFull, consume: bool) {
+        let ring = Ring::new(words(32)).expect("valid").when_full(when_full);
+        let mut buf = [0u8; 1024];
+        let mut lengths = Vec::new();
+        for i in 0..200u64 {
+            if consume {
+                // A consumer drains the ring, moving `tail` past records still whole.
+                ring.read(&mut buf).expect("fits");
+                assert_eq!(ring.pending(), 0);
+            }
+            let args = (i % 9) as usize;
+            ring.push(EventId::new(1), i, &[i; 8][..args])
+                .expect("room");
+            lengths.push(args as u64 + 2);
+            let head = head(&ring);
+            let oldest = oldest(&ring);
+            assert!(oldest <= head, "push {i}: oldest {oldest} past head {head}");
+            assert!(
+                head - oldest <= 32,
+                "push {i}: oldest {oldest}, head {head}"
+            );
+            let starts = boundaries(&lengths);
+            assert!(
+                starts.contains(&oldest),
+                "push {i}: {oldest} is no boundary"
+            );
+            // The newest push overwrote everything before `head - capacity`, and `oldest`
+            // stopped at the first record from there on.
+            let first_kept = starts
+                .iter()
+                .copied()
+                .find(|&start| start >= head.saturating_sub(32))
+                .expect("the newest record");
+            assert_eq!(oldest, first_kept, "push {i}");
+        }
+    }
+
+    #[test]
+    fn oldest_follows_an_overwriting_producer() {
+        check_oldest(WhenFull::OverwriteOldest, false);
+    }
+
+    #[test]
+    fn oldest_follows_the_producer_past_a_consumer() {
+        check_oldest(WhenFull::OverwriteOldest, true);
+        check_oldest(WhenFull::DropNewest, true);
+    }
+
+    /// A consumer drains the ring ahead of the producer's overwrites: `tail` passes `oldest`,
+    /// `make_room` has nothing to do, and the producer still moves `oldest` alone.
+    #[test]
+    fn oldest_moves_when_tail_is_ahead() {
+        let ring = Ring::new(words(16))
+            .expect("valid")
+            .when_full(WhenFull::OverwriteOldest);
+        // Four 4-word records fill the ring.
+        for t in 0..4 {
+            ring.push(EventId::new(1), t, &[t, t]).expect("room");
+        }
+        let mut buf = [0u8; 256];
+        assert_eq!(ring.read(&mut buf), Ok(128));
+        assert_eq!((oldest(&ring), ring.pending()), (0, 0));
+        ring.push(EventId::new(1), 4, &[4, 4]).expect("room");
+        // The fifth record overwrote the first; `tail` stayed at 16, `lost` at 0.
+        assert_eq!((oldest(&ring), ring.pending(), ring.lost()), (4, 4, 0));
+        // A ten-word record overwrites the next three (12 words).
+        ring.push(EventId::new(1), 5, &[5; 8]).expect("room");
+        assert_eq!((oldest(&ring), ring.lost()), (16, 0));
+    }
+
+    /// A scribbled `oldest`, more than a ring behind `head`, is no record boundary: the
+    /// producer passes everything before `head` instead of walking from it.
+    #[test]
+    fn a_scribbled_oldest_is_not_walked() {
+        let ring = Ring::new(words(16))
+            .expect("valid")
+            .when_full(WhenFull::OverwriteOldest);
+        for t in 0..8 {
+            ring.push(EventId::new(1), t, &[t, t]).expect("room");
+        }
+        assert_eq!(oldest(&ring), 16);
+        ring.storage.oldest.store(1, Ordering::Relaxed);
+        ring.push(EventId::new(1), 8, &[8, 8]).expect("room");
+        assert_eq!(oldest(&ring), 32);
     }
 
     #[test]
@@ -1536,10 +1767,11 @@ mod tests {
             View::new(&mem[..SHARED_HEADER_WORDS]).map(|_| ()),
             Err(ViewError::BadMagic)
         );
-        mem[VERSION_WORD].store(2, Ordering::Relaxed);
+        // A version 1 ring has no `oldest`, which an observer needs.
+        mem[VERSION_WORD].store(1, Ordering::Relaxed);
         assert_eq!(
             View::new(&mem[..]).map(|_| ()),
-            Err(ViewError::Version { found: 2 })
+            Err(ViewError::Version { found: 1 })
         );
     }
 
@@ -1566,11 +1798,11 @@ mod tests {
 
     /// Words that run `hook` the first time word `at` is read, to act between two loads of a
     /// copy.
-    struct Hooked<'a, F: Fn()> {
-        words: &'a [AtomicU64],
-        at: usize,
-        fired: core::sync::atomic::AtomicBool,
-        hook: F,
+    pub(super) struct Hooked<'a, F: Fn()> {
+        pub(super) words: &'a [AtomicU64],
+        pub(super) at: usize,
+        pub(super) fired: core::sync::atomic::AtomicBool,
+        pub(super) hook: F,
     }
 
     impl<F: Fn()> Words for Hooked<'_, F> {

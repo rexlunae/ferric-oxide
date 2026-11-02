@@ -717,9 +717,14 @@ are overwritten and counted (see [Crash dump](#crash-dump) and
 [Host-visible rings](#host-visible-rings), whose rings have the size the boot
 environment gives).
 The ring sits in kernel-allocated pages in the shared layout of
-`ferric_trace::ring`: a 4 KiB header page (magic `FOTRACE1`, layout version,
-data length, and `head`, `tail` and `lost` on cache lines of their own), then
-the data pages.
+`ferric_trace::ring`: a 4 KiB header page (magic `FOTRACE1`, layout version
+2, data length, and `head`, `tail`, `lost` and `oldest` on cache lines of
+their own), then the data pages. `oldest` is the first record whose words the
+kernel has not overwritten. Only the kernel stores it, moving it record by
+record before it writes over older records, whether a reader has consumed them
+or not. The records from `oldest` up to `head` are therefore always whole and
+never span more than one ring's capacity. Version 2 added `oldest`, and readers
+refuse other versions.
 
 ### Timestamps
 
@@ -1202,10 +1207,12 @@ ferric-trace follow --guest-ram /dev/shm/guest-ram --phys 0x2a00000 --out run/tr
 privately from a read-only descriptor (`crates/guest-ram`), so even a stray
 store could only change its own copy of a page, and follows each ring with
 `ferric_trace::ring::Observer`. The observer keeps its own position in the
-ring and copies from there to `head`; it judges from `head` whether the kernel
-overwrote words it copied, retries from the oldest record still whole when it
-did, and reports the words it skipped. It needs only relaxed loads and fences,
-which are sound on memory mapped like this.
+ring and copies from there to `head`. It judges from `head` and `oldest`
+whether the kernel overwrote words it copied, and when it did, it keeps or
+copies again from `oldest`, the oldest record still whole. It reports the words
+it skipped, which are exactly those the kernel overwrote before it read them.
+What guest readers consumed is never skipped. It needs only relaxed loads and
+fences, which are sound on memory mapped like this.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
