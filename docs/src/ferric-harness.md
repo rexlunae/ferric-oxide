@@ -308,7 +308,11 @@ entries in one of two ways:
 - **keys** (`--boot-env-via keys`). When the resolution menu appears, the
   harness presses `e`, types each line into the boot environment editor with
   Enter, and boots with Enter on the empty line. This works with any bootloader
-  that has a display, and it needs one: `--display none` is rejected.
+  that has a display, and it needs one: `--display none` is rejected. Every
+  typed line must be printable text with a US-layout key: an entry with any
+  other character (such as `é`, a tab or an escape) is rejected before the
+  guest boots, naming the key and the character, because the editor would not
+  receive it as typed. fw_cfg carries such values unchanged.
 
 In either case the harness answers each resolution menu it sees on the console
 with Enter. So images whose bootloader has no fw_cfg support still boot without

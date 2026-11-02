@@ -9,7 +9,10 @@
 //!   `FERRIC_BOOT_RESOLUTION=auto` skips the menu. Older bootloaders ignore it.
 //! - **keys**: the harness answers the resolution menu with `e`, types each line into the
 //!   boot-environment editor followed by Enter, and boots with Enter on the empty line. This
-//!   works with any bootloader that has a display, and needs one.
+//!   works with any bootloader that has a display, and needs one. Every typed character must
+//!   be a printable character with a US-layout key ([`input::char_keys`], the mapping the
+//!   harness types with): anything else is refused before the guest boots
+//!   ([`BootEnvError::Untypeable`]) rather than leaving the guest in the editor.
 //!
 //! `--mode trace` adds `FERRIC_KERNEL=trace` (load `usr/lib/boot/kernel-trace`) and
 //! `FERRIC_TRACE_HOST=<KiB per CPU>` (allocate host-visible rings). A `FERRIC_TRACE_HOST`
@@ -27,6 +30,7 @@ use ferric_abi::boot_env::{
 use ferric_trace::host::{RingSize, RingSizeError};
 use thiserror::Error;
 
+use crate::input;
 use crate::machine::{Display, Mode};
 
 pub use ferric_abi::boot_env::FW_CFG_FILE;
@@ -90,6 +94,18 @@ pub enum BootEnvError {
         /// The mode given.
         mode: Mode,
     },
+    /// With `--boot-env-via keys`, an entry with a character the harness cannot type into
+    /// the bootloader's editor: one without a US-layout key, or a control character the
+    /// editor would act on instead of inserting.
+    #[error(
+        "boot environment entry {key} contains {character:?}, which cannot be typed into the bootloader editor (printable US-layout characters only); use --boot-env-via fw-cfg"
+    )]
+    Untypeable {
+        /// The entry's key.
+        key: String,
+        /// The first character that cannot be typed.
+        character: char,
+    },
 }
 
 /// An ordered set of `KEY=VALUE` lines; setting a key again replaces its value in place.
@@ -105,8 +121,9 @@ impl BootEnv {
     /// # Errors
     ///
     /// Any [`BootEnvError`]: a malformed entry, a `FERRIC_TRACE_HOST` the kernel would
-    /// refuse, a `FERRIC_KERNEL` that contradicts the mode, or a file over
-    /// [`MAX_PRESET_BYTES`].
+    /// refuse, a `FERRIC_KERNEL` that contradicts the mode, a file over
+    /// [`MAX_PRESET_BYTES`], or, when `via` is [`BootEnvVia::Keys`], an entry that cannot be
+    /// typed ([`BootEnvError::Untypeable`]).
     pub fn for_run(
         user: &[(String, String)],
         mode: Mode,
@@ -144,7 +161,28 @@ impl BootEnv {
                 max: MAX_PRESET_BYTES,
             });
         }
+        if via == BootEnvVia::Keys {
+            env.check_typeable()?;
+        }
         Ok(env)
+    }
+
+    /// Checks that every line [`typed_lines`](Self::typed_lines) gives can be typed.
+    fn check_typeable(&self) -> Result<(), BootEnvError> {
+        for (key, value) in self
+            .entries
+            .iter()
+            .filter(|(k, _)| k != FERRIC_BOOT_RESOLUTION)
+        {
+            let line = format!("{key}={value}");
+            if let Some(character) = line.chars().find(|&c| !typeable(c)) {
+                return Err(BootEnvError::Untypeable {
+                    key: key.clone(),
+                    character,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Sets `key` to `value`.
@@ -208,8 +246,6 @@ pub fn parse_assignment(text: &str) -> Result<(String, String), BootEnvError> {
     Ok((key.to_owned(), value.to_owned()))
 }
 
-/// Checks one entry with the rule the bootloader and kernel read the environment by
-/// ([`boot_env::Line::parse`]); a value must also stay on its line.
 /// Parses `--trace-ring-kib`: a host ring size the kernel accepts, in KiB.
 ///
 /// # Errors
@@ -219,6 +255,14 @@ pub fn parse_ring_kib(text: &str) -> Result<u32, RingSizeError> {
     RingSize::parse(text).map(RingSize::kib)
 }
 
+/// Whether the editor receives `c` as itself when the harness types it: a printable
+/// character with a key in the mapping [`input::type_events`] uses.
+fn typeable(c: char) -> bool {
+    !c.is_control() && input::char_keys(c).is_ok()
+}
+
+/// Checks one entry with the rule the bootloader and kernel read the environment by
+/// ([`boot_env::Line::parse`]); a value must also stay on its line.
 fn validate(key: &str, value: &str) -> Result<(), BootEnvError> {
     if value.contains(['\n', '\r', '\0']) {
         return Err(BootEnvError::Value(key.to_owned()));
@@ -394,5 +438,38 @@ mod tests {
             BootEnv::for_run(&big, Mode::Normal, 4096, Display::None, BootEnvVia::FwCfg),
             Err(BootEnvError::TooLarge { .. })
         ));
+    }
+
+    /// Typed entries must be printable US-layout text; fw_cfg carries any valid value.
+    #[test]
+    fn typed_entries_must_be_typeable() {
+        let via = |user: &[(String, String)], via| {
+            BootEnv::for_run(user, Mode::Normal, 4096, Display::Std, via)
+        };
+        for (value, character) in [
+            ("caf\u{e9}", '\u{e9}'),
+            ("a\tb", '\t'),
+            ("x\u{1b}", '\u{1b}'),
+        ] {
+            assert_eq!(
+                via(&[kv("A", "ok"), kv("PROBE", value)], BootEnvVia::Keys),
+                Err(BootEnvError::Untypeable {
+                    key: "PROBE".into(),
+                    character
+                }),
+                "{value:?}"
+            );
+            assert!(
+                via(&[kv("PROBE", value)], BootEnvVia::FwCfg).is_ok(),
+                "{value:?}"
+            );
+        }
+        let printable: String = (' '..='~').collect();
+        let env = via(&[kv("ALL", &printable)], BootEnvVia::Keys).expect("printable ASCII");
+        for line in env.typed_lines() {
+            input::type_events(&line).expect("the session types every accepted line");
+        }
+        // FERRIC_BOOT_RESOLUTION is not typed, so it is not checked.
+        assert!(via(&[kv("FERRIC_BOOT_RESOLUTION", "\u{e9}")], BootEnvVia::Keys).is_ok());
     }
 }
