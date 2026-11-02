@@ -33,6 +33,9 @@ const STAT_PLAN: Plan = Plan {
     budget: Duration::from_secs(1),
 };
 
+/// How many names [`Scratch::new`] tries before giving up.
+pub const SCRATCH_TRIES: u32 = 64;
+
 /// A benchmark's scratch directory: a new directory of its own, removed with everything in it
 /// by [`Scratch::remove`], or when dropped on the way out of a benchmark that failed. It never
 /// removes or reuses a directory that was there before, so `--dir` may name any directory.
@@ -44,16 +47,35 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    /// Makes `<dir>/ferric-perf-<pid>-<name>`, a directory this process owns (and `dir` if
-    /// it does not exist).
+    /// Makes a new directory of this process's own in `dir` (and `dir` if it does not exist):
+    /// `ferric-perf-<pid>-<name>`, or, when a run that was killed left one of that name (its
+    /// process ID since reused), the first free `ferric-perf-<pid>-<name>.<n>`. What is
+    /// already there is never touched.
     ///
     /// # Errors
     ///
-    /// When `dir` cannot be made, or the directory cannot be made or already exists.
+    /// When `dir` cannot be made, or a directory cannot be made for another reason than its
+    /// name being taken, or [`SCRATCH_TRIES`] names are all taken.
     pub fn new(dir: &Path, name: &str) -> Result<Self, BenchError> {
         fs::create_dir_all(dir).map_err(file_error(Op::MakeDir, dir))?;
-        let path = dir.join(format!("ferric-perf-{}-{name}", std::process::id()));
-        fs::create_dir(&path).map_err(file_error(Op::MakeDir, &path))?;
+        let base = format!("ferric-perf-{}-{name}", std::process::id());
+        let mut tries = (0..SCRATCH_TRIES).map(|n| match n {
+            0 => dir.join(&base),
+            n => dir.join(format!("{base}.{n}")),
+        });
+        let path = loop {
+            let Some(path) = tries.next() else {
+                let path = dir.join(&base);
+                return Err(file_error(Op::MakeDir, &path)(std::io::Error::from(
+                    std::io::ErrorKind::AlreadyExists,
+                )));
+            };
+            match fs::create_dir(&path) {
+                Ok(()) => break path,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(file_error(Op::MakeDir, &path)(error)),
+            }
+        };
         Ok(Self {
             path,
             removed: false,
@@ -186,15 +208,22 @@ mod tests {
         fs::remove_dir_all(&dir).expect("cleanup");
     }
 
-    /// An existing directory of the same name is refused, not reused or emptied.
+    /// A directory a killed run left under the same name (its process ID reused) is left
+    /// alone, and the benchmark gets the next free name.
     #[test]
-    fn an_existing_scratch_directory_is_refused() {
+    fn a_leftover_scratch_directory_is_passed_over() {
         let dir = root("taken");
-        let taken = dir.join(format!("ferric-perf-{}-files", std::process::id()));
-        fs::create_dir_all(&taken).expect("mkdir");
-        fs::write(taken.join("keep"), b"x").expect("write");
-        assert!(Scratch::new(&dir, "files").is_err());
-        assert!(taken.join("keep").exists());
+        let base = format!("ferric-perf-{}-files", std::process::id());
+        for taken in [base.clone(), format!("{base}.1")] {
+            fs::create_dir_all(dir.join(&taken)).expect("mkdir");
+            fs::write(dir.join(&taken).join("keep"), b"x").expect("write");
+        }
+        let scratch = Scratch::new(&dir, "files").expect("made");
+        assert_eq!(scratch.path(), dir.join(format!("{base}.2")));
+        assert_eq!(fs::read_dir(scratch.path()).expect("exists").count(), 0);
+        scratch.remove().expect("removed");
+        assert!(dir.join(&base).join("keep").exists());
+        assert!(dir.join(format!("{base}.1")).join("keep").exists());
         fs::remove_dir_all(&dir).expect("cleanup");
     }
 
