@@ -23,7 +23,7 @@ use ferric_harness::report::{self, Report, ScenarioReport};
 use ferric_harness::rundir::{self, RunDir};
 use ferric_harness::scenario::{self, Scenario};
 use ferric_harness::serial::Eol;
-use ferric_harness::session::{Session, Since};
+use ferric_harness::session::{Finish, Session, Since};
 use ferric_harness::trace;
 use ferric_harness::verdict::Outcome;
 
@@ -734,7 +734,14 @@ fn run(image: &Path, scenario_path: Option<&Path>, options: &UpOptions) -> Resul
     }
     let run = write_launch(&config)?;
     eprintln!("run: {}", run.root().display());
-    let session = Session::launch(config)?;
+    // With a scenario, the report waits for its results: a guest that exits in the middle
+    // of a step must not be judged before the step's failure is recorded.
+    let finish = if scenario.is_some() {
+        Finish::AfterScenario
+    } else {
+        Finish::OnExit
+    };
+    let session = Session::launch_with(config, finish)?;
     {
         let session = session.clone();
         watch_signals(move || session.interrupt())?;

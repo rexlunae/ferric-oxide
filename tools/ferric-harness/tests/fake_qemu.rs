@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,9 +21,10 @@ use ferric_harness::bootenv::BootEnvVia;
 use ferric_harness::input::{Button, ButtonAction, PointerAction};
 use ferric_harness::machine::{Display, LaunchConfig, Mode, OnCrash};
 use ferric_harness::markers::Marker;
-use ferric_harness::report::Report;
+use ferric_harness::report::{Report, ScenarioReport};
+use ferric_harness::scenario::{self, Scenario};
 use ferric_harness::serial::Eol;
-use ferric_harness::session::{Session, Since};
+use ferric_harness::session::{Finish, Session, Since};
 use ferric_harness::verdict::{CheckStatus, Outcome, StopReason};
 use serde_json::{Value, json};
 
@@ -993,39 +994,14 @@ fn cli_up_commands_down_report() {
     assert_eq!(value["paired"]["pairs"], 1);
 }
 
-#[test]
-fn cli_run_scenario() {
-    let fixture = Fixture::new();
-    let script_path = fixture.path("scen.json");
-    fs::write(&script_path, desktop_script(&fixture).to_string()).expect("script");
-    let scenario = fixture.path("login.toml");
-    fs::write(
-        &scenario,
-        r#"
-[[step]]
-expect = "login: $"
-timeout = 20
-[[step]]
-send = "root"
-[[step]]
-expect = "assword"
-[[step]]
-send = "password"
-[[step]]
-expect = "^root:~# $"
-[[step]]
-mark = "shell"
-[[step]]
-text = "screen.txt"
-contains = "redox login"
-[[step]]
-shot = "end.png"
-[[step]]
-key = "ret"
-"#,
-    )
-    .expect("scenario");
-    let run = fixture.path("scen-run");
+/// Runs `ferric-harness run --scenario` on the fake QEMU playing `script`, with the
+/// scenario `steps`, in the run directory `<fixture>/<name>`.
+fn cli_run(fixture: &Fixture, name: &str, script: &Value, steps: &str) -> (Output, PathBuf) {
+    let script_path = fixture.path(&format!("{name}.json"));
+    fs::write(&script_path, script.to_string()).expect("script");
+    let scenario = fixture.path(&format!("{name}.toml"));
+    fs::write(&scenario, steps).expect("scenario");
+    let run = fixture.path(name);
     let exe = std::env::current_exe().expect("exe");
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -1056,7 +1032,39 @@ key = "ret"
         script_path.to_string_lossy().into_owned(),
     ]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = harness(&refs);
+    (harness(&refs), run)
+}
+
+#[test]
+fn cli_run_scenario() {
+    let fixture = Fixture::new();
+    let (out, run) = cli_run(
+        &fixture,
+        "scen-run",
+        &desktop_script(&fixture),
+        r#"
+[[step]]
+expect = "login: $"
+timeout = 20
+[[step]]
+send = "root"
+[[step]]
+expect = "assword"
+[[step]]
+send = "password"
+[[step]]
+expect = "^root:~# $"
+[[step]]
+mark = "shell"
+[[step]]
+text = "screen.txt"
+contains = "redox login"
+[[step]]
+shot = "end.png"
+[[step]]
+key = "ret"
+"#,
+    );
     assert!(
         out.status.success(),
         "run: {}{}",
@@ -1076,15 +1084,76 @@ key = "ret"
     assert!(run.join("shots/end.png").exists());
 
     // A failing step fails the run.
-    let bad = fixture.path("bad.toml");
-    fs::write(&bad, "[[step]]\nexpect = \"never\"\ntimeout = 0.3\n").expect("scenario");
-    let run2 = fixture.path("bad-run");
-    let mut args2 = args.clone();
-    args2[3] = bad.to_string_lossy().into_owned();
-    args2[5] = run2.to_string_lossy().into_owned();
-    let refs: Vec<&str> = args2.iter().map(String::as_str).collect();
-    let out = harness(&refs);
+    let (out, run) = cli_run(
+        &fixture,
+        "bad-run",
+        &desktop_script(&fixture),
+        "[[step]]\nexpect = \"never\"\ntimeout = 0.3\n",
+    );
     assert_eq!(out.status.code(), Some(1));
-    let report = Report::load(&run2).expect("report");
+    let report = Report::load(&run).expect("report");
     assert_eq!(check(&report, "scenario").status, CheckStatus::Fail);
+}
+
+/// A guest that powers off by itself and a scenario that is not finished with it.
+const CUT_SHORT_GUEST: &str = "kernel::a:INFO -- BOOT\r\n";
+const CUT_SHORT_STEPS: &str = "[[step]]\nexpect = \"BOOT\"\n[[step]]\nwait-exit = true\n[[step]]\nexpect = \"READY\"\ntimeout = 20\n";
+
+fn failures(report: &Report) -> Vec<(String, String)> {
+    report
+        .verdict
+        .failures()
+        .map(|c| (c.name.clone(), c.detail.clone()))
+        .collect()
+}
+
+/// The report of a scenario run waits for the scenario: the step the guest's exit broke
+/// is in it, and fails the run.
+#[test]
+fn a_scenario_cut_short_by_the_guest_is_reported() {
+    let fixture = Fixture::new();
+    let script = json!({"serial": [{"text": CUT_SHORT_GUEST}], "exit_after_serial": 0});
+    let mut config = fixture.config("cut-short", &script);
+    config.display = Display::None;
+    let session = Running(Session::launch_with(config, Finish::AfterScenario).expect("launch"));
+    let scenario = Scenario::parse(Path::new("cut.toml"), CUT_SHORT_STEPS).expect("scenario");
+    let (steps, summary) = scenario::run(&session, &scenario);
+    assert!(session.exited());
+    assert!(
+        session
+            .wait_report(Some(Duration::from_millis(500)))
+            .is_none(),
+        "no report before the scenario's results"
+    );
+    session.set_scenario(ScenarioReport {
+        path: scenario.path.clone(),
+        summary,
+        steps,
+    });
+    let report = session
+        .wait_report(Some(Duration::from_secs(20)))
+        .expect("report");
+    let expected = vec![(
+        "scenario".to_owned(),
+        "step 3 of 3 failed: the guest has exited".to_owned(),
+    )];
+    assert_eq!(failures(&report), expected);
+    let steps = report.scenario.expect("scenario").steps;
+    assert_eq!(
+        steps.iter().map(|s| s.ok).collect::<Vec<_>>(),
+        [true, true, false]
+    );
+
+    // The same through `run --scenario`, where the guest exits while the main thread is in
+    // the scenario.
+    let (out, run) = cli_run(&fixture, "cut-short-cli", &script, CUT_SHORT_STEPS);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = Report::load(&run).expect("report");
+    assert_eq!(failures(&report), expected);
 }

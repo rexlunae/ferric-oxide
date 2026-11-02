@@ -141,7 +141,10 @@ directory whose sockets would not fit.
 
 `run --scenario <file>` runs TOML steps in order. The first failing step ends
 the scenario, and the run is then brought down and judged. The verdict's
-`scenario` check fails if any step failed. Each step has one action and an
+`scenario` check fails if any step failed. If the guest powers off during the
+scenario, the step that needed it fails (`the guest has exited`), and the
+report is written only once the scenario has ended, so that failure is always
+in it. Each step has one action and an
 optional `timeout` in seconds. Without one, a step uses the file's `timeout`,
 or 60 seconds if the file sets none. The harness checks every pattern,
 predicate, key name and typed character before it boots the guest.

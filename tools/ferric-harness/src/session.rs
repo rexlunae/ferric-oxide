@@ -13,7 +13,10 @@
 //!
 //! When QEMU exits (the guest powered off, or [`Session::down`] or a stop ended it) and both
 //! sockets have closed, the monitor stops `follow`, removes the shared RAM file, judges the
-//! run and writes `report.json`; [`Session::wait_report`] returns it.
+//! run and writes `report.json`; [`Session::wait_report`] returns it. A session launched
+//! with [`Finish::AfterScenario`] judges the run only once [`Session::set_scenario`] has
+//! recorded the scenario's results too, so a guest that exits in the middle of a step
+//! cannot leave the step's failure out of the report.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -183,6 +186,17 @@ pub struct DownResult {
     pub report: PathBuf,
 }
 
+/// When a session judges the run and writes its report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Finish {
+    /// As soon as QEMU has exited and its sockets have closed.
+    #[default]
+    OnExit,
+    /// Once QEMU has exited and the scenario's results have been recorded with
+    /// [`Session::set_scenario`] (`run --scenario`).
+    AfterScenario,
+}
+
 enum Feed {
     Line(Line),
     Event(QmpEvent),
@@ -228,6 +242,8 @@ struct State {
     follow_start_failures: Vec<String>,
     shots: u32,
     scenario: Option<ScenarioReport>,
+    /// A scenario is running whose results the report must wait for.
+    scenario_pending: bool,
     report: Option<Report>,
 }
 
@@ -310,14 +326,24 @@ fn connect_serial(path: &Path) -> Result<UnixStream, Error> {
 }
 
 impl Session {
-    /// Starts a guest as `config` says (see the [module docs](self)).
+    /// Starts a guest as `config` says (see the [module docs](self)), to be reported as
+    /// soon as QEMU exits ([`Finish::OnExit`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`launch_with`](Self::launch_with).
+    pub fn launch(config: LaunchConfig) -> Result<Self, Error> {
+        Self::launch_with(config, Finish::OnExit)
+    }
+
+    /// Starts a guest as `config` says, to be reported when `finish` says.
     ///
     /// # Errors
     ///
     /// Configuration errors (missing image or firmware, bad boot environment, KVM or
     /// `ferric-trace` unavailable, a leftover RAM file), I/O errors in the run directory,
     /// and start-up failures (QEMU exits or its sockets never answer).
-    pub fn launch(config: LaunchConfig) -> Result<Self, Error> {
+    pub fn launch_with(config: LaunchConfig, finish: Finish) -> Result<Self, Error> {
         if !config.image.is_file() {
             return Err(Error::ImageMissing(config.image.clone()));
         }
@@ -453,7 +479,10 @@ impl Session {
             ferric_trace,
             qmp,
             serial,
-            state: Mutex::default(),
+            state: Mutex::new(State {
+                scenario_pending: finish == Finish::AfterScenario,
+                ..State::default()
+            }),
             changed: Condvar::new(),
             sampler: Mutex::new(Sampler {
                 cpus: None,
@@ -839,9 +868,16 @@ impl Session {
         self.inner.wait_until(timeout, |s| s.exit.is_some())
     }
 
-    /// Records the scenario's results for the report (call before the run ends).
+    /// Records the scenario's results for the report. A session launched with
+    /// [`Finish::AfterScenario`] writes its report only after this; otherwise call it
+    /// before the run ends.
     pub fn set_scenario(&self, scenario: ScenarioReport) {
-        self.inner.state().scenario = Some(scenario);
+        {
+            let mut state = self.inner.state();
+            state.scenario = Some(scenario);
+            state.scenario_pending = false;
+        }
+        self.inner.changed.notify_all();
     }
 
     /// Waits for the report (written once QEMU has exited), up to `timeout`.
@@ -1340,6 +1376,10 @@ impl Inner {
         }
         if let Some(shm) = &self.shm {
             shm.remove();
+        }
+        if self.state().scenario_pending {
+            self.log("waiting for the scenario's results");
+            self.wait_until(None, |s| !s.scenario_pending);
         }
         let report = self.build_report();
         if let Err(e) = report.write(&self.run.report_json()) {
