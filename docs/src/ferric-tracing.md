@@ -132,9 +132,11 @@ boot with a message naming the problem; the bootloader never falls back to
 another kernel.
 
 The trace-mode kernel logs one line when it starts, before any event is turned
-on: `kernel::trace::imp:INFO -- trace: trace-mode kernel`. A kernel without
-`kernel.trace` has no tracing code and logs no `trace:` message at all, so a
-harness can tell from the log which kernel ran. In a normal boot of such an
+on: exactly `trace: trace-mode kernel`, without the module and level prefix of
+its other messages. A kernel without `kernel.trace` has no tracing code and
+logs no `trace:` message at all, so a harness can tell from the log which
+kernel ran. Symbolize records and profiles of the trace-mode kernel with its
+own `kernel-trace.all` (or `kernel-trace.sym`), not the normal kernel's. In a normal boot of such an
 image user space does no tracing work either: the kernel hands out no
 `kernel.trace` scheme, so bootstrap never reads the initfs `trace.toml` and
 `procmgr` makes no `emit` calls.
