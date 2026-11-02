@@ -9,7 +9,8 @@
 //!   kernel's log line uses.
 //! - `mm.cr3_switch`: what the switch loaded ([`Cr3SwitchKind`]).
 //!
-//! Other events need no description: their arguments are plain numbers.
+//! Other events need no description: their arguments are plain numbers. [`syscall_name`] and
+//! [`opcode`] name the system call numbers and scheme opcodes that views group by.
 
 use ferric_amdvi::event::Event as AmdViEvent;
 use ferric_trace::kernel::{
@@ -17,6 +18,8 @@ use ferric_trace::kernel::{
     PageFaultFlags, PageFaultOutcome,
 };
 use ferric_vtd::fault::FaultRecord;
+use syscall::number as nr;
+use syscall::schemev2::Opcode;
 
 use crate::capture::Entry;
 
@@ -65,6 +68,52 @@ pub fn source_name(raw: u64) -> String {
 /// `mm.cr3_switch`: the name of what the switch loaded, or the number when it is not a kind.
 pub fn cr3_switch_kind(raw: u64) -> String {
     Cr3SwitchKind::from_raw(raw).map_or_else(|| format!("kind {raw}"), |k| k.to_string())
+}
+
+/// The scheme opcode `raw` (a `scheme.request`'s `opcode`), or `None` for a number
+/// `schemev2::Opcode` does not define.
+pub fn opcode(raw: u64) -> Option<Opcode> {
+    u8::try_from(raw).ok().and_then(Opcode::try_from_raw)
+}
+
+/// The system calls [`syscall_name`] knows, by number: the constants of `redox_syscall`.
+const SYSCALLS: &[(usize, &str)] = &[
+    (nr::SYS_OPENAT_INTO, "openat_into"),
+    (nr::SYS_UNLINKAT, "unlinkat"),
+    (nr::SYS_CLOSE, "close"),
+    (nr::SYS_DUP_INTO, "dup_into"),
+    (nr::SYS_DUP2, "dup2"),
+    (nr::SYS_READ, "read"),
+    (nr::SYS_READ2, "read2"),
+    (nr::SYS_WRITE, "write"),
+    (nr::SYS_WRITE2, "write2"),
+    (nr::SYS_LSEEK, "lseek"),
+    (nr::SYS_FCHOWN, "fchown"),
+    (nr::SYS_FCNTL, "fcntl"),
+    (nr::SYS_FEVENT, "fevent"),
+    (nr::SYS_CALL, "call"),
+    (nr::SYS_FMAP, "fmap"),
+    (nr::SYS_FUNMAP, "funmap"),
+    (nr::SYS_MREMAP, "mremap"),
+    (nr::SYS_FLINK, "flink"),
+    (nr::SYS_FPATH, "fpath"),
+    (nr::SYS_FRENAME, "frename"),
+    (nr::SYS_FSTAT, "fstat"),
+    (nr::SYS_FSYNC, "fsync"),
+    (nr::SYS_CLOCK_GETTIME, "clock_gettime"),
+    (nr::SYS_FUTEX, "futex"),
+    (nr::SYS_MPROTECT, "mprotect"),
+    (nr::SYS_NANOSLEEP, "nanosleep"),
+    (nr::SYS_YIELD, "yield"),
+];
+
+/// The name of system call number `raw` (`SYS_WRITE` is `write`), or `None` for a number the
+/// `redox_syscall` version this tool is built with does not define.
+pub fn syscall_name(raw: u64) -> Option<&'static str> {
+    SYSCALLS
+        .iter()
+        .find(|&&(number, _)| u64::try_from(number) == Ok(raw))
+        .map(|&(_, name)| name)
 }
 
 /// `iommu.fault`: the decoded report, and how many times it was reported in a row.
@@ -128,6 +177,17 @@ pub(crate) mod tests {
         assert_eq!(describe(&line).as_deref(), Some("line, 0 handles"));
         assert_eq!(describe(&entry(&IRQ_ACK, &[11, 2, 5])), None);
         assert_eq!(describe(&entry(&SYSCALL_EXIT, &[1, 2])), None);
+    }
+
+    #[test]
+    fn system_calls_have_names() {
+        assert_eq!(syscall_name(0x2100_0004), Some("write"));
+        assert_eq!(syscall_name(158), Some("yield"));
+        assert_eq!(syscall_name(0xdead), None);
+        let mut numbers: Vec<usize> = SYSCALLS.iter().map(|&(number, _)| number).collect();
+        numbers.sort_unstable();
+        numbers.dedup();
+        assert_eq!(numbers.len(), SYSCALLS.len(), "one name per number");
     }
 
     #[test]

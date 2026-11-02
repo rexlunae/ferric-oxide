@@ -53,6 +53,11 @@ Several image tests under `recipes/tests/` measure the new I/O paths and print
 - `ferric-netq-test` compares kernel-bypass transmission with netstack.
 - `ferric-trace-bench` measures what tracing costs when compiled in but off,
   and with every event on.
+- `ferric-perf` times process spawn (fork+exec and `posix_spawn` of a static and
+  a dynamically linked program, `ion -c true`), thread and process ping-pong over
+  pipes, pipe throughput, logging through `/scheme/log` against `/scheme/null`,
+  file create/stat/unlink and mapping a large file; `config/ferric-perf.toml`
+  runs it at boot ([Process and IPC benchmarks](./ferric-testing.md#process-and-ipc-benchmarks)).
 
 Include the recipe in your image configuration to run one by hand. Benchmarks
 in QEMU compare two setups in the same boot well, but their absolute numbers

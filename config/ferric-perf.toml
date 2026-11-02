@@ -1,0 +1,55 @@
+# Ferric Oxide process and IPC benchmark image
+#
+# Boots the minimal system, runs ferric-perf once (recipes/tests/ferric-perf: process
+# spawn, thread and process ping-pong over pipes, pipe throughput and round trip, writes
+# to /scheme/log against /scheme/null, file create/stat/unlink and large-file mmap),
+# prints its FERRIC_BENCH perf-* lines on the serial console between two markers, and
+# shuts down. The whole run takes well under a minute on KVM.
+#
+#   make all CONFIG_NAME=ferric-perf
+#   (or: ferric-config set image.config=ferric-perf)
+#
+# The host boots it like the other test images, for example with
+# scripts/ferric-ci/boot-smoke.sh, which waits for the FERRIC_SMOKE_OK the script ends
+# with and fails the boot on any FERRIC_TEST_FAIL line. Compare two kernels or option
+# sets by booting each image several times on the same host and pairing the boots, as
+# docs/src/ferric-testing.md ("Process and IPC benchmarks") says; one boot's numbers
+# carry QEMU/KVM's run-to-run noise.
+
+include = ["minimal.toml"]
+
+[general]
+# Room for the 32 MiB file the mmap benchmark writes.
+filesystem_size = 256
+
+[packages]
+kernel = "source"
+relibc = "source"
+bootloader = "source"
+redoxfs = "source"
+base = "source"
+# The benchmarks, with their static and dynamic spawn targets (ferric-perf-true and
+# ferric-perf-true-dynamic).
+ferric-perf = "source"
+
+[[files]]
+path = "/usr/lib/init.d/30_console"
+data = """
+requires_weak 10_net.target
+ion /usr/lib/ferric-perf.ion
+"""
+
+[[files]]
+path = "/usr/lib/ferric-perf.ion"
+data = """
+#!/usr/bin/env ion
+echo FERRIC_PERF_BEGIN
+uname -a
+cat /scheme/sys/cpu
+# Let the boot services settle, so they do not run during the measurements.
+sleep 5
+ferric-perf || echo FERRIC_TEST_FAIL perf exited with an error
+echo FERRIC_PERF_DONE
+echo FERRIC_SMOKE_OK
+shutdown
+"""

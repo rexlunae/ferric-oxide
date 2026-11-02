@@ -378,6 +378,13 @@ baseline image. Enable `kernel.trace`, `kernel.trace_sched` and `kernel.rings`
 for its measurement workload; image selection preserves the chosen feature
 policy. See the [scheduler baseline checks](ferric-testing.md#scheduler-baseline-accounting).
 
+`image.config = "ferric-perf"` selects the microbenchmark image, which runs
+`ferric-perf` (process spawn, pipe ping-pong and throughput, logging, file
+metadata and `mmap`) once at boot and shuts down. It needs no optional features
+and keeps the chosen feature policy, so images built with different kernel
+options can be compared. See
+[Process and IPC benchmarks](ferric-testing.md#process-and-ipc-benchmarks).
+
 1. `mk/ferric.mk` regenerates configuration when the user file, catalog or
    configuration tool sources change; Make includes the result and restarts.
 2. `FERRIC_TARGET_RUSTFLAGS` and `FERRIC_TARGET_CPPFLAGS` reach target recipe
