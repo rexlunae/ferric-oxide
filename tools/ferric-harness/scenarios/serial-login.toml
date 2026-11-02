@@ -1,0 +1,47 @@
+# Log in on the serial console (any image whose init runs the serial getty: minimal,
+# desktop, wayland), run a command and check its output, then read VT 2 by OCR.
+#
+#   ferric-harness run build/x86_64/desktop/harddrive.img \
+#       --scenario tools/ferric-harness/scenarios/serial-login.toml
+description = "serial login, a command, and the text console"
+timeout = 60
+
+[[step]]
+expect = "login:"
+timeout = 300
+
+[[step]]
+send = "root"
+
+[[step]]
+expect = "assword"
+
+[[step]]
+send = "password"
+
+[[step]]
+expect = "root:~# "
+
+[[step]]
+mark = "shell"
+
+[[step]]
+# The arithmetic keeps the echoed command line from matching the expected output.
+send = "echo harness_$((6*7))"
+
+[[step]]
+expect = "harness_42"
+
+[[step]]
+# Super+F2 shows VT 2 (fbcond's getty), which is drawn with the font `text` reads.
+key = "meta_l-f2"
+
+[[step]]
+wait = "text:login:"
+timeout = 30
+
+[[step]]
+text = "vt2.txt"
+
+[[step]]
+shot = "vt2.png"

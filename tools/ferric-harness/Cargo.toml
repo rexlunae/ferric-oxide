@@ -1,0 +1,30 @@
+[package]
+name = "ferric-harness"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Boots Ferric Oxide images in QEMU under a supervisor: serial, QMP screen and input, boot control, measurements and reports"
+
+[[bin]]
+name = "ferric-harness"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["env"] }
+# The 8x16 console font fbcond, fbbootlogd and the kernel's graphical debug draw with; the
+# `text` OCR matches screen cells against it. No SDL: only the font table is used.
+orbclient = { version = "0.4.6", default-features = false, features = ["unifont"] }
+png = "0.18"
+regex = "1"
+# Safe wrappers for the monotonic clock, clock ticks and signalling `ferric-trace follow`.
+rustix = { version = "1", features = ["param", "process", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+signal-hook = "0.3"
+thiserror = { workspace = true, features = ["std"] }
+time = { workspace = true, features = ["std", "formatting"] }
+toml = { workspace = true, features = ["parse", "serde", "std"] }
+
+[dev-dependencies]
+tempfile.workspace = true
