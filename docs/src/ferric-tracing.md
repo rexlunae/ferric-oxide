@@ -31,6 +31,8 @@ what is on at run time.
 | `kernel.trace_crash_test` | `false` | Testing only: writing `panic` to `kernel.trace/crash` panics the kernel and resets the machine after the dump |
 | `kernel.log_persist` | `false` | Keeps the kernel log in reserved RAM too, so the next boot serves its end as `/scheme/sys/log_previous` ([Persistent kernel log](#persistent-kernel-log)); needs no `kernel.trace` |
 | `kernel.log_persist_base` | `"0x4010000"` | The persistent log region's physical address, written to the kernel `config.toml` as `log.persist_base` |
+| `kernel.trace_mode` | `false` | Also builds the trace-mode kernel, `usr/lib/boot/kernel-trace`, which the bootloader loads for `FERRIC_KERNEL=trace` ([Trace mode](#trace-mode)); needs no `kernel.trace` |
+| `bootloader.fw_cfg_env` | `false` | Under QEMU, the bootloader reads boot environment lines from a fw_cfg file before its menu ([Setting the boot environment](#setting-the-boot-environment)) |
 
 The options below `kernel.trace` take effect only with it. The subsystem
 options map to the kernel Cargo features `trace_syscall`, `trace_sched`,
@@ -42,10 +44,10 @@ interrupt that live patching waits for.
 
 A selection is a comma- or space-separated list. Each item is `all`, a
 subsystem (`syscall`, `sched`, `scheme`, `mm`, `irq`, `iommu`) or an event name (`sched.switch`). Besides
-`trace.boot`, the boot environment can set `FERRIC_TRACE=<selection>`, which
-the bootloader's environment editor can change. Both are applied on the
-bootstrap processor before the other CPUs start, and the kernel logs
-`trace: <event> on from boot (<source>)` for each event that is on.
+`trace.boot`, the boot environment can set `FERRIC_TRACE=<selection>`
+([Setting the boot environment](#setting-the-boot-environment)). Both are
+applied on the bootstrap processor before the other CPUs start, and the kernel
+logs `trace: <event> on from boot (<source>)` for each event that is on.
 
 ```toml
 [kernel]
@@ -85,8 +87,116 @@ Bootstrap writes `enable <selection>` for each `enable` entry and then
 `disable <selection>` for each `disable` entry to `/scheme/kernel.trace/events`,
 as a root shell could. The kernel logs each change, for example
 `trace: enable syscall (2 event(s) changed)`. A missing file does nothing.
-Bootstrap logs a warning and boots on when the file does not parse, when a
-command is refused, or when the kernel has no `kernel.trace` scheme.
+Bootstrap logs a warning and boots on when the file does not parse or a
+command is refused. When the kernel has no `kernel.trace` scheme (it was built
+without tracing, like the normal kernel of a [trace-mode](#trace-mode) image),
+bootstrap does not open the file at all.
+
+### Trace mode
+
+A kernel built with `kernel.trace` runs some tracing code on every boot, even
+with every event off: it allocates the rings, registers the scheme, keeps a NOP
+at each tracepoint and times TLB shootdowns, and `procmgr` makes a system call
+per process event. To measure a system without any of that, and still trace it
+when asked, an image can carry two kernels:
+
+```toml
+[kernel]
+trace_mode = true   # and kernel.trace left off, its default
+
+[bootloader]
+fw_cfg_env = true   # optional: lets QEMU choose the kernel, see below
+```
+
+`kernel.trace_mode` adds the recipe `recipes/core/kernel-trace`, which builds
+the same kernel source again and installs it as `usr/lib/boot/kernel-trace`
+(with `kernel-trace.sym` and `kernel-trace.all`) beside `usr/lib/boot/kernel`.
+`ferric-config` exports its Cargo features as `FERRIC_TRACE_KERNEL_FEATURES`:
+the image kernel's features (`FERRIC_KERNEL_FEATURES`) plus `trace`,
+`trace_mode`, every subsystem's `trace_<subsystem>`, the level feature of
+`kernel.trace_max_level`'s default (`trace_level_info`) and `trace_crash`,
+without `profiling`, which cannot be combined with tracing. Both kernels use the
+same `kernel-config.toml` and link arguments, every option that rebuilds the
+kernel rebuilds the trace-mode kernel too, and like the kernel it never gets
+the user-space CPU flags (`cpu.flags_exclude`). The kernel recipes
+share their build in `recipes/core/kernel/build-kernel.sh`.
+
+The bootloader loads the trace-mode kernel when the boot environment has
+`FERRIC_KERNEL=trace`, and the normal one for `FERRIC_KERNEL=normal` or
+without the key. The choice is made once the environment is final, after the
+editor, and before any kernel is loaded. When the image has the trace-mode
+kernel, the resolution menu also offers `Press t to  enable the trace kernel`,
+which sets `FERRIC_KERNEL=trace` (pressing `t` again removes it). Any other
+value, or `trace` in an image without `usr/lib/boot/kernel-trace`, stops the
+boot with a message naming the problem; the bootloader never falls back to
+another kernel.
+
+The trace-mode kernel logs one line when it starts, before any event is turned
+on: `kernel::trace::imp:INFO -- trace: trace-mode kernel`. A kernel without
+`kernel.trace` has no tracing code and logs no `trace:` message at all, so a
+harness can tell from the log which kernel ran. In a normal boot of such an
+image user space does no tracing work either: the kernel hands out no
+`kernel.trace` scheme, so bootstrap never reads the initfs `trace.toml` and
+`procmgr` makes no `emit` calls.
+
+Nothing is traced until events are turned on: with `FERRIC_TRACE=` in the same
+boot environment, or at run time through the scheme. `kernel.trace_boot` and the
+initfs options need `kernel.trace`, which builds tracing into the normal kernel
+too.
+
+### Setting the boot environment
+
+The bootloader hands the kernel a boot environment of `KEY=VALUE` lines. It
+writes its own keys (`RSDP_*`, `REDOXFS_*`, `FRAMEBUFFER_*`); the kernel serves
+the text as `/scheme/sys/env`, and bootstrap passes it on to `init`. Keys that
+Ferric Oxide reads, defined once in `ferric_abi::boot_env` (`crates/abi`):
+
+| Key | Read by | Values |
+| --- | --- | --- |
+| `FERRIC_KERNEL` | bootloader | `normal` (the default) or `trace`, which loads `usr/lib/boot/kernel-trace` ([Trace mode](#trace-mode)) |
+| `FERRIC_BOOT_RESOLUTION` | bootloader | `menu` (the default: ask) or `auto`: for every display, take the mode the menu would highlight first without waiting for a key (the display's preferred resolution from its EDID, else the firmware's current one, when a mode has it; otherwise the largest mode), and print `FERRIC_BOOT_RESOLUTION=auto: <width>x<height>` |
+| `FERRIC_TRACE` | kernel with `kernel.trace` | A selection of events to turn on before the other CPUs start |
+| `FERRIC_TRACE_HOST` | kernel with host-visible rings | Reserved for the size of the host-visible trace rings |
+
+There are two ways to add lines:
+
+- **The environment editor.** Pressing `e` in the resolution menu picks the
+  highlighted mode and opens an editor on the environment, where lines can be
+  added, changed or removed. The menu and the editor exist only on boots with
+  a display: the menu runs once per video output, so a boot with none (QEMU's
+  `-nographic -vga none`, as CI's smoke boot uses) has neither, and until
+  `bootloader.fw_cfg_env` there was no way to set any key on such a boot.
+  `FERRIC_BOOT_RESOLUTION` cannot be set here, because the editor opens after
+  the menu.
+- **A QEMU fw_cfg file**, with `bootloader.fw_cfg_env` (the bootloader's
+  `fw_cfg_env` Cargo feature, x86_64 UEFI). QEMU passes the file with
+  `-fw_cfg name=opt/org.ferric-oxide/boot-env,file=<path>`, and the bootloader
+  reads it before the menu, so it works with and without a display:
+
+  ```text
+  # harness run 42
+  FERRIC_KERNEL=trace
+  FERRIC_BOOT_RESOLUTION=auto
+  FERRIC_TRACE=sched,irq
+  ```
+
+  The file is UTF-8 `KEY=VALUE` lines, where a key is ASCII letters, digits and
+  `_`; blank lines and lines starting with `#` are skipped. The bootloader adds
+  the assignments after its own keys, where the editor adds lines, so the
+  editor shows them and can still change them. It logs
+  `INFO - fw_cfg opt/org.ferric-oxide/boot-env: <n> boot environment lines`.
+  A line that is not an assignment is skipped with a warning naming its
+  number, and a file over 4096 bytes or not UTF-8 is ignored with a warning.
+  Keep it much smaller than that limit: bootstrap reads less than 4 KiB of the
+  whole environment, the bootloader's keys included, and stops the boot when
+  it is larger. The bootloader only touches the fw_cfg I/O ports (`0x510` and
+  `0x511`) when CPUID reports a hypervisor, and reads past the signature only
+  when it is QEMU's, so on hardware the feature does nothing. The reader is
+  the `ferric-fwcfg` crate (`crates/fwcfg`), written from QEMU's fw_cfg
+  specification.
+
+When a key is assigned more than once, the first assignment counts, for the
+bootloader as for the kernel and relibc's `getenv`.
 
 ## How a tracepoint works
 
@@ -323,8 +433,9 @@ writing a record to `kernel.trace/emit` ([User-space records](#user-space-record
 and the kernel stamps and stores it in the writing CPU's ring like its own.
 They are `sched` events, compiled in with `kernel.trace_sched`. On a kernel
 without them the first write fails with `EOPNOTSUPP` and `procmgr` stops
-writing; on a kernel without `kernel.trace` it opens nothing. While an event
-is off, each report costs `procmgr` one system call and stores nothing.
+writing; on a kernel without `kernel.trace` it opens nothing and a report costs
+nothing. While an event is off, each report costs `procmgr` one system call
+and stores nothing.
 
 - `sched.proc_fork` records that `procmgr` created the `child` process for
   a `fork` by `parent`. The parent then copies its address space and file

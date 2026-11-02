@@ -387,6 +387,15 @@ policy. See the [scheduler baseline checks](ferric-testing.md#scheduler-baseline
    `--no-default-features`, copies CPU policy and forwards extra linker
    arguments. `kernel.kaslr_image` emits `--emit-relocs` and the bootloader's
    `kaslr` feature. `kernel.aslr` also selects relibc's `aslr` feature.
+   `kernel.trace_mode` adds `recipes/core/kernel-trace`, a second build of the
+   kernel source from `FERRIC_TRACE_KERNEL_FEATURES` (the kernel's features plus
+   tracing), installed as `usr/lib/boot/kernel-trace`; both recipes run
+   `recipes/core/kernel/build-kernel.sh`, whose `KERNEL_INSTALL_NAME` picks the
+   installed name. See [Trace mode](ferric-tracing.md#trace-mode).
+   `FERRIC_BOOTLOADER_FEATURES` collects the bootloader's Cargo features
+   (`kaslr`, and `fw_cfg_env` from `bootloader.fw_cfg_env`, which reads boot
+   environment lines from QEMU; see
+   [Setting the boot environment](ferric-tracing.md#setting-the-boot-environment)).
 4. Local source recipes copy kernel, bootloader, relibc and base trees for
    building. They create links that preserve relative paths to shared crates.
    The target installer recipe uses `tools/installer/`; RedoxFS uses
@@ -682,12 +691,14 @@ Cookbook detects recipe/source timestamps rather than arbitrary environment
 changes. Configuration generation compares fingerprints in
 `build/ferric-rebuild-state.toml` and
 touches the `recipe.toml` files named by each changed option's `rebuild` scope.
-`["*"]` marks all recipes; kernel-only options usually mark the kernel. The
+`["*"]` marks all recipes; kernel-only options usually mark the kernel, and
+every option that marks the kernel also marks `kernel-trace`, which is built
+from the same options. The
 fingerprints are saved only after all selected recipe timestamps are updated.
 If a recipe cannot be opened or touched, generation fails with its path and
 underlying error, retaining the prior rebuild state. Correct the filesystem
 problem and rerun `make config-generate` to retry pending rebuilds. The kernel,
-bootloader and relibc recipes also maintain feature stamps for their
+trace-mode kernel, bootloader and relibc recipes also maintain feature stamps for their
 Make-driven artifacts. Generated output, `ferric.toml` and image artifacts must
 stay uncommitted.
 
