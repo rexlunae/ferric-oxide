@@ -299,9 +299,9 @@ struct UpOptions {
     /// How the boot environment reaches the bootloader.
     #[arg(long, value_enum, default_value_t = BootEnvVia::FwCfg)]
     boot_env_via: BootEnvVia,
-    /// Host-visible trace ring per CPU in KiB (trace mode; a power of two).
-    #[arg(long, default_value_t = 4096)]
-    trace_ring_kib: u64,
+    /// Host-visible trace ring per CPU in KiB (trace mode; a power of two from 4 to 1048576).
+    #[arg(long, default_value_t = 4096, value_parser = bootenv::parse_ring_kib)]
+    trace_ring_kib: u32,
     /// The ferric-trace binary (trace mode); default PATH, then target/*/ferric-trace.
     #[arg(long)]
     ferric_trace: Option<PathBuf>,
@@ -919,6 +919,14 @@ mod tests {
             [("FERRIC_TRACE".to_owned(), "sched.switch".to_owned())]
         );
         assert_eq!(options.qemu_arg, ["-d", "guest_errors"]);
+        assert_eq!(options.trace_ring_kib, 4096);
+        for bad in ["1", "3000", "2097152", "4M"] {
+            assert!(
+                Cli::try_parse_from(["ferric-harness", "up", "img", "--trace-ring-kib", bad])
+                    .is_err(),
+                "--trace-ring-kib {bad}"
+            );
+        }
         assert!(
             Cli::try_parse_from(["ferric-harness", "up", "img", "--boot-env", "nope"]).is_err()
         );

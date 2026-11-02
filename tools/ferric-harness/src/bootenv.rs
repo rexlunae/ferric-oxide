@@ -12,7 +12,10 @@
 //!   works with any bootloader that has a display, and needs one.
 //!
 //! `--mode trace` adds `FERRIC_KERNEL=trace` (load `usr/lib/boot/kernel-trace`) and
-//! `FERRIC_TRACE_HOST=<KiB per CPU>` (allocate host-visible rings).
+//! `FERRIC_TRACE_HOST=<KiB per CPU>` (allocate host-visible rings). A `FERRIC_TRACE_HOST`
+//! value, the mode's or the user's, must be a size the kernel accepts
+//! ([`RingSize::parse`], a power of two from 4 to 1048576 KiB): the kernel would otherwise
+//! boot without host rings.
 //!
 //! The key names, the fw_cfg file name, the size limit and the key rule are those of
 //! [`ferric_abi::boot_env`], the definitions the bootloader and kernel use.
@@ -21,6 +24,7 @@ use ferric_abi::boot_env::{
     self, FERRIC_BOOT_RESOLUTION, FERRIC_KERNEL, FERRIC_TRACE_HOST, Kernel, MAX_PRESET_BYTES,
     Resolution,
 };
+use ferric_trace::host::{RingSize, RingSizeError};
 use thiserror::Error;
 
 use crate::machine::{Display, Mode};
@@ -68,9 +72,16 @@ pub enum BootEnvError {
         /// The limit.
         max: usize,
     },
-    /// `FERRIC_TRACE_HOST` must be a power of two.
-    #[error("--trace-ring-kib {0} is not a power of two")]
-    RingSize(u64),
+    /// A `FERRIC_TRACE_HOST` value (from `--trace-ring-kib` or `--boot-env`) that is not a
+    /// ring size the kernel accepts.
+    #[error("FERRIC_TRACE_HOST={value} is not a host ring size the kernel accepts")]
+    RingSize {
+        /// The value given.
+        value: String,
+        /// Why the kernel would refuse it.
+        #[source]
+        source: RingSizeError,
+    },
     /// The user set `FERRIC_KERNEL` to something other than the mode.
     #[error("--boot-env FERRIC_KERNEL={value} contradicts --mode {mode}")]
     KernelConflict {
@@ -93,21 +104,18 @@ impl BootEnv {
     ///
     /// # Errors
     ///
-    /// Any [`BootEnvError`]: a malformed entry, a ring size that is not a power of two, a
-    /// `FERRIC_KERNEL` that contradicts the mode, or a file over
+    /// Any [`BootEnvError`]: a malformed entry, a `FERRIC_TRACE_HOST` the kernel would
+    /// refuse, a `FERRIC_KERNEL` that contradicts the mode, or a file over
     /// [`MAX_PRESET_BYTES`].
     pub fn for_run(
         user: &[(String, String)],
         mode: Mode,
-        trace_ring_kib: u64,
+        trace_ring_kib: u32,
         display: Display,
         via: BootEnvVia,
     ) -> Result<Self, BootEnvError> {
         let mut env = Self::default();
         if mode == Mode::Trace {
-            if !trace_ring_kib.is_power_of_two() {
-                return Err(BootEnvError::RingSize(trace_ring_kib));
-            }
             env.set(FERRIC_KERNEL, Kernel::Trace.name())?;
             env.set(FERRIC_TRACE_HOST, &trace_ring_kib.to_string())?;
         }
@@ -122,6 +130,12 @@ impl BootEnv {
                 });
             }
             env.set(key, value)?;
+        }
+        if let Some(value) = env.get(FERRIC_TRACE_HOST) {
+            RingSize::parse(value).map_err(|source| BootEnvError::RingSize {
+                value: value.to_owned(),
+                source,
+            })?;
         }
         let bytes = env.render().len();
         if bytes > MAX_PRESET_BYTES {
@@ -196,6 +210,15 @@ pub fn parse_assignment(text: &str) -> Result<(String, String), BootEnvError> {
 
 /// Checks one entry with the rule the bootloader and kernel read the environment by
 /// ([`boot_env::Line::parse`]); a value must also stay on its line.
+/// Parses `--trace-ring-kib`: a host ring size the kernel accepts, in KiB.
+///
+/// # Errors
+///
+/// [`RingSizeError`] as [`RingSize::parse`] gives it.
+pub fn parse_ring_kib(text: &str) -> Result<u32, RingSizeError> {
+    RingSize::parse(text).map(RingSize::kib)
+}
+
 fn validate(key: &str, value: &str) -> Result<(), BootEnvError> {
     if value.contains(['\n', '\r', '\0']) {
         return Err(BootEnvError::Value(key.to_owned()));
@@ -237,6 +260,54 @@ mod tests {
                 "FERRIC_TRACE=sched.switch"
             ]
         );
+    }
+
+    /// The ring sizes are the kernel's: a power of two from 4 KiB to 1 GiB, whether they
+    /// come from `--trace-ring-kib` or a `FERRIC_TRACE_HOST` entry.
+    #[test]
+    fn ring_sizes_the_kernel_accepts() {
+        let trace = |kib, user: &[(String, String)]| {
+            BootEnv::for_run(user, Mode::Trace, kib, Display::None, BootEnvVia::FwCfg)
+        };
+        for kib in [4, 4096, 1 << 20] {
+            assert!(trace(kib, &[]).is_ok(), "{kib} KiB");
+        }
+        for (kib, source) in [
+            (1, RingSizeError::TooSmall { kib: 1 }),
+            (2, RingSizeError::TooSmall { kib: 2 }),
+            (3000, RingSizeError::NotPowerOfTwo { kib: 3000 }),
+            (1 << 21, RingSizeError::TooLarge { kib: 1 << 21 }),
+        ] {
+            assert_eq!(
+                trace(kib, &[]),
+                Err(BootEnvError::RingSize {
+                    value: kib.to_string(),
+                    source
+                })
+            );
+        }
+        // A user's entry replaces the mode's and is held to the same rule, in any mode.
+        assert_eq!(
+            trace(4096, &[kv("FERRIC_TRACE_HOST", "4M")]),
+            Err(BootEnvError::RingSize {
+                value: "4M".into(),
+                source: RingSizeError::NotNumber
+            })
+        );
+        assert!(matches!(
+            BootEnv::for_run(
+                &[kv("FERRIC_TRACE_HOST", "2")],
+                Mode::Normal,
+                4096,
+                Display::None,
+                BootEnvVia::FwCfg
+            ),
+            Err(BootEnvError::RingSize { .. })
+        ));
+        let env = trace(4096, &[kv("FERRIC_TRACE_HOST", "65536")]).expect("valid");
+        assert_eq!(env.get("FERRIC_TRACE_HOST"), Some("65536"));
+        assert_eq!(parse_ring_kib("65536"), Ok(65536));
+        assert_eq!(parse_ring_kib("1"), Err(RingSizeError::TooSmall { kib: 1 }));
     }
 
     #[test]
@@ -286,10 +357,6 @@ mod tests {
             BootEnv::default().set("A", "x\ny"),
             Err(BootEnvError::Value(_))
         ));
-        assert_eq!(
-            BootEnv::for_run(&[], Mode::Trace, 3000, Display::None, BootEnvVia::FwCfg),
-            Err(BootEnvError::RingSize(3000))
-        );
         assert!(matches!(
             BootEnv::for_run(
                 &[kv("FERRIC_KERNEL", "normal")],

@@ -145,8 +145,10 @@ pub struct LaunchConfig {
     pub boot_env: Vec<(String, String)>,
     /// How the boot environment reaches the bootloader.
     pub boot_env_via: BootEnvVia,
-    /// Host-visible trace ring size per CPU, in KiB (trace mode).
-    pub trace_ring_kib: u64,
+    /// Host-visible trace ring size per CPU, in KiB (trace mode): a size the kernel accepts
+    /// (`ferric_trace::host::RingSize`), which [`BootEnv::for_run`](crate::bootenv::BootEnv::for_run)
+    /// checks.
+    pub trace_ring_kib: u32,
     /// The `ferric-trace` binary (resolved when trace mode is requested).
     pub ferric_trace: Option<PathBuf>,
     /// Start `ferric-trace follow` as soon as the kernel announces its rings.

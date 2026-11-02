@@ -108,7 +108,7 @@ full chain of causes.
 | `--display std\|none` | `std` | A VGA framebuffer read through QMP, or no display, like CI's smoke boots. Without a display the bootloader shows no menu |
 | `--boot-env KEY=VALUE` | none | A boot environment entry. Repeat for more |
 | `--boot-env-via fw-cfg\|keys` | `fw-cfg` | How the boot environment reaches the bootloader |
-| `--trace-ring-kib <n>` | 4096 | Host-visible ring size per CPU in trace mode. Must be a power of two. Use 65536 for system-call events under load (see [Limits](#limits)) |
+| `--trace-ring-kib <n>` | 4096 | Host-visible ring size per CPU in trace mode: a power of two from 4 to 1048576 KiB, the sizes the kernel accepts (`ferric_trace::host::RingSize`). Any other value is rejected before QEMU starts. Use 65536 for system-call events under load (see [Limits](#limits)) |
 | `--ferric-trace <path>`, `--no-trace-autostart` | `PATH`, then the newest `target/*/ferric-trace` | `follow` binary, and whether to start it when the rings are announced |
 | `--smp`, `--mem` | 4, 2048 MiB | vCPUs and guest RAM |
 | `--accel auto\|kvm\|tcg`, `--cpu <model>` | `auto` | KVM with `host,migratable=off` when `/dev/kvm` opens read-write, otherwise TCG with `max` |
@@ -281,7 +281,11 @@ In either case the harness answers each resolution menu it sees on the console
 with Enter. So images whose bootloader has no fw_cfg support still boot without
 a person. Keys must be letters, digits and `_`. Values cannot contain line
 breaks. The file may be at most 4 KiB, the most the bootloader reads. A
-`FERRIC_KERNEL` entry that contradicts `--mode` is rejected.
+`FERRIC_KERNEL` entry that contradicts `--mode` is rejected, and so is a
+`FERRIC_TRACE_HOST` entry with a ring size the kernel would refuse (it would
+boot without host rings). The key names, the fw_cfg file name, the size limit
+and the key rule come from `ferric_abi::boot_env`, which the bootloader and
+kernel use too.
 
 ## Input and screen
 

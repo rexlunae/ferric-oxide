@@ -14,6 +14,8 @@ path = "src/main.rs"
 clap = { workspace = true, features = ["env"] }
 # The boot environment's key names, fw_cfg file and size limit, as the bootloader reads them.
 ferric-abi = { path = "../../crates/abi" }
+# The host ring sizes the kernel accepts (`host::RingSize`).
+ferric-trace = { path = "../../crates/trace" }
 # The 8x16 console font fbcond, fbbootlogd and the kernel's graphical debug draw with; the
 # `text` OCR matches screen cells against it. No SDL: only the font table is used.
 orbclient = { version = "0.4.6", default-features = false, features = ["unifont"] }
