@@ -193,6 +193,27 @@ pub enum Error {
         /// The supervisor's effective user ID.
         owner: u32,
     },
+    /// A control client that did not send its whole request in time.
+    #[error("no complete request within {seconds}s of connecting")]
+    RequestTimeout {
+        /// The limit, in seconds.
+        seconds: f64,
+    },
+    /// A control request larger than the supervisor reads.
+    #[error("the request is larger than {max} bytes")]
+    RequestTooLarge {
+        /// The limit, in bytes.
+        max: usize,
+    },
+    /// A control connection beyond the number served at once.
+    #[error("the supervisor is already serving {limit} connections; try again")]
+    ControlBusy {
+        /// The number served at once.
+        limit: usize,
+    },
+    /// Reading a control request failed.
+    #[error("cannot read the control request")]
+    ControlRead(#[source] io::Error),
     /// The control socket closed before replying.
     #[error("the supervisor closed the connection without replying")]
     NoReply,
@@ -249,6 +270,8 @@ impl Error {
             | Error::TraceRunning
             | Error::TraceNotRunning
             | Error::PeerRefused { .. }
+            | Error::RequestTimeout { .. }
+            | Error::RequestTooLarge { .. }
             | Error::ShotName(_) => ErrorKind::BadRequest,
             Error::Screen(ScreenError::Predicate(_) | ScreenError::Regex(_)) => {
                 ErrorKind::BadRequest

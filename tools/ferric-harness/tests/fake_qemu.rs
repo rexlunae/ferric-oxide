@@ -650,6 +650,101 @@ fn expect_since_a_mark_moves_the_cursor_back() {
     session.down(None);
 }
 
+/// An idle control client is answered with a timeout and dropped, extra connections are
+/// refused while the limit is reached, and the server keeps serving, long requests included.
+#[test]
+fn control_drops_idle_clients_and_bounds_connections() {
+    let fixture = Fixture::new();
+    let script = json!({"serial": [{"text": "ready\r\n"}], "on_powerdown": "exit"});
+    let mut config = fixture.config("control-limits", &script);
+    config.display = Display::None;
+    let session = Running::launch(config);
+    let run_dir = session.run().root().to_path_buf();
+    let sock = session.run().control_sock();
+    let limits = control::ServeLimits {
+        request_timeout: Duration::from_millis(300),
+        max_connections: 2,
+    };
+    let server = {
+        let session = session.0.clone();
+        let sock = sock.clone();
+        thread::spawn(move || control::serve_with(&session, &sock, limits))
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while control::request(&run_dir, &Request::Status).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the control socket never answered"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // A served connection counts until its thread ends, just after the reply.
+    let settle = || thread::sleep(Duration::from_millis(100));
+    settle();
+    // Two idle clients fill the limit; a third connection is turned away at once.
+    let connected = Instant::now();
+    let idle: Vec<UnixStream> = (0..2)
+        .map(|_| UnixStream::connect(&sock).expect("connect"))
+        .collect();
+    settle();
+    match control::request(&run_dir, &Request::Status) {
+        Err(ferric_harness::Error::Remote { message, .. }) => {
+            assert!(message.contains("already serving 2"), "{message}");
+        }
+        other => panic!("expected a busy reply, got {other:?}"),
+    }
+
+    // Each idle client is answered with the timeout and dropped.
+    for client in idle {
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let mut text = String::new();
+        BufReader::new(client)
+            .read_to_string(&mut text)
+            .expect("the server closes the connection");
+        let reply: Value = serde_json::from_str(text.trim()).expect("a reply");
+        assert_eq!(reply["err"]["kind"], "bad-request", "{reply}");
+        assert!(
+            reply["err"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("no complete request within 0.3s")),
+            "{reply}"
+        );
+    }
+    let waited = connected.elapsed();
+    assert!(
+        waited >= Duration::from_millis(300) && waited < Duration::from_secs(5),
+        "{waited:?}"
+    );
+
+    // The server still serves, and the limit is on reading the request, not on running it.
+    settle();
+    assert!(matches!(
+        control::request(&run_dir, &Request::Status),
+        Ok(control::Output::Status(_))
+    ));
+    let started = Instant::now();
+    let expect = control::request(
+        &run_dir,
+        &Request::Expect {
+            pattern: "never printed".into(),
+            timeout_s: 1.0,
+            since: Since::Start,
+        },
+    );
+    assert!(
+        matches!(&expect, Err(e) if e.kind() == ErrorKind::Timeout),
+        "{expect:?}"
+    );
+    assert!(started.elapsed() >= Duration::from_secs(1));
+
+    session.down(None);
+    server.join().expect("server thread").expect("serve");
+    assert!(!sock.exists());
+}
+
 #[test]
 fn smoke_run_powers_off_by_itself() {
     let fixture = Fixture::new();

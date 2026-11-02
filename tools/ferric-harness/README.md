@@ -65,7 +65,7 @@ bootloader built with `bootloader.fw_cfg_env`; with other bootloaders, use
 | --- | --- |
 | `machine` | Options and the QEMU command line (the topology of `scripts/ferric-ci/boot-smoke.sh`) |
 | `session` | A running guest: QEMU, its sockets, the monitor and sampler threads, every command |
-| `control` | The supervisor's control socket (one JSON request and reply per connection, `0600`, served only to the supervisor's user) |
+| `control` | The supervisor's control socket (one JSON request and reply per connection, `0600`, served only to the supervisor's user, with a request timeout and a limit on connections served at once) |
 | `qmp`, `serial` | QMP client with an event reader; timestamped serial capture with `expect` |
 | `screen`, `input` | PNG screenshots, text recognition, predicates; qcodes and pointer events |
 | `bootenv`, `trace` | Boot environment (fw_cfg or keys); `ferric-trace follow` discovery and control |

@@ -7,6 +7,13 @@
 //! `{"err": {"kind": ..., "message": ...}}`). Connections are served on their own threads,
 //! so a long `expect` does not hold up a `shot`.
 //!
+//! A client that connects must send its request within [`REQUEST_TIMEOUT`] (and take its
+//! reply within as long), or it is answered with [`Error::RequestTimeout`] and dropped; the
+//! limit covers reading the request, not carrying it out, so `expect --timeout 300` still
+//! works. At most [`MAX_CONNECTIONS`] connections are served at once; others get
+//! [`Error::ControlBusy`]. Idle or repeated connections therefore cannot tie up the
+//! supervisor's threads ([`ServeLimits`] sets both limits).
+//!
 //! Screenshots are written only under `<run>/shots/`: a request names the file, never a
 //! path ([`Request::Shot`]), and a client that wants it elsewhere copies it there itself.
 //!
@@ -16,7 +23,7 @@
 //! other client gets an [`Error::PeerRefused`] reply and nothing else.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -219,6 +226,32 @@ pub fn handle(session: &Session, request: Request) -> Result<Output, Error> {
 /// waiting for it must still get its reply).
 const DRAIN: Duration = Duration::from_secs(10);
 
+/// How long a client has to send its request after connecting, and to take its reply.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How many connections are served at once.
+pub const MAX_CONNECTIONS: usize = 16;
+/// The largest request accepted, in bytes.
+pub const MAX_REQUEST_BYTES: usize = 1 << 20;
+
+/// Limits on the clients [`serve_with`] serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServeLimits {
+    /// How long a client has to send its whole request, and to take its reply.
+    pub request_timeout: Duration,
+    /// How many connections are served at once; more are answered with
+    /// [`Error::ControlBusy`].
+    pub max_connections: usize,
+}
+
+impl Default for ServeLimits {
+    fn default() -> Self {
+        Self {
+            request_timeout: REQUEST_TIMEOUT,
+            max_connections: MAX_CONNECTIONS,
+        }
+    }
+}
+
 /// Requests being served; the count drops when the guard does.
 #[derive(Clone, Debug, Default)]
 struct InFlight(Arc<AtomicUsize>);
@@ -229,8 +262,12 @@ impl InFlight {
         InFlightGuard(Arc::clone(&self.0))
     }
 
+    fn count(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+
     fn idle(&self) -> bool {
-        self.0.load(Ordering::Acquire) == 0
+        self.count() == 0
     }
 }
 
@@ -273,12 +310,22 @@ pub fn peer_permitted(peer_uid: Option<u32>, owner_uid: u32) -> bool {
 
 /// Serves requests for `session` on `path` until the session's report is written and the
 /// requests in flight have been answered; then removes the socket. Only clients running as
-/// the supervisor's effective user are served (see the [module docs](self)).
+/// the supervisor's effective user are served, within the default [`ServeLimits`] (see the
+/// [module docs](self)).
 ///
 /// # Errors
 ///
 /// [`Error::Io`] when the socket cannot be bound or its mode set.
 pub fn serve(session: &Session, path: &Path) -> Result<(), Error> {
+    serve_with(session, path, ServeLimits::default())
+}
+
+/// [`serve`] with other limits.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the socket cannot be bound or its mode set.
+pub fn serve_with(session: &Session, path: &Path, limits: ServeLimits) -> Result<(), Error> {
     let listener = bind(path)?;
     let done = Arc::new(AtomicBool::new(false));
     let in_flight = InFlight::default();
@@ -289,7 +336,7 @@ pub fn serve(session: &Session, path: &Path) -> Result<(), Error> {
         let path = path.to_path_buf();
         thread::Builder::new()
             .name("control".to_owned())
-            .spawn(move || accept_loop(&listener, &session, &done, &in_flight))
+            .spawn(move || accept_loop(&listener, &session, &done, &in_flight, limits))
             .map_err(|source| Error::Io { path, source })?;
     }
     session.wait_report(None);
@@ -309,6 +356,7 @@ fn accept_loop(
     session: &Session,
     done: &AtomicBool,
     in_flight: &InFlight,
+    limits: ServeLimits,
 ) {
     let owner = geteuid().as_raw();
     for stream in listener.incoming() {
@@ -322,24 +370,40 @@ fn accept_loop(
             reply(stream, Err(Error::PeerRefused { owner }).into());
             continue;
         }
+        // Only this loop adds connections, so the count cannot grow between the check and
+        // `enter`.
+        if in_flight.count() >= limits.max_connections {
+            let busy = Error::ControlBusy {
+                limit: limits.max_connections,
+            };
+            eprintln!("control: {busy}");
+            stream.set_write_timeout(Some(limits.request_timeout)).ok();
+            reply(stream, Err(busy).into());
+            continue;
+        }
         let session = session.clone();
         let guard = in_flight.enter();
         thread::spawn(move || {
-            serve_one(stream, &session);
+            serve_one(stream, &session, limits.request_timeout);
             drop(guard);
         });
     }
 }
 
-fn serve_one(stream: UnixStream, session: &Session) {
-    let Ok(read_half) = stream.try_clone() else {
-        return;
+fn serve_one(mut stream: UnixStream, session: &Session, timeout: Duration) {
+    // A client that stops reading must not hold this thread either.
+    stream.set_write_timeout(Some(timeout)).ok();
+    let request = match read_request(&mut stream, timeout) {
+        Ok(Some(request)) => request,
+        // The client left without asking anything.
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("control: dropped a client: {}", chain(&e));
+            reply(stream, Err(e).into());
+            return;
+        }
     };
-    let mut line = String::new();
-    if BufReader::new(read_half).read_line(&mut line).unwrap_or(0) == 0 {
-        return;
-    }
-    let answer: Reply = match serde_json::from_str::<Request>(&line) {
+    let answer: Reply = match serde_json::from_slice::<Request>(&request) {
         Ok(request) => handle(session, request).into(),
         Err(e) => Reply::Err(RemoteError {
             kind: ErrorKind::BadRequest,
@@ -347,6 +411,52 @@ fn serve_one(stream: UnixStream, session: &Session) {
         }),
     };
     reply(stream, answer);
+}
+
+/// Reads one request line (without its newline) from `stream`, giving the client `timeout`
+/// for all of it, however slowly its bytes arrive. `None` when the client closes the
+/// connection without sending anything.
+fn read_request(stream: &mut UnixStream, timeout: Duration) -> Result<Option<Vec<u8>>, Error> {
+    let deadline = Instant::now() + timeout;
+    let timed_out = || Error::RequestTimeout {
+        seconds: timeout.as_secs_f64(),
+    };
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(timed_out());
+        }
+        stream
+            .set_read_timeout(Some(left))
+            .map_err(Error::ControlRead)?;
+        match stream.read(&mut chunk) {
+            Ok(0) => return Ok((!request.is_empty()).then_some(request)),
+            Ok(n) => {
+                if let Some(end) = chunk[..n].iter().position(|&b| b == b'\n') {
+                    request.extend_from_slice(&chunk[..end]);
+                    return Ok(Some(request));
+                }
+                request.extend_from_slice(&chunk[..n]);
+                if request.len() > MAX_REQUEST_BYTES {
+                    return Err(Error::RequestTooLarge {
+                        max: MAX_REQUEST_BYTES,
+                    });
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(timed_out());
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(Error::ControlRead(e)),
+        }
+    }
 }
 
 fn reply(mut stream: UnixStream, reply: Reply) {
@@ -472,6 +582,57 @@ mod tests {
         let peer = socket_peercred(&server).expect("credentials").uid.as_raw();
         assert!(peer_permitted(Some(peer), geteuid().as_raw()));
         drop(client);
+    }
+
+    #[test]
+    fn requests_are_read_within_the_limit() {
+        let timeout = Duration::from_millis(200);
+        let (mut client, mut server) = UnixStream::pair().expect("pair");
+        client
+            .write_all(b"{\"cmd\":\"status\"}\nignored")
+            .expect("write");
+        assert_eq!(
+            read_request(&mut server, timeout).expect("read"),
+            Some(br#"{"cmd":"status"}"#.to_vec())
+        );
+
+        // A client that leaves without a request is not an error.
+        let (client, mut server) = UnixStream::pair().expect("pair");
+        drop(client);
+        assert_eq!(read_request(&mut server, timeout).expect("read"), None);
+
+        // A client that trickles bytes gets the same limit for the whole request.
+        let (mut client, mut server) = UnixStream::pair().expect("pair");
+        let trickle = thread::spawn(move || {
+            for _ in 0..20 {
+                if client.write_all(b" ").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let start = Instant::now();
+        assert!(matches!(
+            read_request(&mut server, timeout),
+            Err(Error::RequestTimeout { .. })
+        ));
+        assert!(start.elapsed() < Duration::from_millis(600));
+        drop(server);
+        trickle.join().expect("trickle");
+
+        let (mut client, mut server) = UnixStream::pair().expect("pair");
+        let flood = thread::spawn(move || {
+            let chunk = vec![b'x'; 64 << 10];
+            while client.write_all(&chunk).is_ok() {}
+        });
+        assert!(matches!(
+            read_request(&mut server, Duration::from_secs(10)),
+            Err(Error::RequestTooLarge {
+                max: MAX_REQUEST_BYTES
+            })
+        ));
+        drop(server);
+        flood.join().expect("flood");
     }
 
     #[test]

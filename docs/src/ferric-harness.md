@@ -70,6 +70,13 @@ take screenshots, so a run is kept to the user who started it:
 - The supervisor reads each client's user with `SO_PEERCRED` and serves only
   its own effective user. Any other client, root included, gets the error
   `only uid <n> may use this run's control socket` and nothing else.
+- A client must send its whole request within 10 seconds of connecting, and
+  take its reply within as long, or it gets the error `no complete request
+  within 10s of connecting` and is dropped. The limit covers reading the
+  request, not carrying it out, so a long `expect --timeout` still works. At
+  most 16 connections are served at once; another gets `the supervisor is
+  already serving 16 connections; try again`. Requests are at most 1 MiB. So
+  idle or repeated connections cannot use up the supervisor's threads.
 
 The other commands are clients of the control socket. They find the run through
 `--run <dir>`, then `$FERRIC_HARNESS_RUN`, then the `build/harness/latest`
@@ -418,7 +425,8 @@ ferric-harness report --a build/harness/a{1..5} --b build/harness/b{1..5}
   comparison;
 - `tests/fake_qemu.rs`, which uses the test binary itself as QEMU. It serves
   the QMP and serial sockets, plays a scripted console and logs the input it
-  receives, so `up`, the control socket, `run --scenario`, typed boot
+  receives, so `up`, the control socket (with its idle-client timeout and
+  connection limit), `run --scenario`, typed boot
   environments, trace mode with a stand-in `follow`, and `down` are tested end
   to end;
 - `tests/real_qemu.rs`, an ignored test that boots a real smoke image:
