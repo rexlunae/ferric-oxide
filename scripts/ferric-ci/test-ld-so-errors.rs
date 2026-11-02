@@ -7,6 +7,8 @@ mod platform {
     pub mod types {
         #[allow(non_camel_case_types)]
         pub type c_int = i32;
+        #[allow(non_camel_case_types)]
+        pub type off_t = i64;
         pub use core::ffi::c_void;
     }
     use crate::{c_str::CStr, error::Errno, header::sys_stat::stat, out::Out};
@@ -37,10 +39,20 @@ mod platform {
         }
         fn pread(_: i32, buf: &mut [u8], offset: i64) -> Result<usize, Errno> {
             crate::mapping_tests::step("read")?;
-            assert_eq!(offset, 0);
-            crate::mapping_tests::STATE.with(|s| s.borrow_mut().probed = Some(buf.len()));
-            buf.fill(5);
-            Ok(buf.len())
+            crate::mapping_tests::STATE.with(|s| {
+                let mut s = s.borrow_mut();
+                if s.interrupts > 0 {
+                    s.interrupts -= 1;
+                    return Err(Errno(crate::header::errno::EINTR));
+                }
+                let offset = usize::try_from(offset).unwrap();
+                assert_eq!(offset, s.probed.unwrap_or(0), "reads continue where the last ended");
+                let size = usize::try_from(s.size).unwrap();
+                let count = buf.len().min(s.chunk).min(size.saturating_sub(offset));
+                buf[..count].fill(5);
+                s.probed = Some(offset + count);
+                Ok(count)
+            })
         }
         unsafe fn mmap(
             _: *mut types::c_void,
@@ -70,6 +82,7 @@ mod platform {
 mod header {
     pub mod errno {
         pub const ENOENT: i32 = 2;
+        pub const EINTR: i32 = 4;
         pub const EOVERFLOW: i32 = 75;
         pub const STR_ERROR: [&str; 1] = ["Success"];
     }
@@ -137,10 +150,14 @@ mod mapping_tests {
         pub size: i64,
         pub calls: Vec<&'static str>,
         pub mapping: Option<Box<[u8]>>,
-        /// How many bytes the probe asked to read.
+        /// How far into the file the probe has read.
         pub probed: Option<usize>,
+        /// How many reads fail with `EINTR` before one succeeds.
+        pub interrupts: usize,
+        /// The most one read returns.
+        pub chunk: usize,
     }
-    std::thread_local! { pub static STATE: RefCell<State> = const { RefCell::new(State { fail: None, size: 16, calls: Vec::new(), mapping: None, probed: None }) }; }
+    std::thread_local! { pub static STATE: RefCell<State> = const { RefCell::new(State { fail: None, size: 16, calls: Vec::new(), mapping: None, probed: None, interrupts: 0, chunk: usize::MAX }) }; }
     pub fn step(operation: &'static str) -> Result<(), Errno> {
         STATE.with(|s| {
             let mut s = s.borrow_mut();
@@ -160,6 +177,8 @@ mod mapping_tests {
                 calls: vec![],
                 mapping: None,
                 probed: None,
+                interrupts: 0,
+                chunk: usize::MAX,
             }
         });
     }
@@ -229,6 +248,30 @@ mod mapping_tests {
         .unwrap();
         assert_eq!(map.data().len(), 100);
         STATE.with(|s| assert_eq!(s.borrow().probed, Some(PROBE_LEN)));
+    }
+    /// An interrupted read (`EINTR`, which a scheme returns when the kernel cancels a call
+    /// whose context was woken) is retried, and short reads continue until the probe is
+    /// full, so neither makes a library fail to load.
+    #[test]
+    fn interrupted_and_short_reads_still_fill_the_probe() {
+        reset(None, 1 << 20);
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.interrupts = 2;
+            s.chunk = 1000;
+        });
+        let map = MmapFile::open("/lib/test.so", 0, |probe, _| {
+            assert_eq!(probe, [5; PROBE_LEN]);
+            64
+        })
+        .unwrap();
+        assert_eq!(map.data().len(), 64);
+        STATE.with(|s| {
+            let s = s.borrow();
+            assert_eq!(s.probed, Some(PROBE_LEN));
+            // Two interrupted reads, then five short ones (4 x 1000 + 96 bytes).
+            assert_eq!(s.calls.iter().filter(|&&c| c == "read").count(), 7);
+        });
     }
     /// A file shorter than the probe is read only to its end, and an answer beyond
     /// the file's length maps the whole file rather than past its end.

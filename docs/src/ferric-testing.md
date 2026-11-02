@@ -595,8 +595,12 @@ output, isolation from a later parse/TLS failure, stable `dlerror` messages,
 and descriptor cleanup after failed stat, header-read and map operations. File
 descriptors are owned immediately after open, including on error paths; a
 successful mapping retains its descriptor until after unmap. It also checks that
-only the length the loader asks for after reading the first 4 KiB is mapped, and
-that a shorter file is read and mapped only to its end. Which length an ELF
+only the length the loader asks for after reading the first 4 KiB is mapped, that
+a shorter file is read and mapped only to its end, and that an interrupted
+(`EINTR`) or short read of those 4 KiB is retried rather than failing the load.
+A scheme call can return `EINTR` with no signal handler involved: the kernel
+cancels a call whose context was woken, and the smoke image's last commands hit
+this at the end of every boot. Which length an ELF
 object needs (`dso::loaded_len`) uses the `object` crate, which the harness does
 not build; every dynamically linked program in a boot test loads through it. Platform I/O, file guards, errno storage
 and its message table use host adapters; this is not an end-to-end dynamic-link

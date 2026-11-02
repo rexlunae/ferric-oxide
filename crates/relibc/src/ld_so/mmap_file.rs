@@ -12,11 +12,14 @@ use crate::{
     c_str::CStr,
     error::Errno,
     fs::File,
-    header::{errno::EOVERFLOW, sys_mman},
+    header::{
+        errno::{EINTR, EOVERFLOW},
+        sys_mman,
+    },
     out::Out,
     platform::{
         Pal, Sys,
-        types::{c_int, c_void},
+        types::{c_int, c_void, off_t},
     },
 };
 use core::ptr;
@@ -55,12 +58,11 @@ impl MmapFile {
             source: Errno(EOVERFLOW),
         })?;
         let mut probe = [0; PROBE_LEN];
-        let probed = Sys::pread(fd.fd, &mut probe[..size.min(PROBE_LEN)], 0).map_err(|source| {
-            ObjectIoError {
+        let probed =
+            read_start(&fd, &mut probe[..size.min(PROBE_LEN)]).map_err(|source| ObjectIoError {
                 operation: ObjectIoOperation::Read,
                 source,
-            }
-        })?;
+            })?;
         let size = needed(&probe[..probed], size).min(size);
         Self::from_fd(fd, size).map_err(|source| ObjectIoError {
             operation: ObjectIoOperation::Map { size },
@@ -93,6 +95,24 @@ impl MmapFile {
         // SAFETY: the mapping is readable for `size` bytes and lives as long as self.
         unsafe { core::slice::from_raw_parts(self.ptr.cast::<u8>(), self.size) }
     }
+}
+
+/// Reads the start of `file` into `buf`, as much of it as the file holds, and returns how many
+/// bytes that was. A read of a scheme can return `EINTR` without a signal handler having run
+/// (the kernel cancels a call whose context was woken), and short reads are allowed, so it
+/// keeps reading until `buf` is full or the file ends, the way `read_to_end` does.
+fn read_start(file: &File, buf: &mut [u8]) -> core::result::Result<usize, Errno> {
+    let mut read = 0;
+    while read < buf.len() {
+        // `read` is at most `PROBE_LEN`, so it fits in `off_t`.
+        match Sys::pread(file.fd, &mut buf[read..], read as off_t) {
+            Ok(0) => break,
+            Ok(count) => read += count,
+            Err(Errno(EINTR)) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(read)
 }
 
 impl Drop for MmapFile {
