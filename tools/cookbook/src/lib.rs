@@ -117,6 +117,13 @@ pub enum Error {
     MissingHostTools(cook::host_tools::MissingHostTools),
     /// Ferric Oxide: a build tool could not be run in the guest build environment.
     GuestRun(Box<redoxer::guest::GuestError>),
+    /// Ferric Oxide: the Cargo inputs of a path source could not be found.
+    CargoInputs {
+        /// The path source.
+        path: PathBuf,
+        /// The underlying error.
+        source: Box<cook::cargo_inputs::CargoInputsError>,
+    },
 }
 
 /// Why a recipe or one of its packages could not be found or read.
@@ -225,6 +232,19 @@ impl Display for Error {
             Error::FoxArchive(error) => write!(f, "Package archive error: {error}"),
             Error::FoxStore(error) => write!(f, "Cannot install package: {error}"),
             Error::MissingHostTools(error) => write!(f, "{error}"),
+            Error::CargoInputs { path, source } => {
+                write!(
+                    f,
+                    "Cannot find the Cargo inputs of {}: {source}",
+                    path.display()
+                )?;
+                let mut cause = std::error::Error::source(source.as_ref());
+                while let Some(error) = cause {
+                    write!(f, ": {error}")?;
+                    cause = error.source();
+                }
+                Ok(())
+            }
             Error::GuestRun(error) => {
                 write!(f, "Cannot run the build tool in the guest: {error}")?;
                 let mut source = std::error::Error::source(error.as_ref());

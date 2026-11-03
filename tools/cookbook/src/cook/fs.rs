@@ -251,6 +251,26 @@ pub fn modified_dir(dir: &Path) -> Result<SystemTime> {
     modified_dir_inner(dir, |_| true)
 }
 
+/// Returns the newest modification time under a path-source directory,
+/// skipping the build caches and `.git` directories a snapshot skips.
+///
+/// # Errors
+/// Returns an I/O error if an entry or its metadata cannot be read.
+pub fn modified_path_source(dir: &Path) -> Result<SystemTime> {
+    modified_dir_inner(dir, path_source_filter(dir))
+}
+
+/// A [`WalkDir`] entry filter for the path source `dir`, following
+/// [`path_source_entry`].
+pub(crate) fn path_source_filter(dir: &Path) -> impl FnMut(&DirEntry) -> bool + '_ {
+    move |entry| {
+        entry
+            .path()
+            .strip_prefix(dir)
+            .map_or(true, |relative| path_source_entry(dir, relative))
+    }
+}
+
 pub fn modified_dir_ignore_git(dir: &Path) -> Result<SystemTime> {
     modified_dir_inner(dir, |entry| {
         entry

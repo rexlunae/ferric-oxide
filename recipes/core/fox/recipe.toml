@@ -3,8 +3,9 @@
 # "fox" (the default with ferric.toml). docs/src/ferric-packaging.md
 # describes it.
 #
-# The path source makes the cookbook rebuild fox when tools/fox changes;
-# changes only under crates/fox-* need `make cr.fox`.
+# The path source makes the cookbook rebuild fox when tools/fox, the
+# crates/fox-* it uses by path, or the host workspace's Cargo.toml or
+# Cargo.lock change.
 [source]
 path = "tools/fox"
 

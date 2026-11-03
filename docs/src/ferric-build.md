@@ -54,9 +54,13 @@ The cookbook always builds recipes whose
 source is in this repository (a `path` source, or `same_as` one: the kernel,
 UEFI bootloader, relibc, base services/drivers, RedoxFS, fox and the test
 recipes) from source, even with `build.repo_binary = true` and in every image
-configuration, because a package server cannot have this checkout's build. The selected package manager is added by the
-catalog. Existing configurations are preserved, so their image choice and
-package policy still apply. The first build downloads Rust components, target
+configuration, because a package server cannot have this checkout's build.
+Such a recipe is rebuilt when its source changes, and also when a crate its
+Cargo packages use by `path` (for example `crates/fox-core` for fox and the
+installer) or the workspace's `Cargo.toml` or `Cargo.lock` changes; see
+`make rebuild` in the [build-system reference](./build-system-reference.md).
+The selected package manager is added by the catalog. Existing configurations
+are preserved, so their image choice and package policy still apply. The first build downloads Rust components, target
 runtime data, Cargo dependencies and application packages.
 
 The native toolchain (`build.toolchain = "llvm"`, `mk/llvm.mk`) uses host Clang
