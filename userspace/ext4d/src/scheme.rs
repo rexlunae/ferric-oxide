@@ -5,8 +5,9 @@
 //! `fs.ext4_write`), `futimens`, `fchmod` and `fchown` change the inode through the journal
 //! ([`Fs::set_times`], [`Fs::set_mode`], [`Fs::set_owner`]), and a file opened for writing
 //! is written ([`Fs::write_with_flags`], allocating the blocks it does not have yet).
-//! An `O_APPEND` write goes to the end of the file, and the kernel moves the description's
-//! cursor to the size `fsize` reports afterwards (issue #244). `O_CREAT` creates a
+//! An `O_APPEND` write goes to the end of the file; opens say so
+//! ([`ferric_abi::new_fd::APPENDS`]), and the kernel moves the description's cursor to the
+//! size `fsize` reports afterwards (issue #244). `O_CREAT` creates a
 //! regular file, `O_TRUNC` and `ftruncate` resize one ([`Fs::truncate`]). Everything else
 //! that would change the volume (`unlinkat`, `frename`, `flink`, creating directories and
 //! links, and all of the above on a read-only mount) fails with `EROFS` or `EOPNOTSUPP`, as
@@ -15,6 +16,7 @@
 //! every change enforce the caller's UID/GID.
 
 use ferric_abi::id::requested;
+use ferric_abi::new_fd::APPENDS;
 use redox_scheme::scheme::{SchemeState, SchemeSync, register_sync_scheme};
 use redox_scheme::{CallerCtx, OpenResult, RequestKind, Response, SignalBehavior, Socket};
 use syscall::data::{Stat, StatVfs, TimeSpec};
@@ -155,9 +157,11 @@ impl SchemeSync for Ext4Scheme {
                 ctx.gid,
             )
             .map_err(|e| errno(&e))?;
+        // `O_APPEND` writes go to the end, so the kernel may move the cursor to `fsize` after
+        // them (#244).
         Ok(OpenResult::ThisScheme {
             number,
-            flags: NewFdFlags::POSITIONED,
+            flags: NewFdFlags::POSITIONED | NewFdFlags::from_bits_retain(APPENDS),
         })
     }
 

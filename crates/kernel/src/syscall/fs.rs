@@ -858,9 +858,10 @@ pub fn sys_write(fd: FileHandle, buf: UserSliceRo, token: &mut CleanLockToken) -
 }
 /// [`sys_write`] on a description.
 ///
-/// A positioned description's cursor advances by the bytes written, except after an
-/// `O_APPEND` write, which the scheme puts at the end of the file: the cursor then moves to
-/// the size the scheme reports after the write ([`CursorUpdate`]). If the scheme cannot
+/// A positioned description's cursor advances by the bytes written, except after a
+/// non-empty `O_APPEND` write on a scheme that appends (it set
+/// [`ferric_abi::new_fd::APPENDS`] at open), which puts the bytes at the end of the file:
+/// the cursor then moves to the size the scheme reports after the write ([`CursorUpdate`]). If the scheme cannot
 /// report a size, the write has still happened and its count is returned, and the cursor
 /// advances by that count.
 pub fn write_description(
@@ -870,14 +871,16 @@ pub fn write_description(
 ) -> Result<usize> {
     let result = description_op(Arc::clone(&description), token, |scheme, _, desc, token| {
         let positioned = desc.internal_flags.contains(InternalFlags::POSITIONED);
-        let update = CursorUpdate::for_write(positioned, desc.flags);
+        let appends = desc.internal_flags.contains(InternalFlags::APPENDS);
+        let update = CursorUpdate::for_write(positioned, appends, desc.flags);
         let offset = if positioned { desc.offset } else { u64::MAX };
         let written = scheme.kwriteoff(desc.number, buf, offset, desc.flags, desc.flags, token)?;
         // An append went to the end of the file, not to `offset`; the reply does not say
         // where that was, so the cursor follows the size the scheme reports now.
-        let end = match update {
-            CursorUpdate::ToEnd => scheme.fsize(desc.number, token).ok(),
-            CursorUpdate::Advance | CursorUpdate::Unpositioned => None,
+        let end = if update.needs_end(written) {
+            scheme.fsize(desc.number, token).ok()
+        } else {
+            None
         };
         Ok((written, update, end))
     });

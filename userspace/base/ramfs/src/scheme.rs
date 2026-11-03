@@ -4,6 +4,7 @@ use std::str;
 
 use event::{EventFlags, RawEventQueue};
 use ferric_abi::id::Caller;
+use ferric_abi::new_fd::APPENDS;
 use indexmap::IndexMap;
 use libredox::protocol::FsCall;
 use libredox::{flag, Fd};
@@ -525,9 +526,11 @@ impl SchemeSync for Scheme<'_> {
                 .0
         };
         let new_id = self.handles.insert(Handle::Inode(inode));
+        // Ferric Oxide: `O_APPEND` writes go to the end, so the kernel may move the cursor to
+        // `fsize` after them (#244).
         Ok(OpenResult::ThisScheme {
             number: new_id,
-            flags: NewFdFlags::POSITIONED,
+            flags: NewFdFlags::POSITIONED | NewFdFlags::from_bits_retain(APPENDS),
         })
     }
 

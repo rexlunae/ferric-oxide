@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloc::borrow::Cow;
+use ferric_abi::new_fd::APPENDS;
 use libredox::Fd;
 use redox_path::RedoxReference;
 use redox_path::RedoxScheme;
@@ -494,9 +495,11 @@ impl<'sock, D: Disk> FileScheme<'sock, D> {
             }
         }
 
+        // Ferric Oxide: `O_APPEND` writes go to the end (`FileResource::write`), so the kernel
+        // may move the cursor to `fsize` after them (#244).
         Ok(OpenResult::ThisScheme {
             number: id,
-            flags: NewFdFlags::POSITIONED,
+            flags: NewFdFlags::POSITIONED | NewFdFlags::from_bits_retain(APPENDS),
         })
     }
 

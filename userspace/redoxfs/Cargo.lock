@@ -185,6 +185,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferric-abi"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-pcache"
 version = "0.1.0"
 dependencies = [
@@ -494,6 +498,7 @@ dependencies = [
  "bitflags",
  "endian-num",
  "env_logger",
+ "ferric-abi",
  "ferric-pcache",
  "fuser",
  "getrandom",

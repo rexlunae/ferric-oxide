@@ -10,6 +10,7 @@ use crate::{
     syscall::error::Result,
 };
 use alloc::sync::{Arc, Weak};
+use ferric_abi::new_fd::APPENDS;
 use syscall::{schemev2::NewFdFlags, Error, GlobalSchemes, RwFlags, ENODEV, O_APPEND, O_NONBLOCK};
 
 pub type LockedFileDescription = RwLock<L6, FileDescription>;
@@ -74,6 +75,9 @@ bitflags::bitflags! {
     pub struct InternalFlags: u32 {
         const POSITIONED = 1 << 0;
         const NOTIFY_ON_NEXT_DETACH = 1 << 1;
+        /// The scheme writes `O_APPEND` writes at the end of the file and reports that end
+        /// through `fsize` ([`ferric_abi::new_fd::APPENDS`]).
+        const APPENDS = 1 << 2;
     }
 }
 impl FileDescription {
@@ -89,19 +93,18 @@ impl FileDescription {
     }
 }
 impl InternalFlags {
+    /// The flags of a new description from the flags byte of a scheme's open reply:
+    /// `NewFdFlags` and Ferric's [`ferric_abi::new_fd`] extension. `None` if any other bit
+    /// is set.
     pub fn from_extra0(fl: u8) -> Option<Self> {
-        Some(
-            NewFdFlags::from_bits(fl)?
-                .iter()
-                .map(|fd| {
-                    if fd == NewFdFlags::POSITIONED {
-                        Self::POSITIONED
-                    } else {
-                        Self::empty()
-                    }
-                })
-                .collect(),
-        )
+        let positioned = NewFdFlags::POSITIONED.bits();
+        if fl & !(positioned | APPENDS) != 0 {
+            return None;
+        }
+        let mut flags = Self::empty();
+        flags.set(Self::POSITIONED, fl & positioned != 0);
+        flags.set(Self::APPENDS, fl & APPENDS != 0);
+        Some(flags)
     }
 }
 
