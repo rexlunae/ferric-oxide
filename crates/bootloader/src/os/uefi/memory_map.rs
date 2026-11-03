@@ -2,6 +2,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::{mem, ptr};
 use uefi::memory::{MemoryDescriptor, MemoryType};
+use uefi::status::Status;
 
 use crate::area_add;
 #[cfg(target_arch = "aarch64")]
@@ -20,46 +21,64 @@ pub struct MemoryMapIter {
     i: usize,
 }
 
+/// Size of the buffer `GetMemoryMap` writes into. It is allocated once, so a
+/// map can be fetched again after a failed `ExitBootServices` without
+/// allocating.
+const MAP_BUFFER_SIZE: usize = 65536;
+
+/// How often `ExitBootServices` is retried after the firmware reports a stale
+/// map key. A retry is only needed when a firmware event changed the map
+/// between `GetMemoryMap` and `ExitBootServices`, so a few attempts suffice.
+const EXIT_BOOT_SERVICES_ATTEMPTS: usize = 8;
+
 impl MemoryMapIter {
     pub fn new() -> Self {
-        let uefi = std::system_table();
-
-        let mut map = vec![0; 65536];
-        let mut map_size = map.len();
-        let mut map_key = 0;
-        let mut descriptor_size = 0;
-        let mut descriptor_version = 0;
-        status_to_result((uefi.BootServices.GetMemoryMap)(
-            &mut map_size,
-            map.as_mut_ptr() as *mut MemoryDescriptor,
-            &mut map_key,
-            &mut descriptor_size,
-            &mut descriptor_version,
-        ))
-        .expect("Failed to get UEFI memory map");
-
-        // Ensure descriptor size is usable
-        assert!(descriptor_size >= mem::size_of::<MemoryDescriptor>());
-
-        // Ensure descriptor version is supported
-        assert_eq!(descriptor_version, 1);
-
-        // Reduce map size to returned value
-        map.truncate(map_size);
-
-        Self {
-            map,
-            map_key,
-            descriptor_size,
-            descriptor_version,
+        let mut iter = Self {
+            map: vec![0; MAP_BUFFER_SIZE],
+            map_key: 0,
+            descriptor_size: 0,
+            descriptor_version: 0,
             i: 0,
-        }
+        };
+        iter.refresh().expect("Failed to get UEFI memory map");
+        iter
     }
 
-    pub fn exit_boot_services(mut self) {
-        let handle = std::handle();
+    /// Fetch the current map into the existing buffer without allocating,
+    /// which is the only boot service the UEFI specification (2.10, section
+    /// 7.4, `EFI_BOOT_SERVICES.ExitBootServices()`) allows after a failed
+    /// `ExitBootServices` call.
+    fn refresh(&mut self) -> uefi::status::Result<()> {
         let uefi = std::system_table();
 
+        // The buffer was truncated to the previous map's size; restore its
+        // full length. It never shrank its allocation, so this does not
+        // allocate.
+        self.map.resize(MAP_BUFFER_SIZE, 0);
+        let mut map_size = self.map.len();
+        status_to_result((uefi.BootServices.GetMemoryMap)(
+            &mut map_size,
+            self.map.as_mut_ptr() as *mut MemoryDescriptor,
+            &mut self.map_key,
+            &mut self.descriptor_size,
+            &mut self.descriptor_version,
+        ))?;
+
+        // Ensure descriptor size is usable
+        assert!(self.descriptor_size >= mem::size_of::<MemoryDescriptor>());
+
+        // Ensure descriptor version is supported
+        assert_eq!(self.descriptor_version, 1);
+
+        // Reduce map size to returned value
+        self.map.truncate(map_size);
+        self.i = 0;
+        Ok(())
+    }
+
+    /// Point every descriptor's virtual address at its physical address for
+    /// `SetVirtualAddressMap`.
+    fn identity_map_descriptors(&mut self) {
         // We are writing to the memory map that will be passed to
         // SetVirtualAddressMap before ExitBootServices as on some firmware
         // EfiLoaderData memory regions like this one are marked as read-only
@@ -79,9 +98,39 @@ impl MemoryMapIter {
 
             descriptor.VirtualStart.0 = descriptor.PhysicalStart.0;
         }
+    }
 
-        status_to_result((uefi.BootServices.ExitBootServices)(handle, self.map_key))
-            .expect("Failed to exit UEFI boot services");
+    pub fn exit_boot_services(mut self) {
+        let handle = std::handle();
+        let uefi = std::system_table();
+
+        // A firmware event (a timer callback, for example) can allocate or
+        // free memory after GetMemoryMap, which makes the map key stale and
+        // ExitBootServices fail with EFI_INVALID_PARAMETER. The specification
+        // requires the loader to fetch the map again and retry; it must not
+        // call any other boot service, so nothing here may allocate or print.
+        let mut attempt = 1;
+        loop {
+            self.identity_map_descriptors();
+            match (uefi.BootServices.ExitBootServices)(handle, self.map_key) {
+                status if status.is_success() => break,
+                Status::INVALID_PARAMETER if attempt < EXIT_BOOT_SERVICES_ATTEMPTS => {
+                    attempt += 1;
+                    self.refresh()
+                        .expect("Failed to get UEFI memory map after a stale map key");
+                }
+                status => {
+                    status_to_result(status).expect("Failed to exit UEFI boot services");
+                }
+            }
+        }
+
+        // Hand the kernel the map the firmware accepted, so memory a firmware
+        // event took before a retry is never reported as free. `area_add`
+        // writes a static table and calls no boot service.
+        for entry in self.by_ref() {
+            area_add(entry);
+        }
 
         // Runtime services must be called with interrupts disabled
         super::arch::disable_interrupts();
@@ -215,16 +264,8 @@ impl Iterator for MemoryMapIter {
     }
 }
 
-pub unsafe fn memory_map() -> MemoryMapIter {
-    let mut iter = MemoryMapIter::new();
-
-    // Using next to avoid consuming iterator
-    while let Some(entry) = iter.next() {
-        area_add(entry);
-    }
-
-    // Rewind iterator
-    iter.i = 0;
-
-    iter
+/// Read the UEFI memory map. Its entries reach the kernel's memory areas when
+/// [`MemoryMapIter::exit_boot_services`] succeeds.
+pub fn memory_map() -> MemoryMapIter {
+    MemoryMapIter::new()
 }
