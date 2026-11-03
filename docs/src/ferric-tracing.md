@@ -831,6 +831,15 @@ open. A `cpu/<n>` read follows these rules:
   `abi::READ_MIN` bytes always hold one.
 - It fails with `EAGAIN` while another reader is reading the same CPU.
 
+A reader that drains a ring must stop once a read leaves room for another record
+(`abi::read_caught_up`), not when a read returns 0 bytes. While `syscall` events
+are on, each `read` adds its own `syscall.enter` and `syscall.exit` records (88
+bytes) to the ring of the CPU it runs on, so that ring never empties. Before
+this rule, `ferric-iommu-test` drained until 0 bytes. A trace-mode smoke boot with
+`FERRIC_TRACE=syscall,sched,scheme,irq,mm` then stalled in that test: it read
+cpu 2 about two million times a second, and the host capture grew by about
+200 MB/s. `ferric-trace-test` and `ferric-trace-bench` drain with the same rule.
+
 A write naming no known event gives `ENOENT`. A write naming only events that
 are not compiled in gives `EOPNOTSUPP`.
 
