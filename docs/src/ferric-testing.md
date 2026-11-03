@@ -289,7 +289,7 @@ regressions. Record image/configuration details and every skipped check.
 | `scripts/ferric-ci/check-kernel-relocs.sh` | Builds and compares relocation replay against a kernel linked at the shifted address |
 | `scripts/ferric-ci/check-kernel-ibt.sh <kernel.all>` | Checks `endbr64` at linked interrupt declarations and selected entry points in an IBT-built kernel; direct-call helpers are excluded |
 | `scripts/ferric-ci/check-kernel-shstk.sh <kernel.all>` | Checks shadow-stack enable, context-switch and syscall alternatives, WRSS, and the #CP handler with IBT on/off |
-| `scripts/ferric-ci/check-trace-overhead.sh --out LOG... --in LOG...` | Compares `ferric-trace-bench` results from paired boots without and with `kernel.trace` (the Nth of each list is a pair) against the tracing overhead budget, on the median of the pairs' differences and its one-sided 95% sign-test bounds (`sign-test.awk`; `TRACE_OVERHEAD_LOOKS` lists the pair counts a job judges at, so the looks together keep 95%); exits 0 (pass), 1 (fail: the lower bound is over the budget), 2 (usage) or 3 (inconclusive: runner noise exceeds the budget) |
+| `scripts/ferric-ci/check-trace-overhead.sh --out LOG... --in LOG...` | Compares `ferric-trace-bench` results from paired boots without and with `kernel.trace` (the Nth of each list is a pair) against the tracing overhead budget, on the median of the pairs' differences and its one-sided 97.5% sign-test bounds (`sign-test.awk`; the job's 5% false-failure chance is split between its two comparisons, and `TRACE_OVERHEAD_LOOKS` lists the pair counts a job judges at, so the looks together keep that level); exits 0 (pass), 1 (fail: the lower bound is over the budget), 2 (usage) or 3 (inconclusive: runner noise exceeds the budget) |
 | `scripts/ferric-ci/print-test-fails.sh LOG TITLE` | Prints each `FERRIC_TEST_FAIL` line of a console log with the 40 lines before it, in a log group, for steps that keep only a boot's last lines |
 
 The kernel workflow installs its declared nightly toolchain, `rust-src`,
@@ -498,9 +498,10 @@ compiled-out boot against its compiled-in-but-off boot, and each traced boot's
 `on` rounds against its own interleaved `pairoff` rounds, with the budget on
 the median of those differences, so runner load that drifts during the job
 cancels within each pair and a stall in one boot is outvoted (issue #280). It
-fails only when the sign test's one-sided 95% lower bound on that median is
-over the budget too, with the level adjusted so that the job's repeated looks
-together keep 95%. A median over the budget whose lower bound is not is inconclusive
+fails only when the sign test's one-sided lower bound on that median is over
+the budget too, at a level split between the two comparisons and adjusted so
+that over both of them and the job's repeated looks it falsely fails at most
+5% of the time. A median over the budget whose lower bound is not is inconclusive
 (issue #340): the job boots five more pairs and judges again, up to 30 pairs,
 and then passes with a warning that runner noise exceeded the budget. The
 notice lists the bounds and every pair's difference, so a result shows whether
