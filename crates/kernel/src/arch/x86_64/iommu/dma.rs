@@ -27,13 +27,18 @@
 //! ([`DmaSpace::release`], called from the address-space code) or when the domain closes. On
 //! close the devices are blocked first, which already invalidates everything the domain
 //! translated, so the tables are freed whole before the frames are unpinned. Whenever the
-//! hardware does not confirm an invalidation, the frames stay pinned for good.
+//! hardware does not confirm an invalidation, the frames stay pinned until a close that blocks
+//! the devices, or for good when the close cannot block them.
 //!
 //! An installation that fails without confirming its invalidation is the same case, one step
 //! earlier: the driver gets no IOVA and no mapping record names the entries, but a device may
-//! still reach them ([`DmaSpace::translate`]). Those blocks and pins are kept in the domain too,
-//! by IOVA, and released exactly once when the domain's close blocks every device; a close that
-//! could not block them keeps them pinned for good, like the mappings above.
+//! still reach them ([`DmaSpace::translate`]). Those blocks and pins, and those of a mapping
+//! whose strict unmap failed, are kept in the domain ([`Retained`]) and released exactly once
+//! when the domain's close blocks every device; a close that could not block them keeps them
+//! pinned for good, like the mappings above. [`Retained::install`] settles the ownership of
+//! every installation from its outcome, and the physical range is reserved
+//! ([`DmaMappings::vacant`]) before anything is pinned, so no failure path drops pins that no
+//! record owns.
 //!
 //! The bookkeeping (which frames have which IOVA, and who still reaches them) is the
 //! host-tested `ferric_iommu::dma` module.
@@ -63,7 +68,7 @@ use ferric_iommu::dma::{
     grant::{map_runs, record_installation, MapAttempt, MapRunsError, MapStep},
     UnmapFailure, UnmapState,
 };
-use ferric_iommu::dma::{DmaMappings, Mapping, Overlap, Retained, Span, Teardown};
+use ferric_iommu::dma::{DmaMappings, InstallError, Mapping, Overlap, Retained, Span, Teardown};
 use ferric_vtd::{iova::IovaRange, table::Access};
 
 use super::domain::{Domain, DomainError};
@@ -321,9 +326,9 @@ fn runs(frames: &[Frame]) -> Vec<(u64, u64)> {
 pub struct DmaSpace {
     domain: Domain,
     mappings: DmaMappings<Held>,
-    /// Translations whose installation failed without confirming an invalidation, by IOVA: a
-    /// device may still reach them, so their blocks and pins stay owned until the domain closes
-    /// with its devices blocked (#73).
+    /// Translations whose installation or teardown failed without confirming an
+    /// invalidation: a device may still reach them, so their blocks and pins stay owned until
+    /// the domain closes with its devices blocked (#73).
     uncertain: Retained<(IovaRange, Pins)>,
     /// Grant mappings by IOVA.
     #[cfg(feature = "regbuf")]
@@ -376,7 +381,8 @@ impl DmaSpace {
     /// [`DmaError::NotMapped`] when the page is not present, [`DmaError::PinOverflow`] and
     /// [`DmaError::FreeFrame`] when a frame cannot be pinned, and [`DmaError::Domain`] when
     /// the IOVA space is full or the tables cannot be changed. Nothing stays pinned or mapped
-    /// on error.
+    /// on error, except after an installation whose invalidation did not complete: its block
+    /// and pins stay owned by the domain until its close blocks the devices.
     pub fn translate(&mut self, space: &AddrSpace, virt: VirtualAddress) -> Result<u64, DmaError> {
         let mut target = target(space, virt)?;
         if self.mappings.get(target.phys).is_some() {
@@ -399,6 +405,12 @@ impl DmaSpace {
     /// Pins and maps `target.range` at a fresh IOVA block.
     fn map(&mut self, target: &Target) -> Result<(), DmaError> {
         let Span { start: phys, len } = target.range;
+        // Reserve the range first: an overlap found after pinning and mapping would leave
+        // resources no record owns.
+        let slot = self
+            .mappings
+            .vacant(target.range)
+            .map_err(DmaError::Overlap)?;
         let pins = Pins::take(phys, len)?;
         let block = match self.domain.alloc_iova(len) {
             Ok(block) => block,
@@ -407,43 +419,40 @@ impl DmaSpace {
                 return Err(err.into());
             }
         };
-        if let Err(err) = self
-            .domain
-            .map(block.start, phys, len, access(target.writable))
-        {
-            // A table error leaves nothing mapped (`map` undoes its part, with the
-            // invalidation that needs). A failed invalidation may leave entries a unit uses,
-            // so then the block and the frames stay owned: the driver gets no IOVA, no mapping
-            // record names them, and only the domain's close can tell that blocking its
-            // devices made them unreachable (#73).
-            if matches!(err, DomainError::Map(_)) {
+        let domain = &mut self.domain;
+        let installed = self.uncertain.install(
+            (block, pins),
+            |(block, _)| domain.map(block.start, phys, len, access(target.writable)),
+            // A table error leaves nothing mapped: `Domain::map` undoes its part, with the
+            // invalidation that needs. A failed invalidation may leave entries a unit uses.
+            |err| matches!(err, DomainError::Map(_)),
+        );
+        match installed {
+            Ok((block, pins)) => {
+                slot.insert(
+                    block.start,
+                    target.writable,
+                    target.user,
+                    Held { block, pins },
+                );
+                Ok(())
+            }
+            Err(InstallError::Clean {
+                error,
+                value: (block, pins),
+            }) => {
                 self.give_back(block, pins);
-            } else {
+                Err(error.into())
+            }
+            Err(InstallError::Retained(error)) => {
                 warn!(
-                    "IOMMU: domain {}: mapping IOVA {:#x}+{len:#x} failed with {err} and its invalidation did not complete; the block and its frames stay owned until the domain closes",
+                    "IOMMU: domain {}: mapping IOVA {:#x}+{len:#x} failed with {error} and its invalidation did not complete; the block and its frames stay owned until the domain closes",
                     self.domain.id(),
                     block.start
                 );
-                self.uncertain.insert((block, pins));
+                Err(error.into())
             }
-            return Err(err.into());
         }
-        let mapping = Mapping::new(
-            phys,
-            len,
-            block.start,
-            target.writable,
-            target.user,
-            Held { block, pins },
-        );
-        self.mappings.insert(mapping).map_err(|err| {
-            // `translate` checked for overlaps, so this is not reached. Take the entries down
-            // again; the frames stay pinned, since nothing records them any more.
-            if let Err(unmap) = self.domain.unmap(block.start, len) {
-                error!("IOMMU: cannot unmap IOVA {:#x}: {unmap}", block.start);
-            }
-            DmaError::Overlap(err)
-        })
     }
 
     /// Makes the mapping that holds `phys` writable for the device when `writable` asks for
@@ -536,17 +545,20 @@ impl DmaSpace {
     }
 
     /// Unmaps one mapping strictly, then frees its IOVA block and unpins its frames. If the
-    /// IOTLB invalidation fails, the frames stay pinned and the block allocated, since the
-    /// device may still reach them.
+    /// unmap or its IOTLB invalidation fails, the device may still reach them: the block and
+    /// the pins stay owned with the failed installations, until the domain's close blocks its
+    /// devices.
     fn tear_down(&mut self, mapping: Mapping<Held>) {
         let (iova, len) = (mapping.iova(), mapping.phys().len);
+        let Held { block, pins } = mapping.data;
         match self.domain.unmap(iova, len) {
-            Ok(()) => self.give_back(mapping.data.block, mapping.data.pins),
+            Ok(()) => self.give_back(block, pins),
             Err(err) => {
                 error!(
-                    "IOMMU: cannot unmap IOVA {iova:#x}+{len:#x} from domain {}: {err}; its frames stay pinned",
+                    "IOMMU: cannot unmap IOVA {iova:#x}+{len:#x} from domain {}: {err}; its block and frames stay owned until the domain closes",
                     self.domain.id()
                 );
+                self.uncertain.insert((block, pins));
             }
         }
     }
