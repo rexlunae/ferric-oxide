@@ -1,0 +1,12 @@
+# Ferric Oxide: checks that an O_APPEND write leaves the cursor at the end of the file on
+# RedoxFS (/tmp) and ramfs (/scheme/logging) (#244). Only for test images.
+[source]
+path = "recipes/tests/ferric-append-test/files"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-L ${COOKBOOK_SYSROOT}/lib"
+cookbook_cargo
+"""

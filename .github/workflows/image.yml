@@ -483,6 +483,12 @@ jobs:
           for step in refused allowed; do
             grep -aF "FERRIC_TEST_PASS owner-$step" "$LOG"
           done
+      # An O_APPEND write leaves the cursor at the new end of the file (#244).
+      - name: Check O_APPEND cursors
+        run: |
+          for fs in redoxfs ramfs; do
+            grep -aF "FERRIC_TEST_PASS append-$fs" "$LOG"
+          done
 
       # A process opens a scheme it created on the same thread and serves from another: the
       # kernel must block the caller rather than direct-switch it to itself.

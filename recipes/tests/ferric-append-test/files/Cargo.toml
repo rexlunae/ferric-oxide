@@ -1,0 +1,12 @@
+[package]
+name = "ferric-append-test"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "O_APPEND cursor test for Ferric Oxide"
+
+# Builds on its own, outside any workspace above it.
+[workspace]
+
+[profile.release]
+debug = false

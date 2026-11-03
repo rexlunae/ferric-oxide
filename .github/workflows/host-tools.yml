@@ -43,6 +43,7 @@ on:
       - "recipes/tests/ferric-aslr-test/**"
       - "recipes/tests/ferric-ioport-test/**"
       - "recipes/tests/ferric-owner-test/**"
+      - "recipes/tests/ferric-append-test/**"
       - "userspace/base/ramfs/**"
       - "userspace/base/scheme-utils/**"
       - "userspace/base/ipcd/**"
@@ -133,6 +134,12 @@ jobs:
       - name: ramfs ownership test checks
         run: |
           manifest=recipes/tests/ferric-owner-test/files/Cargo.toml
+          cargo fmt --check --manifest-path "$manifest"
+          cargo clippy --locked --manifest-path "$manifest" --all-targets --target x86_64-unknown-redox -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --manifest-path "$manifest" --target x86_64-unknown-redox
+      - name: O_APPEND cursor test checks
+        run: |
+          manifest=recipes/tests/ferric-append-test/files/Cargo.toml
           cargo fmt --check --manifest-path "$manifest"
           cargo clippy --locked --manifest-path "$manifest" --all-targets --target x86_64-unknown-redox -- -D warnings
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --manifest-path "$manifest" --target x86_64-unknown-redox
