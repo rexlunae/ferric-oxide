@@ -1,11 +1,13 @@
 //! The steps, on Redox.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::unix::fs::FileExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt, chown, fchown};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, Stdio};
+use std::ptr;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -34,6 +36,11 @@ const JOURNAL_ROOT: &str = "/scheme/ferric-ext4-journal";
 const WRITE_IMAGE_PATH: &str = "/tmp/ferric-ext4-write.ext4";
 const WRITE_SCHEME: &str = "ferric-ext4-write";
 const WRITE_ROOT: &str = "/scheme/ferric-ext4-write";
+/// The unprivileged user (and group) the access and owner checks run as; nothing in the
+/// fixture belongs to it.
+const USER: u32 = 2000;
+/// The access and modification times the owner check's child sets on its own file.
+const OWN_TIMES: [(i64, i64); 2] = [(1_700_000_000, 0), (1_700_000_100, 0)];
 /// `s_feature_incompat` in the volume superblock, and its `INCOMPAT_RECOVER` bit.
 const INCOMPAT_AT: u64 = 1024 + 0x60;
 const INCOMPAT_RECOVER: u32 = 0x4;
@@ -57,6 +64,15 @@ enum Failure {
     },
     #[error("{what} succeeded on a read-only file system")]
     Changed { what: &'static str },
+    #[error("{what} succeeded for a user who may not do it")]
+    Allowed { what: &'static str },
+    #[error("{what} failed with {source}, not errno {want}")]
+    WrongErrno {
+        what: &'static str,
+        want: i32,
+        #[source]
+        source: io::Error,
+    },
     #[error("{what} failed with {source}, not EROFS")]
     NotErofs {
         what: &'static str,
@@ -250,8 +266,8 @@ fn access() -> Result<(), Failure> {
         "run unprivileged access checks",
         Command::new("/usr/bin/ferric-ext4-test")
             .arg("--access-check")
-            .uid(2000)
-            .gid(2000)
+            .uid(USER)
+            .gid(USER)
             .status(),
     )?;
     same("unprivileged access checks", status.success(), true)
@@ -402,9 +418,130 @@ fn writable() -> Result<(), Failure> {
             "created contents",
             io("read created file", fs::read(&created))?,
             b"created\n".to_vec(),
-        )
+        )?;
+        owner()
     });
     super::image::finish(Path::new(WRITE_IMAGE_PATH), result)
+}
+
+fn write_at(path: &str) -> String {
+    format!("{WRITE_ROOT}/{path}")
+}
+
+/// `result` must have failed with `want`.
+fn refused<T>(what: &'static str, want: i32, result: io::Result<T>) -> Result<(), Failure> {
+    match result {
+        Ok(_) => Err(Failure::Allowed { what }),
+        Err(err) if err.raw_os_error() == Some(want) => Ok(()),
+        Err(source) => Err(Failure::WrongErrno { what, want, source }),
+    }
+}
+
+/// `futimens` on `file` with the access and modification `times`, or with a null pointer
+/// (both the current time) for `None`. `std`'s `File::set_times` is unsupported on Redox.
+#[expect(unsafe_code, reason = "futimens has no safe wrapper on Redox")]
+fn futimens(file: &File, times: Option<[(i64, i64); 2]>) -> io::Result<()> {
+    let times =
+        times.map(|times| times.map(|(tv_sec, tv_nsec)| libc::timespec { tv_sec, tv_nsec }));
+    let times_ptr = times.as_ref().map_or(ptr::null(), |times| times.as_ptr());
+    // SAFETY: the descriptor is open for the call, and `times_ptr` is null or points at two
+    // `timespec`s in `times`, which outlives the call.
+    let status = unsafe { libc::futimens(file.as_raw_fd(), times_ptr) };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// What the owner check compares: a file's owner, group, permission bits and access and
+/// modification times.
+type Attributes = (u32, u32, u32, [(i64, i64); 2]);
+
+fn attributes(path: &str) -> Result<Attributes, Failure> {
+    let meta = io(format!("stat {path}"), fs::metadata(path))?;
+    Ok((
+        meta.uid(),
+        meta.gid(),
+        meta.mode() & 0o7777,
+        [
+            (meta.atime(), meta.atime_nsec()),
+            (meta.mtime(), meta.mtime_nsec()),
+        ],
+    ))
+}
+
+/// `fchmod` and `futimens` reach ext4d as a `StdFsCall`, whose caller context carries no
+/// IDs; ext4d must ask procmgr who the caller is (issue #399). An unprivileged child may
+/// change its own file, but not root's: hello.txt, given to root first, must come back
+/// unchanged.
+fn owner() -> Result<(), Failure> {
+    let hello = write_at("hello.txt");
+    io("give hello.txt to root", chown(&hello, Some(0), Some(0)))?;
+    io(
+        "chmod hello.txt",
+        fs::set_permissions(&hello, Permissions::from_mode(0o644)),
+    )?;
+    let own = write_at("own.txt");
+    io("create own.txt", fs::write(&own, b"own\n"))?;
+    io(
+        "give own.txt to the user",
+        chown(&own, Some(USER), Some(USER)),
+    )?;
+    io(
+        "chmod own.txt",
+        fs::set_permissions(&own, Permissions::from_mode(0o644)),
+    )?;
+    let before = attributes(&hello)?;
+    let status = io(
+        "run unprivileged owner checks",
+        Command::new("/usr/bin/ferric-ext4-test")
+            .arg("--owner-check")
+            .uid(USER)
+            .gid(USER)
+            .status(),
+    )?;
+    same("unprivileged owner checks", status.success(), true)?;
+    same("root's hello.txt afterwards", attributes(&hello)?, before)?;
+    same(
+        "the user's own.txt afterwards",
+        attributes(&own)?,
+        (USER, USER, 0o600, OWN_TIMES),
+    )
+}
+
+/// The owner check's child, run as [`USER`] against the writable mount.
+fn owner_child() -> Result<(), Failure> {
+    let theirs = io("open root's hello.txt", File::open(write_at("hello.txt")))?;
+    refused(
+        "fchmod on root's file",
+        libc::EPERM,
+        theirs.set_permissions(Permissions::from_mode(0o666)),
+    )?;
+    refused(
+        "futimens with explicit times on root's file",
+        libc::EPERM,
+        futimens(&theirs, Some(OWN_TIMES)),
+    )?;
+    refused(
+        "futimens to now on root's read-only file",
+        libc::EACCES,
+        futimens(&theirs, None),
+    )?;
+    refused(
+        "fchown of root's file to the user",
+        libc::EPERM,
+        fchown(&theirs, Some(USER), None),
+    )?;
+    let own = io("open own.txt", File::open(write_at("own.txt")))?;
+    io(
+        "fchmod on the user's own file",
+        own.set_permissions(Permissions::from_mode(0o600)),
+    )?;
+    io(
+        "futimens on the user's own file",
+        futimens(&own, Some(OWN_TIMES)),
+    )
 }
 
 fn unchanged_image() -> Result<(), Failure> {
@@ -464,6 +601,13 @@ fn report(step: &str, result: Result<(), Failure>) -> bool {
 pub fn main() -> ExitCode {
     if std::env::args().any(|arg| arg == "--access-check") {
         return if report("access", access_child()) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    if std::env::args().any(|arg| arg == "--owner-check") {
+        return if report("owner", owner_child()) {
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE

@@ -73,6 +73,7 @@ dependencies = [
  "ferric-abi",
  "ferric-fspath",
  "ferric-jbd2",
+ "ferric-proc-creds",
  "ferric-ready",
  "flate2",
  "libredox",
@@ -103,6 +104,16 @@ name = "ferric-jbd2"
 version = "0.1.0"
 dependencies = [
  "crc",
+ "thiserror",
+]
+
+[[package]]
+name = "ferric-proc-creds"
+version = "0.1.0"
+dependencies = [
+ "libredox",
+ "plain",
+ "redox_syscall",
  "thiserror",
 ]
 

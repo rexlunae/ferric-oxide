@@ -1525,6 +1525,14 @@ remains available to other mounts of the same daemon binary.
   own owner and group. The kernel checks first, before the scheme sees the
   call: a caller other than root may name only its own effective UID and GID,
   or `-1` in either position (`crates/kernel/src/scheme/chown.rs`).
+- **The caller's IDs:** `fchown` (the kernel's direct call) and `openat`
+  arrive with the caller's effective UID and GID. `fchmod` and `futimens`
+  arrive as a `StdFsCall`, whose caller IDs read as root, so the scheme asks
+  procmgr for the calling process's effective IDs through the
+  `proc-creds-capability` handle it opens at mount, before leaving its
+  namespace (`ferric-proc-creds`, `crates/proc-creds`; issue
+  [#399](https://github.com/rexlunae/ferric-oxide/issues/399)). `ftruncate` and
+  `write` use no IDs: opening the file for writing was checked.
 - **`write`** (`Fs::write`, `ext4d::write::write_data`) writes into the
   blocks a regular file already has, as ext4's default ordered mode does: the
   data is written home and flushed without going through the journal, then

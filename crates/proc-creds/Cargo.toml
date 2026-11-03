@@ -1,0 +1,21 @@
+[package]
+name = "ferric-proc-creds"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "The credentials procmgr reports for the process behind a scheme request, for schemes that check a StdFsCall's caller"
+publish = false
+
+# Versions are not inherited from a workspace: base's and ext4d's recipes build this crate
+# through a symlink outside the host workspace, where `workspace = true` cannot be resolved.
+[dependencies]
+# ProcMeta, the reply's layout, and the error type of the call that asks for it.
+libredox = { version = "0.1.25", default-features = false, features = ["std", "protocol"] }
+plain = "0.2.3"
+# The errno a scheme answers with.
+redox_syscall = { version = "0.9.4", default-features = false }
+thiserror = "2"
+
+[target.'cfg(target_os = "redox")'.dependencies]
+# The credentials request itself, and the capability handle it goes through.
+libredox = { version = "0.1.25", default-features = false, features = ["std", "protocol", "call"] }

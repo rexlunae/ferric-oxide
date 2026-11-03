@@ -13,8 +13,16 @@
 //! [`Error::ReadOnly`] and [`Error::CreateKind`] say. Errors become errnos only through
 //! [`Error::errno`]. Opens and
 //! every change enforce the caller's UID/GID.
+//!
+//! Where the caller's IDs come from depends on the call. The kernel forwards `openat` and
+//! `fchown` (`SYS_FCHOWN`) with the caller's effective IDs in the [`CallerCtx`]. `fchmod`
+//! and `futimens` arrive as a `StdFsCall`, whose `CallerCtx` carries only the pid (its uid
+//! and gid read as 0, root), so the scheme asks procmgr for that process's effective IDs
+//! through a [`Capability`] it opens before leaving its namespace. `ftruncate` and `write`
+//! use no IDs: the open for writing was checked.
 
 use ferric_abi::id::requested;
+use ferric_proc_creds::{Capability, EffectiveIds};
 use redox_scheme::scheme::{SchemeState, SchemeSync, register_sync_scheme};
 use redox_scheme::{CallerCtx, OpenResult, RequestKind, Response, SignalBehavior, Socket};
 use syscall::data::{Stat, StatVfs, TimeSpec};
@@ -42,6 +50,9 @@ pub enum ServeError {
         #[source]
         source: syscall::Error,
     },
+    /// Opening procmgr's credentials capability failed.
+    #[error("cannot open procmgr's credentials capability")]
+    Credentials(#[source] ferric_proc_creds::Error),
     /// Entering the null namespace after registering failed.
     #[error("cannot enter the null namespace")]
     Namespace(#[source] libredox::error::Error),
@@ -55,6 +66,8 @@ pub struct Ext4Scheme {
     fs: Fs,
     /// `/scheme/NAME`, which `fpath` puts before paths.
     mounted: String,
+    /// Where a `StdFsCall`'s caller IDs come from.
+    credentials: Capability,
 }
 
 /// A registered scheme and the socket its requests come in on.
@@ -73,14 +86,16 @@ impl Mount {
     ///
     /// # Errors
     ///
-    /// [`ServeError::Socket`], [`ServeError::Register`] (which includes failing to open the
-    /// root directory as the scheme's root) and [`ServeError::Namespace`] for the step that
-    /// failed.
+    /// [`ServeError::Credentials`], [`ServeError::Socket`], [`ServeError::Register`] (which
+    /// includes failing to open the root directory as the scheme's root) and
+    /// [`ServeError::Namespace`] for the step that failed.
     pub fn new(fs: Fs, name: &str) -> Result<Self, ServeError> {
+        let credentials = Capability::open().map_err(ServeError::Credentials)?;
         let socket = Socket::create().map_err(ServeError::Socket)?;
         let mut scheme = Ext4Scheme {
             fs,
             mounted: format!("/scheme/{name}"),
+            credentials,
         };
         register_sync_scheme(&socket, name, &mut scheme).map_err(|source| {
             ServeError::Register {
@@ -129,6 +144,14 @@ impl Mount {
                 return Ok(());
             }
         }
+    }
+}
+
+impl Ext4Scheme {
+    /// The effective IDs of the process behind a `StdFsCall`, from procmgr: the call's
+    /// `ctx` has only the pid.
+    fn std_fs_caller(&self, ctx: &CallerCtx) -> syscall::Result<EffectiveIds> {
+        Ok(self.credentials.effective_ids(ctx.pid)?)
     }
 }
 
@@ -206,12 +229,15 @@ impl SchemeSync for Ext4Scheme {
     }
 
     fn fchmod(&mut self, id: usize, mode: u16, ctx: &CallerCtx) -> syscall::Result<()> {
+        let caller = self.std_fs_caller(ctx)?;
         self.fs
-            .set_mode(id, mode, ctx.uid, ctx.gid)
+            .set_mode(id, mode, caller.uid, caller.gid)
             .map_err(|e| errno(&e))
     }
 
     fn fchown(&mut self, id: usize, uid: u32, gid: u32, ctx: &CallerCtx) -> syscall::Result<()> {
+        // relibc's fchown is SYS_FCHOWN, which the kernel forwards with the caller's IDs. A
+        // StdFsCall fchown would reach the default std_fs_call, which refuses it.
         let (uid, gid) = (requested(uid), requested(gid));
         self.fs
             .set_owner(id, uid, gid, ctx.uid, ctx.gid)
@@ -275,8 +301,9 @@ impl SchemeSync for Ext4Scheme {
         let (accessed, modified) = change(accessed)
             .and_then(|a| Ok((a, change(modified)?)))
             .map_err(|e| errno(&e))?;
+        let caller = self.std_fs_caller(ctx)?;
         self.fs
-            .set_times(id, accessed, modified, ctx.uid, ctx.gid)
+            .set_times(id, accessed, modified, caller.uid, caller.gid)
             .map_err(|e| errno(&e))
     }
 
