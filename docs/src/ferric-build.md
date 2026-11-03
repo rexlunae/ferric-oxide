@@ -626,14 +626,17 @@ Both mark every recipe for rebuild, and the relibc recipe's build stamp includes
 debug-info setting, so toggling `build.debug` rebuilds relibc too.
 
 Unless a recipe sets `COOKBOOK_NOSTRIP`, Cookbook strips each staged package after
-its build script with `${GNU_TARGET}-strip` (`BUILD_POSTSCRIPT` in
-`tools/cookbook/src/cook/script.rs`): `--strip-all` for files in `bin/` and
-`libexec/`, `--strip-debug` for files in `lib/`. It uses only options GNU strip and
-llvm-strip both accept, because the native toolchain's strip is llvm-strip. Only
-ELF files and regular `ar` archives are passed to strip; scripts, linker scripts,
-pkg-config files and other data in those directories are left alone. If strip
-fails on an object, Cookbook names the file and the recipe build fails. `host:`
-recipes on macOS produce Mach-O files and are not stripped.
+its build script (`BUILD_POSTSCRIPT` in `tools/cookbook/src/cook/script.rs`):
+`--strip-all` for files in `bin/` and `libexec/`, `--strip-debug` for files in
+`lib/`. Cross builds use `${GNU_TARGET}-strip`; `host:` builds use the strip
+Redoxer selected for the host (`strip`, `llvm-strip` with Clang, or
+`REDOXER_HOST_STRIP`). It uses only options GNU strip and llvm-strip both accept,
+because the native toolchain's strip is llvm-strip. Only ELF files and regular
+`ar` archives are passed to strip; scripts, linker scripts, pkg-config files and
+other data in those directories are left alone. If strip fails on an object, or
+a staged directory cannot be fully listed, Cookbook names the file or directory
+and the recipe build fails. `host:` recipes on macOS produce Mach-O files and are
+not stripped.
 
 ## Dependency sources
 

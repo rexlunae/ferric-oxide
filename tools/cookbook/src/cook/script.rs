@@ -120,6 +120,11 @@ function GNU_CONFIG_GET {
 );
 
 pub(crate) static BUILD_PRESCRIPT: &str = r#"
+# redoxer exports the strip it selected for host builds as STRIP (unprefixed
+# strip, llvm-strip with Clang, or REDOXER_HOST_STRIP). Recipe scripts may unset
+# STRIP (cookbook_meson does), so keep it for package stripping in BUILD_POSTSCRIPT.
+COOKBOOK_HOST_STRIP="${STRIP-}"
+
 # Add cookbook bins to path
 export PATH="${COOKBOOK_ROOT}/bin:${PATH}"
 
@@ -500,21 +505,52 @@ function cookbook_python {
 "#;
 
 pub(crate) static BUILD_POSTSCRIPT: &str = r#"
-# Runs "${GNU_TARGET}-strip" with the given options on every ELF file and static
-# archive under a directory. The options must be ones both GNU strip and
-# llvm-strip accept. Other files (scripts, linker scripts, pkg-config and data
-# files) are left alone, so they are not handed to strip at all. A strip failure
-# on an object is reported and fails the build once the whole directory has been
-# processed. host: recipes on macOS produce Mach-O files and have no
-# "${GNU_TARGET}-strip", so their packages are not stripped.
+# Runs strip with the given options on every ELF file and static archive under a
+# directory. Cross builds use "${GNU_TARGET}-strip"; host: builds use the strip
+# redoxer selected for the host (COOKBOOK_HOST_STRIP, see BUILD_PRESCRIPT). The
+# options must be ones both GNU strip and llvm-strip accept. Other files
+# (scripts, linker scripts, pkg-config and data files) are not passed to strip.
+# A strip failure on an object, or a failure to list the directory, is reported
+# and fails the build once the whole directory has been processed. host: recipes
+# on macOS produce Mach-O files, so their packages are not stripped.
 function COOKBOOK_STRIP_OBJECTS {
     case "${TARGET}" in
         *-apple-darwin) return 0 ;;
     esac
     local dir="$1"
     shift
-    local file magic failed=0
-    while IFS= read -r -d '' file
+    local strip="${GNU_TARGET}-strip"
+    if [ "${TARGET}" = "${COOKBOOK_HOST_TARGET}" ]
+    then
+        strip="${COOKBOOK_HOST_STRIP:-strip}"
+    fi
+    # find runs in a process substitution, whose exit status bash discards, so
+    # it appends its status as a final record.
+    local records=() record
+    while IFS= read -r -d '' record
+    do
+        records+=("${record}")
+    done < <(
+        if find "${dir}" -type f -print0
+        then
+            printf '0\0'
+        else
+            printf '%d\0' "$?"
+        fi
+    )
+    local count="${#records[@]}" failed=0
+    if [ "${count}" -eq 0 ]
+    then
+        echo "error: could not list the files to strip in ${dir}" >&2
+        return 1
+    fi
+    if [ "${records[count - 1]}" != 0 ]
+    then
+        echo "error: could not list all the files to strip in ${dir}" >&2
+        failed=1
+    fi
+    local file magic
+    for file in "${records[@]:0:count - 1}"
     do
         magic="$(od -An -tx1 -N8 -- "${file}")"
         magic="${magic//[[:space:]]/}"
@@ -523,14 +559,14 @@ function COOKBOOK_STRIP_OBJECTS {
             7f454c46*|213c617263683e0a) ;;
             *) continue ;;
         esac
-        if "${GNU_TARGET}-strip" "$@" -- "${file}"
+        if "${strip}" "$@" -- "${file}"
         then
             echo "stripped ${file}"
         else
-            echo "error: ${GNU_TARGET}-strip $* failed on ${file}" >&2
+            echo "error: ${strip} $* failed on ${file}" >&2
             failed=1
         fi
-    done < <(find "${dir}" -type f -print0)
+    done
     return "${failed}"
 }
 
@@ -750,24 +786,58 @@ mod tests {
         bin
     }
 
-    /// Runs the build postscript on `stage` with `strip_bin` first in `PATH`.
+    /// Runs the build postscript on `stage` for a cross build, with `strip_bin`
+    /// first in `PATH`.
     fn run_postscript(stage: &Path, strip_bin: &Path) -> Output {
+        run_strip_script(
+            BUILD_POSTSCRIPT,
+            stage,
+            strip_bin,
+            &[("TARGET", STRIP_TARGET), ("GNU_TARGET", STRIP_TARGET)],
+        )
+    }
+
+    /// Runs `script` on `stage` with `strip_bin` first in `PATH` and `env` set.
+    fn run_strip_script(
+        script: &str,
+        stage: &Path,
+        strip_bin: &Path,
+        env: &[(&str, &str)],
+    ) -> Output {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mut paths = vec![strip_bin.to_owned()];
         paths.extend(std::env::split_paths(&path));
         Command::new("bash")
             .arg("-e")
             .arg("-c")
-            .arg(BUILD_POSTSCRIPT)
+            .arg(script)
             .env("PATH", std::env::join_paths(paths).unwrap())
-            .env("TARGET", STRIP_TARGET)
-            .env("GNU_TARGET", STRIP_TARGET)
             .env("COOKBOOK_STAGE", stage)
             .env("COOKBOOK_NAME", "strip-test")
             .env_remove("COOKBOOK_NOSTRIP")
+            .env_remove("COOKBOOK_HOST_TARGET")
+            .env_remove("STRIP")
+            .envs(env.iter().copied())
             .output()
             .unwrap()
     }
+
+    /// Returns the sorted strip invocations in `log`, with `stage` removed from paths.
+    fn strip_calls(log: &Path, stage: &Path) -> Vec<String> {
+        let mut calls: Vec<String> = std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.replace(&stage.display().to_string(), ""))
+            .collect();
+        calls.sort();
+        calls
+    }
+
+    const EXPECTED_STRIP_CALLS: [&str; 3] = [
+        "--strip-all -- /usr/bin/prog",
+        "--strip-debug -- /usr/lib/libt.a",
+        "--strip-debug -- /usr/lib/libt.so",
+    ];
 
     fn write_executable(path: &Path, contents: &str) {
         std::fs::write(path, contents).unwrap();
@@ -819,21 +889,72 @@ mod tests {
 
         let output = run_postscript(&stage, &bin);
         assert!(output.status.success(), "{output:?}");
+        assert_eq!(strip_calls(&log, &stage), EXPECTED_STRIP_CALLS);
+    }
 
-        let mut calls: Vec<String> = std::fs::read_to_string(log)
-            .unwrap()
-            .lines()
-            .map(|line| line.replace(&stage.display().to_string(), ""))
-            .collect();
-        calls.sort();
-        assert_eq!(
-            calls,
-            [
-                "--strip-all -- /usr/bin/prog",
-                "--strip-debug -- /usr/lib/libt.a",
-                "--strip-debug -- /usr/lib/libt.so",
-            ]
+    /// Runs the build prescript, a recipe script that unsets `STRIP` as
+    /// `cookbook_meson` does, and the postscript, as a `host:` build.
+    fn run_host_build(stage: &Path, strip_bin: &Path, strip: Option<&str>) -> Output {
+        let host = "x86_64-unknown-linux-gnu";
+        // The prescript puts `${COOKBOOK_ROOT}/bin` first in `PATH`.
+        let root = strip_bin.parent().unwrap().to_str().unwrap();
+        let mut env = vec![
+            ("COOKBOOK_ROOT", root),
+            ("TARGET", host),
+            ("COOKBOOK_HOST_TARGET", host),
+            ("GNU_TARGET", "x86_64-linux-gnu"),
+        ];
+        env.extend(strip.map(|strip| ("STRIP", strip)));
+        let script = format!("{BUILD_PRESCRIPT}\nunset STRIP\n{BUILD_POSTSCRIPT}");
+        run_strip_script(&script, stage, strip_bin, &env)
+    }
+
+    #[test]
+    fn host_builds_use_the_strip_redoxer_selected() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = fake_stage(root.path());
+        let (bin, log) = fake_strip(root.path());
+        std::os::unix::fs::symlink(root.path().join("fake-strip"), bin.join("host-strip")).unwrap();
+
+        let output = run_host_build(&stage, &bin, Some("host-strip"));
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(strip_calls(&log, &stage), EXPECTED_STRIP_CALLS);
+    }
+
+    #[test]
+    fn host_builds_without_strip_use_unprefixed_strip() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = fake_stage(root.path());
+        let (bin, log) = fake_strip(root.path());
+        std::os::unix::fs::symlink(root.path().join("fake-strip"), bin.join("strip")).unwrap();
+
+        let output = run_host_build(&stage, &bin, None);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(strip_calls(&log, &stage), EXPECTED_STRIP_CALLS);
+    }
+
+    #[test]
+    fn postscript_fails_when_the_stage_cannot_be_listed() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = fake_stage(root.path());
+        let (bin, log) = fake_strip(root.path());
+        // A find that lists every file but then reports an error, as it does
+        // after an unreadable directory.
+        let real_find = find_tool(&["find"]).unwrap();
+        write_executable(
+            &bin.join("find"),
+            &format!("#!/bin/sh\n'{}' \"$@\"\nexit 1\n", real_find.display()),
         );
+
+        let output = run_postscript(&stage, &bin);
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("could not list all the files to strip"),
+            "{stderr}"
+        );
+        // The files that were listed are still stripped.
+        assert_eq!(strip_calls(&log, &stage), EXPECTED_STRIP_CALLS[..1]);
     }
 
     #[test]
