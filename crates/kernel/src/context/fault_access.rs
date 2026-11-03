@@ -10,7 +10,7 @@
 //!
 //! This module holds the architecture-independent decision so the host tests in
 //! `crates/kernel/tests` exercise it; `context::memory` converts `rmm` page flags into
-//! [`PtePermissions`].
+//! [`PtePermissions`](crate::context::fault_access::PtePermissions).
 
 /// The access that caused a user page fault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
