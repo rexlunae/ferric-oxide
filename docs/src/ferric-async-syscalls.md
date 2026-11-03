@@ -310,10 +310,30 @@ entry is taken**. For forwarded and deferred entries they are captured with the
 waiter, as the worker captures PID and credentials today.
 
 So a `setuid` issued between publishing an entry and its being taken does
-change the identity it runs with. The library therefore issues a `BARRIER`,
-draining the ring with `Enter`, before relibc changes credentials, `chdir`s or
-`close_range`s, and on a v1 kernel it simply drains. This rule is part of the
-ABI: *an entry acts as if issued at the moment the kernel takes it.*
+change the identity it runs with. The library therefore fully drains the ring
+before relibc changes credentials, `chdir`s or `close_range`s. This rule is part
+of the ABI: *an entry acts as if issued at the moment the kernel takes it.*
+
+One `Enter` is not a full drain. Today `Enter` stops waiting once the CQ holds
+`min_complete` completions or no chain is in flight, so it can return after the
+first completion while earlier entries still run, and it does not take SQ
+entries beyond `to_submit`. A full drain is a loop, run by the thread that owns
+the ring with new submissions held back:
+
+1. Let `untaken` be the SQ entries the kernel has not consumed (SQ tail minus
+   head).
+2. Call `Enter { to_submit: untaken, min_complete: cq_entries }`. Asking for a
+   full CQ makes the wait end only when the CQ is full or no chain is in
+   flight, which also covers entries sent with `NO_CQE_ON_SUCCESS`. Retry on
+   `EINTR`.
+3. Reap the CQ. If the SQ still holds untaken entries, or the CQ was full
+   (more completions may follow), go back to step 1. Otherwise the drain is
+   done: every published entry was taken and none is in flight.
+
+The loop ends because every pass either frees the CQ for more completions or
+finds nothing in flight. On a v2 kernel a `BARRIER` entry may replace the loop
+only when the kernel documents that its completion follows every earlier
+entry's completion; on a v1 kernel the library always uses the loop.
 
 ### Process and thread lifecycle
 
@@ -437,7 +457,14 @@ The key rules:
   opportunistically is seen with no system call, then registers its waker.
 - **`park` is the only transfer.** An executor calls it when it has no
   runnable task. It uses the need-wakeup protocol (`notify::prepare_sleep`)
-  and `Enter { to_submit: pending, min_complete: 1 }`. On a v1 kernel, or
+  and `Enter { to_submit: pending, min_complete: 1 }`.
+- **`park` may return without a completion.** `Enter` also returns when no
+  chain is in flight, on `EINTR`, or with SQ entries it did not take. `park`
+  therefore reaps whatever arrived and returns `Ok(())` even if that was
+  nothing; the executor then re-polls ready tasks, resubmits untaken entries
+  and parks again. It never assumes that one completion arrived, and it does
+  not park again with nothing in flight and nothing untaken (that would sleep
+  until the timeout). On a v1 kernel, or
   when service points are off, `park` also runs before the executor sleeps
   and whenever the SQ holds entries the kernel has not taken: the explicit
   transfer moves to the latest safe moment instead of disappearing.
