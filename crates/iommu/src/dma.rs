@@ -188,12 +188,16 @@ pub enum Teardown {
     Unblocked,
 }
 
-/// Installations the hardware did not confirm, kept owned until the domain is torn down.
+/// Installations and teardowns the hardware did not confirm, kept owned until the domain is
+/// torn down.
 ///
-/// A mapping whose installation failed without completing its invalidation may still be
-/// reachable by a device, so its IOVA block and its frame pins have to stay owned. No mapping
-/// record names it, so no unmap or close request can find it: only a teardown that blocked the
-/// domain's devices can retire it.
+/// A mapping whose installation or strict unmap failed without completing its invalidation
+/// may still be reachable by a device, so its IOVA block and its frame pins have to stay
+/// owned. No mapping record names it any more, so no unmap or close request can find it: only
+/// a teardown that blocked the domain's devices can retire it.
+///
+/// [`Retained::install`] runs an installation and decides who owns its resources from the
+/// outcome, so no failure path can drop them unrecorded.
 ///
 /// [`Retained::release`] hands every entry back exactly once, and only when that teardown
 /// blocked the devices. Otherwise the entries stay owned and are dropped at the end, which
@@ -214,6 +218,57 @@ impl<T> Retained<T> {
     /// Keeps `value` owned until a teardown releases it.
     pub fn insert(&mut self, value: T) {
         self.entries.push(value);
+    }
+
+    /// Runs `install` on `value` (the resources an installation needs, such as an IOVA block
+    /// and the frame pins mapped there) and settles who owns `value` from the outcome:
+    ///
+    /// - success hands `value` back, for the caller to record in its mapping;
+    /// - a failure that `clean_failure` accepts (nothing the installation touched is reachable
+    ///   by a device, invalidation included) hands it back in [`InstallError::Clean`], for the
+    ///   caller to release;
+    /// - any other failure keeps `value` here until [`Retained::release`], and returns
+    ///   [`InstallError::Retained`].
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError::Clean`] or [`InstallError::Retained`] with the error of `install`, as
+    /// above.
+    ///
+    /// # Panics
+    ///
+    /// A panic in `install` or `clean_failure` propagates and drops `value`, which leaks what
+    /// it holds when its type does so (the safe outcome while a device may still reach it).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferric_iommu::dma::{InstallError, Retained, Teardown};
+    ///
+    /// let mut retained = Retained::new();
+    /// // The tables could not be changed: nothing is reachable, so the caller gets it back.
+    /// let clean = retained.install("block", |_| Err("no memory"), |&err| err == "no memory");
+    /// assert_eq!(clean, Err(InstallError::Clean { error: "no memory", value: "block" }));
+    /// // The invalidation timed out: a device may reach it, so the domain keeps it.
+    /// let kept = retained.install("block", |_| Err("timeout"), |&err| err == "no memory");
+    /// assert_eq!(kept, Err(InstallError::Retained("timeout")));
+    /// assert_eq!(retained.len(), 1);
+    /// retained.release(Teardown::Blocked, |value| assert_eq!(value, "block"));
+    /// ```
+    pub fn install<E>(
+        &mut self,
+        mut value: T,
+        install: impl FnOnce(&mut T) -> Result<(), E>,
+        clean_failure: impl FnOnce(&E) -> bool,
+    ) -> Result<T, InstallError<T, E>> {
+        match install(&mut value) {
+            Ok(()) => Ok(value),
+            Err(error) if clean_failure(&error) => Err(InstallError::Clean { error, value }),
+            Err(error) => {
+                self.insert(value);
+                Err(InstallError::Retained(error))
+            }
+        }
     }
 
     /// How many installations are retained.
@@ -258,6 +313,53 @@ impl<T> Retained<T> {
         }
         for entry in core::mem::take(&mut self.entries) {
             release(entry);
+        }
+    }
+}
+
+/// Why [`Retained::install`] failed, and who owns the installation's resources now.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InstallError<T, E> {
+    /// Nothing the installation touched is reachable: the caller owns `value` again and
+    /// releases it.
+    Clean {
+        /// The installation's error.
+        error: E,
+        /// The installation's resources.
+        value: T,
+    },
+    /// A device may still reach the installation: its resources stay in the [`Retained`]
+    /// set until a teardown blocks the domain's devices.
+    Retained(E),
+}
+
+impl<T, E> InstallError<T, E> {
+    /// The installation's error, dropping any resources a clean failure handed back.
+    pub fn into_error(self) -> E {
+        match self {
+            Self::Clean { error, .. } | Self::Retained(error) => error,
+        }
+    }
+}
+
+impl<T, E: fmt::Display> fmt::Display for InstallError<T, E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Clean { error, .. } => write!(f, "installation rolled back: {error}"),
+            Self::Retained(error) => {
+                write!(
+                    f,
+                    "installation retained after an unconfirmed invalidation: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl<T: fmt::Debug, E: core::error::Error + 'static> core::error::Error for InstallError<T, E> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Clean { error, .. } | Self::Retained(error) => Some(error),
         }
     }
 }
@@ -450,13 +552,44 @@ impl<T> DmaMappings<T> {
     ///
     /// [`Overlap`] when part of its physical range is already mapped; nothing changes.
     pub fn insert(&mut self, mapping: Mapping<T>) -> Result<(), Overlap> {
-        if let Some(existing) = self.overlapping(mapping.phys) {
+        self.vacant(mapping.phys)?
+            .maps
+            .by_phys
+            .insert(mapping.phys.start, mapping);
+        Ok(())
+    }
+
+    /// Reserves the physical range `phys`, which no mapping overlaps, for a mapping recorded
+    /// later with [`Vacant::insert`]. The reservation borrows the mappings, so nothing can
+    /// take the range in between and recording cannot fail: check before pinning frames or
+    /// changing tables, so that no resources are lost to an overlap found afterwards.
+    ///
+    /// # Errors
+    ///
+    /// [`Overlap`] when part of `phys` is already mapped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferric_iommu::dma::{DmaMappings, Span};
+    ///
+    /// let mut maps = DmaMappings::new();
+    /// let slot = maps.vacant(Span::new(0x8000_0000, 0x1000))?;
+    /// slot.insert(0x4000, true, Span::new(0x7000_0000, 0x1000), "block");
+    /// assert!(maps.vacant(Span::new(0x8000_0000, 0x1000)).is_err());
+    /// # Ok::<(), ferric_iommu::dma::Overlap>(())
+    /// ```
+    pub fn vacant(&mut self, phys: Span) -> Result<Vacant<'_, T>, Overlap> {
+        // An empty range overlaps nothing, but must not replace a mapping that starts there.
+        let existing = self
+            .overlapping(phys)
+            .or_else(|| self.by_phys.get(&phys.start));
+        if let Some(existing) = existing {
             return Err(Overlap {
                 existing: existing.phys,
             });
         }
-        self.by_phys.insert(mapping.phys.start, mapping);
-        Ok(())
+        Ok(Vacant { maps: self, phys })
     }
 
     /// Removes and returns the mapping whose physical range holds `phys`, whatever its users.
@@ -518,6 +651,29 @@ impl<T> DmaMappings<T> {
     /// Removes and returns every mapping.
     pub fn drain(&mut self) -> impl Iterator<Item = Mapping<T>> + use<T> {
         core::mem::take(&mut self.by_phys).into_values()
+    }
+}
+
+/// A physical range no mapping overlaps, from [`DmaMappings::vacant`].
+#[must_use = "the range is only reserved while the slot is held"]
+pub struct Vacant<'a, T> {
+    maps: &'a mut DmaMappings<T>,
+    phys: Span,
+}
+
+impl<'a, T> Vacant<'a, T> {
+    /// The reserved physical range.
+    pub fn phys(&self) -> Span {
+        self.phys
+    }
+
+    /// Records the range mapped at `iova`, as [`Mapping::new`] describes the arguments.
+    pub fn insert(self, iova: u64, writable: bool, user: Span, data: T) -> &'a mut Mapping<T> {
+        let Span { start, len } = self.phys;
+        self.maps
+            .by_phys
+            .entry(start)
+            .or_insert(Mapping::new(start, len, iova, writable, user, data))
     }
 }
 
@@ -826,6 +982,60 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].data, 7);
         assert!(maps.is_empty());
+    }
+
+    #[test]
+    fn install_hands_back_or_retains_by_outcome() {
+        let mut retained = Retained::new();
+        assert_eq!(
+            retained.install(
+                1,
+                |v| {
+                    *v += 1;
+                    Ok::<(), &str>(())
+                },
+                |_| true
+            ),
+            Ok(2)
+        );
+        assert_eq!(
+            retained.install(3, |_| Err("tables"), |&e| e == "tables"),
+            Err(InstallError::Clean {
+                error: "tables",
+                value: 3
+            })
+        );
+        assert!(retained.is_empty());
+        let kept = retained.install(4, |_| Err("timeout"), |&e| e == "tables");
+        assert_eq!(kept, Err(InstallError::Retained("timeout")));
+        assert_eq!(kept.map_err(InstallError::into_error), Err("timeout"));
+        let mut released = Vec::new();
+        retained.release(Teardown::Blocked, |v| released.push(v));
+        assert_eq!(released, [4]);
+    }
+
+    #[test]
+    fn vacant_slots_reserve_the_range_they_checked() {
+        let mut maps = DmaMappings::new();
+        let slot = maps.vacant(Span::new(0x10_0000, 0x2000)).unwrap();
+        assert_eq!(slot.phys(), Span::new(0x10_0000, 0x2000));
+        let mapping = slot.insert(0x4000, false, Span::new(0x7000, 0x2000), 5);
+        assert_eq!(
+            (mapping.iova(), mapping.writable(), mapping.data),
+            (0x4000, false, 5)
+        );
+        assert_eq!(maps.iova_of(0x10_1000), Some(0x5000));
+        let existing = Span::new(0x10_0000, 0x2000);
+        assert_eq!(
+            maps.vacant(Span::new(0x10_1000, 0x1000)).err(),
+            Some(Overlap { existing })
+        );
+        // An empty range overlaps nothing, but cannot replace a mapping that starts there.
+        assert_eq!(
+            maps.vacant(Span::new(0x10_0000, 0)).err(),
+            Some(Overlap { existing })
+        );
+        assert_eq!(maps.get(0x10_0000).map(|m| m.data), Some(5));
     }
 
     #[test]
