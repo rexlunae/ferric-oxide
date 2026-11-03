@@ -5,8 +5,8 @@
 //! `fs.ext4_write`), `futimens`, `fchmod` and `fchown` change the inode through the journal
 //! ([`Fs::set_times`], [`Fs::set_mode`], [`Fs::set_owner`]), and a file opened for writing
 //! is written ([`Fs::write_with_flags`], allocating the blocks it does not have yet).
-//! `O_APPEND` opens and writes fail with `EOPNOTSUPP`: the current write response cannot
-//! report an append's actual position to the kernel (issue #244). `O_CREAT` creates a
+//! An `O_APPEND` write goes to the end of the file, and the kernel moves the description's
+//! cursor to the size `fsize` reports afterwards (issue #244). `O_CREAT` creates a
 //! regular file, `O_TRUNC` and `ftruncate` resize one ([`Fs::truncate`]). Everything else
 //! that would change the volume (`unlinkat`, `frename`, `flink`, creating directories and
 //! links, and all of the above on a read-only mount) fails with `EROFS` or `EOPNOTSUPP`, as

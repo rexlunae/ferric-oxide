@@ -1,7 +1,7 @@
 //! The steps, on Redox.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
@@ -402,9 +402,41 @@ fn writable() -> Result<(), Failure> {
             "created contents",
             io("read created file", fs::read(&created))?,
             b"created\n".to_vec(),
-        )
+        )?;
+        appends(&created)
     });
     super::image::finish(Path::new(WRITE_IMAGE_PATH), result)
+}
+
+/// An `O_APPEND` write goes to the end of `path` (8 bytes long) and leaves the cursor there
+/// (#244), whatever the cursor was.
+fn appends(path: &str) -> Result<(), Failure> {
+    let mut file = io(
+        "open created.txt for appending",
+        OpenOptions::new().read(true).append(true).open(path),
+    )?;
+    io("append to created.txt", file.write_all(b"more"))?;
+    same(
+        "cursor after the append",
+        io("lseek created.txt", file.stream_position())?,
+        12,
+    )?;
+    let mut rest = Vec::new();
+    io("read after the append", file.read_to_end(&mut rest))?;
+    same("what a read after the append finds", rest, Vec::new())?;
+    io("seek created.txt to 0", file.seek(SeekFrom::Start(0)))?;
+    io("append to created.txt again", file.write_all(b"!"))?;
+    same(
+        "cursor after the second append",
+        io("lseek created.txt", file.stream_position())?,
+        13,
+    )?;
+    drop(file);
+    same(
+        "appended contents",
+        io("read appended created.txt", fs::read(path))?,
+        b"created\nmore!".to_vec(),
+    )
 }
 
 fn unchanged_image() -> Result<(), Failure> {
