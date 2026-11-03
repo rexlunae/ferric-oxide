@@ -33,6 +33,7 @@ use redox_path::RedoxPath;
 use crate::{Disk, FileSystem, Node, Transaction, TreeData, TreePtr, BLOCK_SIZE};
 
 use super::resource::{DirResource, Entry, FileMmapInfo, FileResource, Resource};
+use crate::fmap::release_unused;
 
 enum Handle<D: Disk> {
     ResourceDir((DirResource, PhantomData<D>)),
@@ -1097,17 +1098,14 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
             .checked_sub(1)
             .expect("open_fds not tracked correctly");
 
-        // Check if node no longer in use
-        if !file_info.in_use() {
+        // Ferric Oxide: once no description or mapping uses the node, its entry goes, and with
+        // it the mapping buffer (#373). Removing it used to leak, as dropping the entry never
+        // unmapped the buffer; `FileMmapInfo` now returns it on drop.
+        if release_unused(&mut self.fmap, node_ptr.id()) {
             // Notify filesystem of close
             if let Err(err) = self.fs.tx(|tx| tx.on_close_node(node_ptr)) {
                 log::error!("failed to close node {}: {}", node_ptr.id(), err);
             }
-
-            /*TODO: leaks memory, but why?
-            // Remove from fmap list
-            self.fmap.remove(&node_ptr.id());
-            */
         }
     }
 

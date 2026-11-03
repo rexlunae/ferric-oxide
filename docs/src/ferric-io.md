@@ -740,6 +740,17 @@ a ramp-up period (`ramp_time` is 0 by default).
    installation: the shared crate's unit test covers the retained entries and
    the ordering of their release, and the kernel path is compiled for the
    target but only runs when hardware fails an invalidation.
+6. Moving memory away with `mremap` or a proc transfer (`AddrSpace::r#move`)
+   releases the source's translations one grant at a time, right after that
+   grant has left the source (`ferric_iommu::dma::moved`). A move that fails
+   part way, for example when a destination page table cannot be allocated,
+   keeps the translations of the grants still mapped in the source, so the
+   device can keep using them. In a move within one process, the destination
+   span is not released. The tail a shrinking move unmaps, and
+   a fixed destination it replaces, follow `munmap` and are released even when
+   the unmap stops early. A translation shared by a moved and an unmoved
+   grant is retired whole, as for a partial `munmap`
+   ([#306](https://github.com/rexlunae/ferric-oxide/issues/306)).
 
 The entry points are `userspace/base/drivers/pcid/src/iommu.rs`,
 `src/driver_interface/mod.rs`, `crates/kernel/src/scheme/iommu.rs`, and

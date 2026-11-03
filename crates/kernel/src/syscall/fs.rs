@@ -10,6 +10,7 @@ use crate::{
         file::{FileDescription, FileDescriptor, InternalFlags, LockedFileDescription},
         memory::{
             handle_notify_files, AddrSpace, GenericFlusher, Grant, PageSpan, TlbShootdownActions,
+            UnmapVec,
         },
     },
     memory::{Page, VirtualAddress, PAGE_SIZE},
@@ -747,13 +748,16 @@ pub fn mremap(
 
         let raii_frame = addr_space.borrow_frame_enforce_rw_allocated(src_span.base, token)?;
 
-        let mut token = token.token();
-        let base = addr_space.acquire_write(token.downgrade()).mmap(
+        // Ferric Oxide: a fixed destination may replace file mappings, whose schemes must hear
+        // of the unmap (see the other branch).
+        let mut notify_files = UnmapVec::new();
+        let mut lock_token = token.token();
+        let base = addr_space.acquire_write(lock_token.downgrade()).mmap(
             &addr_space,
             requested_dst_base,
             NonZeroUsize::new(1).expect("value specified is not zero"),
             map_flags,
-            None,
+            Some(&mut notify_files),
             |page, page_flags, mapper, flusher| {
                 let frame = raii_frame.take();
                 // XXX: add_ref(RefKind::Shared) is internally done by borrow_frame_enforce_rw_allocated(src_span.base).
@@ -769,21 +773,29 @@ pub fn mremap(
 
                 Ok(Grant::allocated_one_page_nomap(page, page_flags))
             },
-        )?;
+        );
+        handle_notify_files(notify_files, token);
 
-        Ok(base.start_address().data())
+        Ok(base?.start_address().data())
     } else {
+        // Ferric Oxide: shrinking a file mapping or replacing one at a fixed destination unmaps
+        // it, and its scheme must get the funmap: dropping the results lost the write-back of
+        // shared writable pages and kept the scheme's mapping state (RedoxFS's buffer, #373)
+        // and the file description forever. Notified even on failure, as for `munmap`, since
+        // whatever was unmapped before the error stays unmapped.
+        let mut notify_files = UnmapVec::new();
         let base = addr_space.r#move(
             None,
             src_span,
             requested_dst_base,
             new_page_count,
             map_flags,
-            None,
+            Some(&mut notify_files),
             token.downgrade(),
-        )?;
+        );
+        handle_notify_files(notify_files, token);
 
-        Ok(base.start_address().data())
+        Ok(base?.start_address().data())
     }
 }
 

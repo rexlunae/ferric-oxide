@@ -5,11 +5,12 @@ use pkgar_keys::PublicKeyFile;
 
 use crate::bail_other_err;
 use crate::config::CookConfig;
+use crate::cook::cargo_inputs::cargo_inputs;
 use crate::cook::fetch_repo;
 use crate::cook::package::package_source_paths;
 use crate::cook::{fetch, fs, host_tools, pty::PtyOut, script::*};
 use crate::recipe::BuildCompiler;
-use crate::recipe::{AutoDeps, BuildKind, CookRecipe, OptionalPackageRecipe, Recipe};
+use crate::recipe::{AutoDeps, BuildKind, CookRecipe, OptionalPackageRecipe, Recipe, SourceRecipe};
 use std::io::Read;
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -254,6 +255,10 @@ pub fn build(
         .map(|p| p.with_added_extension("pkgar"))
         .collect();
     let native_sysroot_time = native_sysroot_modified(recipe_dir);
+    let path_source = match &recipe.source {
+        Some(SourceRecipe::Path { path }) => Some(Path::new(path)),
+        _ => None,
+    };
     let native_sysroot_changed = native_sysroot_is_newer(native_sysroot_time, &stage_pkgars);
     let cli_jobs = cook_config.jobs;
     if recipe.build.kind == BuildKind::None {
@@ -342,6 +347,7 @@ pub fn build(
             logger,
             recipe_dir,
             source_dir,
+            path_source,
             &auto_deps_file,
             stage_pkgars,
             native_sysroot_time,
@@ -680,6 +686,7 @@ fn build_is_source_newer(
     logger: &PtyOut,
     recipe_dir: &Path,
     source_dir: &Path,
+    path_source: Option<&Path>,
     auto_deps_file: &Path,
     stage_pkgars: Vec<PathBuf>,
     native_sysroot_modified: Option<std::time::SystemTime>,
@@ -691,25 +698,50 @@ fn build_is_source_newer(
     let Ok(stage_modified) = fs::modified_all(&stage_pkgars, fs::modified) else {
         return true;
     };
-    let Ok(mut source_modified) = fs::modified_dir_ignore_git(source_dir) else {
+    let Ok(source_modified) = fs::modified_dir_ignore_git(source_dir) else {
         return false;
     };
-    let mut recipe_is_newest = false;
+    let mut newest = (source_modified, "source");
     if let Some(recipe_modified) = recipe_modified(recipe_dir)
-        && recipe_modified > source_modified
+        && recipe_modified > newest.0
     {
-        source_modified = recipe_modified;
-        recipe_is_newest = true;
+        newest = (recipe_modified, "recipe");
     }
-    let newer = source_modified > stage_modified;
+    // The snapshot in source_dir holds only the path source itself; an
+    // in-tree Cargo package also builds from its path dependencies and its
+    // workspace's manifest and lockfile.
+    if let Some(path_source) = path_source {
+        match path_source_cargo_modified(path_source) {
+            Ok(Some(modified)) if modified > newest.0 => {
+                newest = (modified, "Cargo path dependency or workspace file");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                log_to_pty!(
+                    logger,
+                    "DEBUG: updating build: cannot check the Cargo inputs of {}: {error}",
+                    path_source.display()
+                );
+                return true;
+            }
+        }
+    }
+    let newer = newest.0 > stage_modified;
     if newer {
-        log_to_pty!(
-            logger,
-            "DEBUG: updating build: {} is newer",
-            if recipe_is_newest { "recipe" } else { "source" }
-        );
+        log_to_pty!(logger, "DEBUG: updating build: {} is newer", newest.1);
     }
     newer
+}
+
+/// Returns the newest modification time among the Cargo inputs of the path
+/// source `path_source`, or `None` when it is not a Cargo package.
+fn path_source_cargo_modified(path_source: &Path) -> Result<Option<std::time::SystemTime>> {
+    cargo_inputs(path_source)
+        .map_err(|source| Error::CargoInputs {
+            path: path_source.to_path_buf(),
+            source: Box::new(source),
+        })?
+        .newest_modified()
 }
 
 pub fn remove_stage_dir(stage_dir: &PathBuf) -> crate::Result<()> {
@@ -1354,6 +1386,7 @@ mod tests {
             &None,
             temp.path(),
             &source,
+            None,
             &auto_deps,
             variants.clone(),
             Some(stamp)
@@ -1364,11 +1397,101 @@ mod tests {
             &None,
             temp.path(),
             &source,
+            None,
             &auto_deps,
             variants,
             Some(stamp)
         ));
         assert!(!super::native_sysroot_is_newer(Some(stamp), &[dev]));
+    }
+
+    /// A path source rebuilds when a crate it depends on by path, or its
+    /// workspace lockfile, changes, but not for that crate's build cache.
+    #[test]
+    fn path_source_rebuilds_when_a_cargo_path_dependency_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let write = |relative: &str, text: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "Cargo.toml",
+            "[workspace]\nexclude = [\"tools/app/bootstrap\"]\n\
+             [workspace.dependencies]\nshared = { path = \"crates/shared\" }\n",
+        );
+        write(
+            "tools/app/bootstrap/Cargo.toml",
+            "[package]\nname = \"bootstrap\"\n",
+        );
+        write("tools/app/bootstrap/Cargo.lock", "");
+        write("Cargo.lock", "");
+        write(
+            "tools/app/Cargo.toml",
+            "[package]\nname = \"app\"\n[dependencies]\n\
+             dep = { path = \"../../crates/dep\" }\nshared.workspace = true\n",
+        );
+        write("crates/dep/Cargo.toml", "[package]\nname = \"dep\"\n");
+        write("crates/dep/src/lib.rs", "");
+        write("crates/shared/Cargo.toml", "[package]\nname = \"shared\"\n");
+        write("recipe/recipe.toml", "");
+        write("recipe/source/Cargo.toml", "");
+        write("recipe/target/auto_deps.toml", "");
+        let package = root.join("recipe/target/stage.pkgar");
+        write("recipe/target/stage.pkgar", "");
+
+        let stage_time = std::time::SystemTime::now();
+        let old = stage_time - std::time::Duration::from_secs(60);
+        let new = stage_time + std::time::Duration::from_secs(60);
+        let touch = |path: &std::path::Path, time| {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(time))
+                .unwrap();
+        };
+        for entry in walkdir::WalkDir::new(root) {
+            touch(entry.unwrap().path(), old);
+        }
+        touch(&package, stage_time);
+        let check = || {
+            super::build_is_source_newer(
+                &None,
+                &root.join("recipe"),
+                &root.join("recipe/source"),
+                Some(&root.join("tools/app")),
+                &root.join("recipe/target/auto_deps.toml"),
+                vec![package.clone()],
+                None,
+            )
+        };
+        assert!(!check());
+
+        write("crates/dep/target/CACHEDIR.TAG", "");
+        touch(&root.join("crates/dep/target/CACHEDIR.TAG"), new);
+        touch(&root.join("crates/dep/target"), new);
+        touch(&root.join("crates/dep"), old);
+        assert!(!check(), "a dependency's build cache is not an input");
+
+        touch(&root.join("crates/dep/src/lib.rs"), new);
+        assert!(check(), "a path dependency changed");
+        touch(&root.join("crates/dep/src/lib.rs"), old);
+
+        touch(&root.join("crates/shared/Cargo.toml"), new);
+        assert!(check(), "a workspace-inherited path dependency changed");
+        touch(&root.join("crates/shared/Cargo.toml"), old);
+
+        touch(&root.join("Cargo.lock"), new);
+        assert!(check(), "the workspace lockfile changed");
+        touch(&root.join("Cargo.lock"), old);
+
+        touch(&root.join("tools/app/bootstrap/Cargo.lock"), new);
+        assert!(check(), "an excluded package's own lockfile changed");
+        touch(&root.join("tools/app/bootstrap/Cargo.lock"), old);
+
+        assert!(!check());
+        std::fs::remove_file(root.join("crates/dep/Cargo.toml")).unwrap();
+        assert!(check(), "an unreadable dependency forces a rebuild");
     }
 
     #[test]
@@ -1401,6 +1524,7 @@ mod tests {
             &None,
             temp.path(),
             &source,
+            None,
             &auto_deps,
             vec![package.clone()],
             None
@@ -1409,6 +1533,7 @@ mod tests {
             &None,
             temp.path(),
             &source,
+            None,
             &auto_deps,
             vec![package],
             Some(stage_time + std::time::Duration::from_secs(2))

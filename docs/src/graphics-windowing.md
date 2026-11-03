@@ -172,8 +172,9 @@ unresolved.
 
 With the default 2 GiB of `cargo xtask run`, the example then started only some
 of the time. Loading it and `cosmic-comp`, debug builds of 436 and 392 MiB,
-mapped both files whole, RedoxFS read and kept them
-([#373](https://github.com/rexlunae/ferric-oxide/issues/373)), and the guest
+mapped both files whole, RedoxFS read and kept them (it now frees a file's
+buffer once the file is unused,
+[#373](https://github.com/rexlunae/ferric-oxide/issues/373)), and the guest
 ran out of memory, which panics the kernel
 ([#372](https://github.com/rexlunae/ferric-oxide/issues/372)). `ld.so` now maps
 only the part of an object that loading reads, 18 and 26 MiB for these two (see

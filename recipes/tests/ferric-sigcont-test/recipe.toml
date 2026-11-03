@@ -1,0 +1,16 @@
+# Ferric Oxide: the on-target test that a SIGCONT with the default action does not
+# interrupt a blocked read (#377). Shells send SIGCONT to every job they start, so a
+# program still loading its libraries saw EINTR. Only for test images. The source is
+# relibc's signals/sigcont-default test.
+[source]
+path = "crates/relibc/tests"
+
+[build]
+template = "custom"
+dev-dependencies = ["relibc"]
+script = """
+mkdir -p "${COOKBOOK_STAGE}/usr/bin"
+${CC} ${CPPFLAGS} ${CFLAGS} -static -std=c11 -O2 -fno-builtin -Wall -Wextra -Werror \
+    "${COOKBOOK_SOURCE}/signals/sigcont-default.c" \
+    -o "${COOKBOOK_STAGE}/usr/bin/ferric-sigcont-test" ${LDFLAGS}
+"""

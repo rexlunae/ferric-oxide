@@ -5,7 +5,7 @@ use cookbook::cook::fs::{
     create_dir, create_target_dir, get_git_commit_date, get_git_head_rev, get_git_rev_before_date,
     remove_all, run_command,
 };
-use cookbook::cook::package::{package, package_handle_push};
+use cookbook::cook::package::{get_package_name, package, package_handle_push};
 use cookbook::cook::pty::{PtyOut, flush_pty, write_to_pty};
 use cookbook::cook::tree::{self, DisplayOptions, TreeData, TreeItem, TreeOptions, WalkTreeEntry};
 use cookbook::cook::tui::join_logs;
@@ -15,7 +15,7 @@ use cookbook::recipe::{
     validate_filesystem_rules,
 };
 use cookbook::{Error, Result, staged_pkg};
-use fox_core::cookbook::RecipeName;
+use fox_core::cookbook::{RecipeName, RepositoryIndex};
 use redox_installer::PackageConfig;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Write, stderr};
@@ -833,17 +833,12 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
             if let Some(gitrev) = lock
                 .get(recipe.name.as_str())
                 .and_then(|r| r.gitrev.clone())
+                && !recipe.pin_rev(gitrev)
             {
-                if let Some(SourceRecipe::Git { rev, branch, .. }) = &mut recipe.recipe.source {
-                    *rev = Some(gitrev.clone());
-                    *branch = None;
-                } else {
-                    println!(
-                        "DEBUG: Recipe {:?} contains into git rev but recipe source is not git",
-                        recipe.name.as_str()
-                    );
-                }
-                recipe.pinned = true;
+                println!(
+                    "DEBUG: Recipe {:?} contains into git rev but recipe source is not git",
+                    recipe.name.as_str()
+                );
             }
         }
     }
@@ -851,7 +846,7 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
     if command.is_building() && recipes.iter().any(|r| r.rule == "binary") {
         let remote = fetch_repo::binary_repo();
         for recipe in recipes.iter_mut() {
-            if recipe.rule == "binary" && !remote_publishes(remote, recipe) {
+            if recipe.rule == "binary" && !remote_publishes(remote.map(|r| &r.index), recipe) {
                 if config.cook.verbose && !(config.cook.tui && command == CliCommand::Cook) {
                     // TODO: this should be printed at fetch log, not here
                     println!(
@@ -901,7 +896,7 @@ fn builds_from_source(
 ) -> bool {
     recipe.is_in_tree()
         || offline_cook_without_binaries(offline, command, recipe)
-        || (fetches_artifacts(command) && !remote_publishes(remote, recipe))
+        || (fetches_artifacts(command) && !remote_publishes(remote.map(|r| &r.index), recipe))
 }
 
 /// Whether `command` downloads or builds packages, as opposed to only
@@ -913,10 +908,21 @@ fn fetches_artifacts(command: &CliCommand) -> bool {
     )
 }
 
-/// Whether `remote`'s index lists a prebuilt `recipe`; without a remote,
-/// nothing is published.
-fn remote_publishes(remote: Option<&fetch_repo::BinaryRepo>, recipe: &CookRecipe) -> bool {
-    remote.is_some_and(|r| r.index.packages.contains_key(recipe.name.as_str()))
+/// Whether a remote's `index` lists every package `recipe` makes, its main
+/// package and each optional one, so `fetch_remote` can download them all;
+/// without a remote, nothing is published.
+fn remote_publishes(index: Option<&RepositoryIndex>, recipe: &CookRecipe) -> bool {
+    index.is_some_and(|index| {
+        recipe
+            .recipe
+            .get_packages_list()
+            .into_iter()
+            .all(|package| {
+                index
+                    .packages
+                    .contains_key(&get_package_name(recipe.name.as_str(), package))
+            })
+    })
 }
 
 /// Whether `recipe` is a prebuilt that an offline cook, or its `cook-list`
@@ -1338,7 +1344,10 @@ mod tests {
         assert_eq!(super::guest_tool_names(&recipes, in_guest), ["gperf"]);
     }
 
-    use super::{CliCommand, builds_from_source, offline_cook_without_binaries};
+    use super::{
+        CliCommand, RepositoryIndex, builds_from_source, offline_cook_without_binaries,
+        remote_publishes,
+    };
     use cookbook::recipe::CookRecipe;
 
     #[test]
@@ -1407,5 +1416,60 @@ mod tests {
         ] {
             assert!(!builds_from_source(false, &command, None, &recipe));
         }
+    }
+
+    fn recipe_with_optional_package(root: &std::path::Path) -> CookRecipe {
+        let dir = root.join("gettext");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("recipe.toml"),
+            "[source]\ntar = \"https://example.org/gettext.tar.xz\"\n\n[build]\ntemplate = \"configure\"\n\n[[optional-packages]]\nname = \"dev\"\n",
+        )
+        .unwrap();
+        CookRecipe::from_path(&dir, true, false).unwrap()
+    }
+
+    fn index_of(packages: &[&str]) -> RepositoryIndex {
+        RepositoryIndex {
+            packages: packages
+                .iter()
+                .map(|name| (name.to_string(), String::new()))
+                .collect(),
+            ..RepositoryIndex::default()
+        }
+    }
+
+    #[test]
+    fn remote_publishes_only_recipes_with_every_package_listed() {
+        let root = tempfile::tempdir().unwrap();
+        let recipe = recipe_with_optional_package(root.path());
+
+        assert!(remote_publishes(
+            Some(&index_of(&["gettext", "gettext.dev"])),
+            &recipe
+        ));
+        assert!(!remote_publishes(Some(&index_of(&["gettext"])), &recipe));
+        assert!(!remote_publishes(
+            Some(&index_of(&["gettext.dev"])),
+            &recipe
+        ));
+        assert!(!remote_publishes(Some(&index_of(&[])), &recipe));
+        assert!(!remote_publishes(None, &recipe));
+    }
+
+    #[test]
+    fn remote_publishes_recipes_without_optional_packages_by_main_package() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("zlib");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("recipe.toml"),
+            "[source]\ntar = \"https://example.org/zlib.tar.xz\"\n\n[build]\ntemplate = \"configure\"\n",
+        )
+        .unwrap();
+        let recipe = CookRecipe::from_path(&dir, true, false).unwrap();
+
+        assert!(remote_publishes(Some(&index_of(&["zlib"])), &recipe));
+        assert!(!remote_publishes(Some(&index_of(&["zlib.dev"])), &recipe));
     }
 }

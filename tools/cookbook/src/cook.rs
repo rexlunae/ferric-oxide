@@ -1,4 +1,5 @@
 // avoid confusion with build.rs
+pub mod cargo_inputs;
 pub mod cook_build;
 pub mod fetch;
 pub mod fetch_repo;

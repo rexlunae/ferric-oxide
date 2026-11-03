@@ -427,9 +427,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "range-tree"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "384c2842d4e069d5ccacf5fe1dca4ef8d07a5444329715f0fc3c61813502d4d1"
+checksum = "25360c805d5f69f6bc20297c3657a24e75c989da1de208a8168240b1f92816e4"
 
 [[package]]
 name = "redox-buffer-pool"

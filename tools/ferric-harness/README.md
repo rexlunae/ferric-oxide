@@ -55,7 +55,8 @@ Trace mode (`--mode trace`) needs an image with the trace-mode kernel
 (`kernel.trace_mode`) and a `ferric-trace` with the `follow` subcommand, found
 with `--ferric-trace`, on `PATH` or in `target/*/`; the harness runs
 `ferric-trace follow --help` before booting and stops with an error when the
-subcommand is missing. The default boot environment delivery, fw_cfg, needs a
+subcommand is missing. It turns the scheduler events on from boot
+(`FERRIC_TRACE=sched`) unless `--boot-env` sets `FERRIC_TRACE`. The default boot environment delivery, fw_cfg, needs a
 bootloader built with `bootloader.fw_cfg_env`; with other bootloaders, use
 `--boot-env-via keys`. Both options are off in the catalog by default.
 

@@ -684,11 +684,20 @@ pub enum PageFaultOutcome {
     CopyFailed = 1,
     /// The fault could not be handled: a signal for a user process, a panic in the kernel.
     Unhandled = 2,
+    /// No physical frame was available (or a page reference count would overflow) to map a
+    /// user page. A kernel copy (record without the user flag) fails with `EFAULT`; a user
+    /// access is unhandled and fails the faulting thread as [`Self::Unhandled`] does.
+    OutOfMemory = 3,
 }
 
 impl PageFaultOutcome {
     /// Every outcome.
-    pub const ALL: [Self; 3] = [Self::Mapped, Self::CopyFailed, Self::Unhandled];
+    pub const ALL: [Self; 4] = [
+        Self::Mapped,
+        Self::CopyFailed,
+        Self::Unhandled,
+        Self::OutOfMemory,
+    ];
 
     /// The raw argument.
     pub const fn raw(self) -> u64 {
@@ -706,6 +715,7 @@ impl PageFaultOutcome {
             Self::Mapped => "mapped",
             Self::CopyFailed => "copy failed",
             Self::Unhandled => "unhandled",
+            Self::OutOfMemory => "out of memory",
         }
     }
 }
@@ -1094,7 +1104,7 @@ mod tests {
         for outcome in PageFaultOutcome::ALL {
             assert_eq!(PageFaultOutcome::from_raw(outcome.raw()), Some(outcome));
         }
-        assert_eq!(PageFaultOutcome::from_raw(3), None);
+        assert_eq!(PageFaultOutcome::from_raw(4), None);
         for source in IrqSource::ALL {
             assert_eq!(IrqSource::from_raw(source.raw()), Some(source));
         }
