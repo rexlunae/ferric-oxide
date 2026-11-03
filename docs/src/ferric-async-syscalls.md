@@ -320,20 +320,33 @@ first completion while earlier entries still run, and it does not take SQ
 entries beyond `to_submit`. A full drain is a loop, run by the thread that owns
 the ring with new submissions held back:
 
-1. Let `untaken` be the SQ entries the kernel has not consumed (SQ tail minus
-   head).
-2. Call `Enter { to_submit: untaken, min_complete: cq_entries }`. Asking for a
-   full CQ makes the wait end only when the CQ is full or no chain is in
-   flight, which also covers entries sent with `NO_CQE_ON_SUCCESS`. Retry on
-   `EINTR`.
-3. Reap the CQ. If the SQ still holds untaken entries, or the CQ was full
+1. Reap the CQ. Let `untaken` be the SQ entries the kernel has not consumed
+   (SQ tail minus head).
+2. If `untaken` is not zero, call
+   `Enter { to_submit: untaken, min_complete: cq_entries }`. If it is zero,
+   call `Enter { to_submit: 0, min_complete: cq_entries }`. Asking for a full
+   CQ makes the wait end only when the CQ is full or no chain is in flight,
+   which also covers entries sent with `NO_CQE_ON_SUCCESS`. Retry on `EINTR`.
+3. `EBUSY` means the CQ has no room for the next chain: completions of chains
+   in flight still hold it. Call `Enter { to_submit: 0, min_complete: cq_entries }`
+   to wait for them, then go back to step 1.
+4. Reap the CQ. If the SQ still holds untaken entries, or the CQ was full
    (more completions may follow), go back to step 1. Otherwise the drain is
    done: every published entry was taken and none is in flight.
 
-The loop ends because every pass either frees the CQ for more completions or
-finds nothing in flight. On a v2 kernel a `BARRIER` entry may replace the loop
-only when the kernel documents that its completion follows every earlier
-entry's completion; on a v1 kernel the library always uses the loop.
+The loop ends because every pass either takes an entry, frees the CQ for more
+completions, or finds nothing in flight. Two library rules keep it that way.
+The library advances the SQ tail only after a whole `LINK` chain is written,
+so the SQ never ends in an unfinished chain that the kernel would leave
+untaken. It never publishes a chain longer than the CQ, so `EBUSY` with an
+empty CQ and nothing in flight cannot happen. If a pass takes nothing, the CQ
+is empty and nothing is in flight while entries remain untaken, the ring is
+corrupt: the drain fails with `RingError::Corrupt` instead of looping, and
+relibc fails the credential or descriptor change.
+
+On a v2 kernel a `BARRIER` entry may replace the loop only when the kernel
+documents that its completion follows every earlier entry's completion; on a
+v1 kernel the library always uses the loop.
 
 ### Process and thread lifecycle
 
