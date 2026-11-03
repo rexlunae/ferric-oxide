@@ -38,7 +38,7 @@ impl From<Errno> for crate::io::Error {
     }
 }
 
-// TODO: core::error::Error
+impl core::error::Error for Errno {}
 
 impl core::fmt::Display for Errno {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

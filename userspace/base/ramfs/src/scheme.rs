@@ -97,21 +97,39 @@ pub enum RingState {
     },
 }
 
-/// Ferric Oxide: whether an inode handle was opened for writing, which `ftruncate` needs.
+/// Ferric Oxide: the access mode (`O_ACCMODE` bits) a descriptor was opened with. The
+/// kernel checks none of it (#375, #400): `read` and `write` pass the descriptor's flags
+/// in, and inode handles keep their own for `ftruncate`, which does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Access {
-    /// Opened `O_RDONLY`, or not opened by path at all.
-    ReadOnly,
-    /// Opened `O_WRONLY` or `O_RDWR`.
-    Writable,
-}
+pub struct Access(usize);
 
 impl Access {
-    /// The access the `O_ACCMODE` bits of open `flags` ask for.
+    /// The access of a handle not opened by path for writing: the root and passed-in
+    /// descriptors.
+    const READ_ONLY: Self = Self(O_RDONLY);
+
+    /// The access the `O_ACCMODE` bits of open or fcntl `flags` give.
     fn from_flags(flags: usize) -> Self {
-        match flags & O_ACCMODE {
-            O_WRONLY | O_RDWR => Self::Writable,
-            _ => Self::ReadOnly,
+        Self(flags & O_ACCMODE)
+    }
+
+    /// Whether this access allows transfers in `direction`.
+    fn allows(self, direction: Direction) -> bool {
+        match direction {
+            Direction::Read => matches!(self.0, O_RDONLY | O_RDWR),
+            Direction::Write => matches!(self.0, O_WRONLY | O_RDWR),
+        }
+    }
+
+    /// Checks that this access allows transfers in `direction`.
+    ///
+    /// # Errors
+    /// `EBADF`, as POSIX `read`, `write` and `ftruncate` return, when it does not.
+    fn check(self, direction: Direction) -> Result<()> {
+        if self.allows(direction) {
+            Ok(())
+        } else {
+            Err(Error::new(EBADF))
         }
     }
 }
@@ -140,8 +158,7 @@ impl Handle {
     /// that is not an inode.
     fn as_writable_inode(&self) -> Result<usize> {
         match *self {
-            Self::Inode(inode, Access::Writable) => Ok(inode),
-            Self::Inode(_, Access::ReadOnly) => Err(Error::new(EBADF)),
+            Self::Inode(inode, access) => access.check(Direction::Write).map(|()| inode),
             _ => Err(Error::new(EBADFD)),
         }
     }
@@ -340,7 +357,7 @@ impl<'a> Scheme<'a> {
         let current_perm = current_perm(file, uid, gid);
         check_permissions(flags, current_perm)?;
 
-        let opened_as_write = flags & O_ACCMODE == O_WRONLY || flags & O_ACCMODE == O_RDWR;
+        let opened_as_write = Access::from_flags(flags).allows(Direction::Write);
 
         if flags & O_TRUNC == O_TRUNC && opened_as_write {
             match file.data {
@@ -442,7 +459,7 @@ impl SchemeSync for Scheme<'_> {
     fn scheme_root(&mut self) -> Result<usize> {
         Ok(self
             .handles
-            .insert(Handle::Inode(Filesystem::ROOT_INODE, Access::ReadOnly)))
+            .insert(Handle::Inode(Filesystem::ROOT_INODE, Access::READ_ONLY)))
     }
 
     fn openat(
@@ -793,9 +810,7 @@ impl SchemeSync for Scheme<'_> {
             .get_mut(&inode)
             .ok_or(Error::new(EBADFD))?;
 
-        if !matches!((fcntl_flags as usize) & O_ACCMODE, O_RDONLY | O_RDWR) {
-            return Err(Error::new(EBADF));
-        }
+        check_open_for(fcntl_flags, Direction::Read)?;
 
         file.read(offset, buf)
     }
@@ -805,7 +820,7 @@ impl SchemeSync for Scheme<'_> {
         fd: usize,
         buf: &[u8],
         offset: u64,
-        _fcntl_flags: u32,
+        fcntl_flags: u32,
         _ctx: &CallerCtx,
     ) -> Result<usize> {
         let Ok(offset) = usize::try_from(offset) else {
@@ -817,6 +832,9 @@ impl SchemeSync for Scheme<'_> {
             .files
             .get_mut(&inode)
             .ok_or(Error::new(EBADFD))?;
+
+        // Ferric Oxide: the kernel does not check the descriptor's access mode (#400).
+        check_open_for(fcntl_flags, Direction::Write)?;
 
         file.write(offset, buf)
     }
@@ -1436,7 +1454,7 @@ impl SchemeSync for Scheme<'_> {
 
         Ok(self
             .handles
-            .insert(Handle::Inode(new_inode_number, Access::ReadOnly)))
+            .insert(Handle::Inode(new_inode_number, Access::READ_ONLY)))
     }
 
     fn std_fs_call(
@@ -1519,4 +1537,72 @@ fn check_permissions(flags: usize, single_mode: u8) -> Result<()> {
         return Err(Error::new(EACCES));
     }
     Ok(())
+}
+
+/// Ferric Oxide: the transfer a descriptor must have been opened for.
+#[derive(Clone, Copy, Debug)]
+enum Direction {
+    Read,
+    Write,
+}
+
+/// Checks that the descriptor whose `fcntl_flags` the kernel passed was opened for
+/// `direction`.
+///
+/// # Errors
+/// `EBADF`, as POSIX `read` and `write` return, when its `O_ACCMODE` bits do not allow it.
+fn check_open_for(fcntl_flags: u32, direction: Direction) -> Result<()> {
+    Access::from_flags(fcntl_flags as usize).check(direction)
+}
+
+#[cfg(test)]
+mod tests {
+    use syscall::flag::{O_APPEND, O_NONBLOCK};
+    use syscall::EBADF;
+
+    use super::{
+        check_open_for, Access, Direction, TryFrom, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+    };
+
+    fn flags(flags: usize) -> u32 {
+        u32::try_from(flags).expect("open flags fit in the fcntl flags")
+    }
+
+    /// #400: a descriptor opened read-only cannot write, whatever else is set.
+    #[test]
+    fn a_read_only_descriptor_cannot_write() {
+        for extra in [0, O_APPEND, O_NONBLOCK] {
+            let err = check_open_for(flags(O_RDONLY | extra), Direction::Write).unwrap_err();
+            assert_eq!(err.errno, EBADF);
+        }
+    }
+
+    #[test]
+    fn a_write_only_descriptor_cannot_read() {
+        let err = check_open_for(flags(O_WRONLY), Direction::Read).unwrap_err();
+        assert_eq!(err.errno, EBADF);
+    }
+
+    #[test]
+    fn each_mode_allows_its_own_transfers() {
+        check_open_for(flags(O_RDONLY), Direction::Read).unwrap();
+        check_open_for(flags(O_WRONLY | O_APPEND), Direction::Write).unwrap();
+        check_open_for(flags(O_RDWR), Direction::Read).unwrap();
+        check_open_for(flags(O_RDWR), Direction::Write).unwrap();
+    }
+
+    /// #375: an inode handle keeps its open access for `ftruncate`, which the kernel passes
+    /// no flags for; the root and passed-in handles are read-only.
+    #[test]
+    fn a_handle_truncates_only_if_opened_for_writing() {
+        let read_only = Access::from_flags(O_RDONLY | O_CREAT | O_TRUNC);
+        assert_eq!(read_only, Access::READ_ONLY);
+        assert_eq!(read_only.check(Direction::Write).unwrap_err().errno, EBADF);
+        Access::READ_ONLY.check(Direction::Read).unwrap();
+        for writable in [O_WRONLY, O_RDWR | O_CREAT] {
+            Access::from_flags(writable)
+                .check(Direction::Write)
+                .unwrap();
+        }
+    }
 }

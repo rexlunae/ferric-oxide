@@ -384,9 +384,6 @@ impl Tracer {
             let mut file = File::open(&path).map_err(io_error(&path))?;
             loop {
                 let len = file.read(&mut buf).map_err(io_error(&path))?;
-                if len == 0 {
-                    break;
-                }
                 for record in Records::new(buf.get(..len).unwrap_or_default()) {
                     let record = record.map_err(|err| Error::Parse {
                         path: path.clone(),
@@ -430,6 +427,9 @@ impl Tracer {
                         }
                         _ => {}
                     }
+                }
+                if abi::read_caught_up(len, buf.len()) {
+                    break;
                 }
             }
         }

@@ -1,6 +1,6 @@
-//! Checks that ramfs changes a file's owner, group and mode (#246), and its times and size
-//! (#375), only under the POSIX rules, using `/scheme/logging`, the ramfs instance every
-//! image runs.
+//! Checks that ramfs changes a file's owner, group and mode (#246), its contents (#400),
+//! and its times and size (#375), only under the POSIX rules, using `/scheme/logging`, the
+//! ramfs instance every image runs.
 //!
 //! As root it creates three files there: one root owns and anyone may open for writing, one
 //! root owns that only root may write (holding a few bytes), and one user 1000 owns (group
@@ -12,6 +12,10 @@
 //! - `owner-allowed`: on its own file it may set the group to its own group, which clears
 //!   the set-user-ID and set-group-ID bits, and change the mode, but not give the file away;
 //!   root then finds the owner, group and mode the child set.
+//! - `owner-write`: `write` through a descriptor it opened read-only, on its own file, is
+//!   refused (`EBADF`), and through one it opened write-only, on root's writable file, it is
+//!   allowed (#400); root then finds its own file empty and root's starting with what was
+//!   written.
 //! - `owner-times-refused`: on root's files, `futimens` with explicit times is refused
 //!   (`EPERM`) and, on the one it may not write, so is setting both to the current time
 //!   (`EACCES`); root then finds neither file carrying the explicit times.
@@ -20,8 +24,9 @@
 //!   modification time; root then finds exactly those times, the current ones within the
 //!   clock readings it took before and after the child.
 //! - `owner-truncate`: `ftruncate` through a descriptor opened read-only is refused (`EBADF`
-//!   or `EINVAL`), even on its own file, and allowed through one opened for writing; root
-//!   then finds the sizes it expects.
+//!   or `EINVAL`), even on its own file, and allowed through one opened for writing, which
+//!   extends root's file past what `owner-write` wrote; root then finds the sizes it expects
+//!   and the extension zeroed.
 //!
 //! `fchown` reaches ramfs as the kernel's fchown call, and `fchmod`, `futimens` and
 //! `ftruncate` as a `StdFsCall`, so the steps cover both ways ramfs learns who the caller
@@ -32,8 +37,7 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions, Permissions};
-use std::io::Write;
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Write};
 use std::ops::RangeInclusive;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, chown, fchown};
@@ -54,8 +58,9 @@ const LOCKED: &str = "/scheme/logging/ferric-owner-test.locked";
 const MINE: &str = "/scheme/logging/ferric-owner-test.mine";
 /// What [`LOCKED`] holds, which a refused `ftruncate` must leave.
 const LOCKED_CONTENTS: &[u8] = b"locked";
-/// The length the child truncates root's writable file to.
-const THEIRS_LENGTH: u64 = 3;
+/// The length the child truncates root's writable file to, past [`WRITTEN`] so that both
+/// the write and the zero-filled extension show.
+const THEIRS_LENGTH: u64 = 16;
 
 /// The explicit time (seconds, nanoseconds) the child asks for.
 const EXPLICIT: (i64, i64) = (1_000_000, 500);
@@ -64,6 +69,10 @@ const OLD: (i64, i64) = (86_400, 0);
 
 /// The argument the unprivileged child runs with.
 const AS_USER: &str = "--as-user";
+/// What the child writes into [`THEIRS`] before truncating it to [`THEIRS_LENGTH`].
+const WRITTEN: &[u8] = b"written";
+const _: () = assert!(WRITTEN.len() < THEIRS_LENGTH as usize);
+
 /// The unprivileged user (and group) the child runs as.
 const USER: u32 = 1000;
 /// The group [`MINE`] starts in, which the child is not a member of.
@@ -105,6 +114,18 @@ fn refused(what: &str, result: io::Result<()>) -> Result<(), Failure> {
         Err(err) if err.raw_os_error() == Some(libc::EPERM) => Ok(()),
         Err(err) => Err(Failure::Check(format!("{what}: {err}, expected EPERM"))),
         Ok(()) => Err(Failure::Check(format!("{what} was allowed"))),
+    }
+}
+
+/// Succeeds when `result` is the `EBADF` a transfer through a descriptor not opened for it
+/// returns.
+fn bad_descriptor(what: &str, result: io::Result<usize>) -> Result<(), Failure> {
+    match result {
+        Err(err) if err.raw_os_error() == Some(libc::EBADF) => Ok(()),
+        Err(err) => Err(Failure::Check(format!("{what}: {err}, expected EBADF"))),
+        Ok(written) => Err(Failure::Check(format!(
+            "{what} was allowed ({written} bytes)"
+        ))),
     }
 }
 
@@ -218,6 +239,21 @@ fn child_mine() -> Result<(), Failure> {
     refused("fchown to root", fchown(&file, Some(0), None))
 }
 
+/// The child's `write` checks: refused through a read-only descriptor, even on its own file,
+/// and allowed through a write-only one.
+fn child_write() -> Result<(), Failure> {
+    let mut read_only = File::open(MINE).map_err(io("open own file read-only"))?;
+    bad_descriptor(
+        "write through a read-only descriptor",
+        read_only.write(WRITTEN),
+    )?;
+    OpenOptions::new()
+        .write(true)
+        .open(THEIRS)
+        .and_then(|mut file| file.write_all(WRITTEN))
+        .map_err(io("write through a write-only descriptor"))
+}
+
 /// The child's `futimens` and `ftruncate` checks.
 fn child_times() -> Result<(), Failure> {
     let explicit = Some([EXPLICIT, EXPLICIT]);
@@ -254,10 +290,11 @@ fn child_times() -> Result<(), Failure> {
     not_writable("ftruncate own file opened read-only", mine.set_len(1))
 }
 
-/// The unprivileged child: all sets of checks, reported through the exit status.
+/// The unprivileged child: every set of checks, reported through the exit status.
 fn as_user() -> ExitCode {
     match child_theirs()
         .and_then(|()| child_mine())
+        .and_then(|()| child_write())
         .and_then(|()| child_times())
     {
         Ok(()) => ExitCode::SUCCESS,
@@ -303,9 +340,23 @@ fn run() -> Result<(), Failure> {
     }
     println!("FERRIC_TEST_PASS owner-allowed");
 
+    let mine = fs::read(MINE).map_err(io("read the user's file"))?;
+    if !mine.is_empty() {
+        return Err(Failure::Check(format!(
+            "the user's file holds {mine:?} after a refused write, expected nothing"
+        )));
+    }
+    let theirs = fs::read(THEIRS).map_err(io("read root's file"))?;
+    if !theirs.starts_with(WRITTEN) {
+        return Err(Failure::Check(format!(
+            "root's file holds {theirs:?}, expected it to start with {WRITTEN:?}"
+        )));
+    }
+    println!("FERRIC_TEST_PASS owner-write");
+
     check_times(mine_modified, before..=after)?;
 
-    check_sizes()?;
+    check_sizes(&theirs)?;
     println!("FERRIC_TEST_PASS owner-truncate");
     Ok(())
 }
@@ -344,8 +395,13 @@ fn check_times(
 }
 
 /// Root's view of the sizes after the child: only the descriptor opened for writing
-/// truncated.
-fn check_sizes() -> Result<(), Failure> {
+/// truncated, and the bytes it added to `theirs` (root's file's contents) zeroed.
+fn check_sizes(theirs: &[u8]) -> Result<(), Failure> {
+    if theirs.iter().skip(WRITTEN.len()).any(|&byte| byte != 0) {
+        return Err(Failure::Check(format!(
+            "root's file holds {theirs:?}, expected zeros after {WRITTEN:?}"
+        )));
+    }
     for (path, expected) in [
         (THEIRS, THEIRS_LENGTH),
         (LOCKED, LOCKED_CONTENTS.len() as u64),

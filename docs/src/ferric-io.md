@@ -965,6 +965,10 @@ Closing the ring cancels the worker for good, as a signal that never clears:
 the wait the running chain is in ends, as does any it starts later, and the
 queued chains complete with `ECANCELED`.
 
+[Batched asynchronous system calls](ferric-async-syscalls.md) designs the
+next extension (planned): more opcodes, kernel service points that take
+entries without `Enter`, and an `async` Rust runtime.
+
 Registered-buffer grants as SQE buffers, polled (`SqPoll`) and `UMWAIT`
 notification, and rings served natively by user schemes come later (see the design in
 `io/rings-design.md` in the project files). Their flags and modes already
@@ -1916,7 +1920,12 @@ netstack.
   the null namespace, which each network driver's event loop watches next to
   the scheme socket (`NetworkScheme::wake_handle`). Asking
   from the request loop deadlocked the two whenever netstack was in a read
-  (#323). The netstack
+  (#323). `NetworkScheme::new` makes the scheme socket and the pipe before it
+  initialises the adapter; if either, or the scheme registration, fails it
+  returns a `NetworkSchemeError` rather than panicking, and every network
+  driver logs that error with its full source chain
+  (`common::exit_with_error`) and exits without reporting readiness to init
+  (#325). The netstack
   socket must be bound to one address: one bound to `0.0.0.0` (or `::`) is
   refused with `EINVAL` (`OwnError::UnspecifiedAddress`), since owning a port
   on every address would let the socket send from any source address. So an

@@ -34,6 +34,8 @@ From Linux, the command-line installer in this repository can write a configurat
 cargo build --release -p redox_installer --features installer
 ```
 
+Then pass it a filesystem configuration and the disk or image to write, for example `target/release/redox_installer --config config/desktop.toml --cookbook . disk.img` from a checkout whose `repo/<target>/` holds the built packages (the installer refuses to install configured packages without `--cookbook`). `redox_installer --help` lists the options; the [installer README](https://github.com/rexlunae/ferric-oxide/blob/main/tools/installer/README.md#command-line) describes how they are parsed.
+
 The GUI installer is not part of this repository yet. Its recipe (`installer-gui`) builds it from Redox's installer source for the target system. It uses `libcosmic`, so on Linux it only works under Wayland.
 
 Depending on where you install, you may need to run the installer with `sudo`.

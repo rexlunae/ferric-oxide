@@ -68,9 +68,6 @@ A scheme decides who may change one of its files' owner, group, mode or times.
   are not checked. `ferric_abi::time::TimeChange` reads the `UTIME_NOW` and
   `UTIME_OMIT` sentinels, so neither is stored as a time.
 
-`ramfs` also refuses `ftruncate` through a descriptor not opened for writing
-(`EBADF`), since the kernel does not check the descriptor's access mode.
-
 The kernel checks `fchown` first: a caller other than root may name only its own
 effective IDs, or `-1` to keep one (`crates/kernel/src/scheme/chown.rs`). Schemes
 learn only the caller's effective user and group, not its supplementary groups,
@@ -85,6 +82,13 @@ one asks procmgr for the pid's credentials through its
 does for `fchmod` and `futimens`. The
 [`ferric-owner-test`](./ferric-testing.md#ramfs-ownership-changes) regression
 checks `ramfs` as root and as user 1000.
+
+The kernel passes each `read` and `write` the descriptor's open flags but does
+not check its access mode itself, so `ramfs` refuses a `read` through a
+descriptor not opened for reading and a `write` through one not opened for
+writing, with `EBADF` (#400). `ftruncate` arrives without the flags, so each
+`ramfs` inode handle keeps the access mode it was opened with, and `ftruncate`
+through one not opened for writing is refused with `EBADF` too (#375).
 
 ## Hardware mitigations
 

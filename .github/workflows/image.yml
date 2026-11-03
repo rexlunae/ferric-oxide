@@ -478,10 +478,11 @@ jobs:
             echo "::notice::$line"
           done
       # ramfs refuses a non-owner's fchown and fchmod and applies the owner's (#246), and
-      # applies the POSIX futimens rules and refuses ftruncate on a read-only descriptor (#375).
+      # applies the POSIX futimens rules and refuses ftruncate on a read-only descriptor (#375),
+      # and refuses a write through a read-only descriptor (#400).
       - name: Check ramfs ownership changes
         run: |
-          for step in refused allowed times-refused times-allowed truncate; do
+          for step in refused allowed times-refused times-allowed truncate write; do
             grep -aF "FERRIC_TEST_PASS owner-$step" "$LOG"
           done
 
