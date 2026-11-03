@@ -30,7 +30,8 @@ Rustdoc with `RUSTDOCFLAGS="-D warnings"`. Its selected-package Clippy check use
 `--no-deps` because imported host tools still have upstream lint warnings,
 including when they are dependencies of a Ferric integration test. It separately
 runs `cargo test --locked --lib` in
-`userspace/redoxfs/`; that is not covered by the root workspace test. Its `ext4d`
+`userspace/redoxfs/`, which includes the host tests of the scheme's mapping
+buffers (`src/fmap/tests.rs`); that is not covered by the root workspace test. Its `ext4d`
 job tests `userspace/ext4d/` twice, on the committed ext4 images in
 `tests/fixtures/` and on ones `make-fixtures.sh` builds with the runner's
 e2fsprogs (`EXT4D_FIXTURES`); the generator fixes tested permissions and ownership
@@ -604,7 +605,7 @@ Read the lines in pairs as well as one at a time:
 - The `mmap` lines split the work differently on Redox and on Linux, so compare
   their sum across systems. On Redox, RedoxFS reads the file into a buffer of its
   own on the first mapping (the untimed warm-up) and keeps it while the file is
-  unchanged, and the kernel maps every page of a private file mapping
+  open and unchanged (it frees it once no description or mapping uses the file), and the kernel maps every page of a private file mapping
   copy-on-write from that buffer before `mmap` returns: a timed `mmap-map` is a
   request to RedoxFS plus mapping 8192 pages, `mmap-touch` takes no page faults
   (only TLB misses), and `mmap-unmap` removes the 8192 pages. On Linux, `mmap`
