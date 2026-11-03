@@ -281,6 +281,18 @@ after new mappings (`TlbShootdownActions::NEW_MAPPING` in
 `context/memory.rs`). Remaps, permission changes and unmaps flush on every
 architecture.
 
+A user page fault on a page whose present entry already permits the access is
+spurious: another CPU resolved it while this one waited for the address-space
+lock, or this CPU still uses an older translation (an AArch64 walk that has not
+yet seen the new descriptor, or a RISC-V hart caching the invalid entry). The
+fault handler then only invalidates the page on the faulting CPU, for every
+grant provider. It does not take another frame reference for a borrowed
+(`External`) grant or send another fmap request to the scheme for an
+`FmapBorrowed` grant. A write to an `External` page whose entry is still read-only
+after `mprotect` added `PROT_WRITE` reuses the frame already mapped, which
+holds its reference. The decision is in `context/fault_access.rs`. AArch64 and
+RISC-V still keep the new-mapping shootdown described above.
+
 A shootdown round invalidates only the pages it changed when there are at most
 32 of them (`TLB_SINGLE_PAGE_FLUSH_CEILING` in `memory/tlb.rs`); a larger round
 flushes the whole TLB. The flushing CPU invalidates the pages itself (`invlpg`,

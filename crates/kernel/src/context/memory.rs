@@ -3113,11 +3113,16 @@ impl Drop for Table {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AccessMode {
-    Read,
-    Write,
-    InstrFetch,
+pub use super::fault_access::AccessMode;
+use super::fault_access::{self, PtePermissions};
+
+/// The user permissions of a present entry, as [`fault_access`] classifies them.
+fn pte_permissions(flags: PageFlags<RmmA>) -> PtePermissions {
+    PtePermissions {
+        user: flags.has_user(),
+        write: flags.has_write(),
+        execute: flags.has_execute(),
+    }
 }
 
 #[derive(Debug)]
@@ -3287,14 +3292,30 @@ fn correct_inner<'l>(
         _ => (),
     }
 
+    let present = addr_space
+        .table
+        .utable
+        .translate(faulting_page.start_address());
+
+    // The entry may already permit the access: another CPU corrected it while this one waited for
+    // the lock, or this CPU still caches an older translation. Asking the provider again would
+    // take a second page reference (`External`) or send another fmap request (`FmapBorrowed`),
+    // so only the local translation is invalidated.
+    if fault_access::is_spurious(access, present.map(|(_, flags)| pte_permissions(flags)))
+        && let Some((phys, _)) = present
+    {
+        drop(flusher);
+        return Ok((
+            Frame::containing(phys),
+            PageFlush::new(faulting_page.start_address()),
+            addr_space,
+        ));
+    }
+
     // By now, the memory at the faulting page is actually valid, but simply not yet mapped, either
     // at all, or with the required flags.
 
-    let faulting_frame_opt = addr_space
-        .table
-        .utable
-        .translate(faulting_page.start_address())
-        .map(|(phys, _page_flags)| Frame::containing(phys));
+    let faulting_frame_opt = present.map(|(phys, _page_flags)| Frame::containing(phys));
     let faulting_pageinfo_opt = faulting_frame_opt.map(|frame| (frame, get_page_info(frame)));
 
     // TODO: Aligned readahead? AMD Zen3+ CPUs can smash 4 4k pages that are 16k-aligned, into a
@@ -3341,8 +3362,8 @@ fn correct_inner<'l>(
             match faulting_pageinfo_opt {
                 Some((_, None)) => unreachable!("allocated page needs frame to be valid"),
 
-                // TODO: Can this match arm even be reached? In other words, can the TLB cache
-                // remember that pages are not present?
+                // The entry is present but lacks a permission the grant allows; spurious faults
+                // returned above.
                 Some((frame, Some(page_info))) => {
                     // Keep in mind that allow_writable must always be true if this code is reached
                     // for AllocatedShared, since shared pages cannot be mapped lazily (without
@@ -3364,6 +3385,13 @@ fn correct_inner<'l>(
             }
         }
         Provider::PhysBorrowed { base } => base.next_by(pages_from_grant_start),
+        // The page already holds the reference taken when it was mapped, and only lacks a
+        // permission `Grant::remap` left to be added here (a write after `mprotect`). Borrowing
+        // the source page again would leak a second reference.
+        Provider::External { .. } if let Some((frame, page_info)) = faulting_pageinfo_opt => {
+            allow_writable = page_info.is_none_or(PageInfo::allows_writable);
+            frame
+        }
         Provider::External {
             address_space: ref foreign_address_space,
             src_base,
@@ -3855,13 +3883,12 @@ impl GenericFlusher for Flusher<'_> {
         // `MAP_FIXED` has unmapped and flushed the old one, or a page `translate` just found
         // unmapped), and queues remaps and frees with their own actions.
         //
-        // This matters because a spurious fault is not harmless everywhere: `correct_inner`
-        // remaps an already-present page idempotently for `Allocated`, `AllocatedShared` and
-        // `PhysBorrowed` grants, but takes an extra page reference for `External` and asks the
-        // scheme again for `FmapBorrowed`. AArch64 does not cache invalid descriptors either, but
-        // without a DSB and a context synchronization on the other PEs a walk can still see the
-        // old invalid entry; RISC-V lets harts cache invalid PTEs until an SFENCE.VMA. Both keep
-        // the shootdown.
+        // Elsewhere a remote CPU can still fault on the new page: AArch64 does not cache invalid
+        // descriptors either, but without a DSB and a context synchronization on the other PEs a
+        // walk can still see the old invalid entry; RISC-V lets harts cache invalid PTEs until an
+        // SFENCE.VMA. `correct_inner` resolves such a spurious fault with a local invalidation
+        // for every grant provider (see `context::fault_access`), so these architectures could
+        // drop the shootdown as well; they keep it until that is validated on hardware.
         let new_mapping = actions.contains(TlbShootdownActions::NEW_MAPPING);
         let actions = actions & !TlbShootdownActions::NEW_MAPPING;
         if cfg!(any(target_arch = "x86", target_arch = "x86_64"))

@@ -1414,6 +1414,16 @@ and exactly one EOI are checked too. These callbacks test dispatch/order, not
 TLB hardware; the profile-image boot remains the on-target regression, and
 profiling plus CET shadow-stack teardown still needs hardware validation.
 
+### Spurious page-fault classification
+
+The kernel helper suite includes `context/fault_access.rs` directly. It checks
+which present-entry permissions make a read, write or instruction-fetch fault
+spurious, so the fault handler only invalidates the local translation instead
+of asking the grant's provider again. A missing or supervisor-only entry, a
+write to a read-only entry and a fetch from a non-executable entry are not
+spurious. The tests do not take page faults or exercise the providers; image
+boots cover the fault path.
+
 ### Lazy file-mapping reply protocol
 
 The kernel helper suite includes `context/fmap_reply.rs` directly. It covers
