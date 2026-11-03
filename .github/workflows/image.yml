@@ -165,7 +165,7 @@ jobs:
       - name: Build image
         run: |
           # Log downloads are not always available to reviewers, so a failed build also
-          # reports the end of its log as one annotation.
+          # reports its error lines, with a few lines of context, as one annotation.
           set -o pipefail
           # The image above enables [drivers] rtl8125, which ferric-config reports as
           # FERRIC_BASE_DRIVERS. base builds the daemon and installs its PCI match only
@@ -180,9 +180,7 @@ jobs:
               ;;
           esac
           if ! make all CONFIG_NAME="$CONFIG_NAME" 2>&1 | tee "$RUNNER_TEMP/build.log"; then
-            tail -n 80 "$RUNNER_TEMP/build.log" \
-              | sed -e 's/%/%25/g' -e 's/\r//g' \
-              | awk 'BEGIN { printf "::error title=Build image failed::" } { printf "%s%%0A", $0 } END { print "" }'
+            bash scripts/ferric-ci/annotate-build-errors.sh "$RUNNER_TEMP/build.log" "Build image failed"
             exit 1
           fi
 

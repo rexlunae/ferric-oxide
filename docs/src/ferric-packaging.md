@@ -532,7 +532,11 @@ no reqwest or tokio in the tree.
 - **Certificates.** Server certificates are checked against the system
   store through `rustls-platform-verifier`. On the target that is
   `/etc/ssl/certs`, from the `ca-certificates` package; `SSL_CERT_FILE`
-  and `SSL_CERT_DIR` override it.
+  and `SSL_CERT_DIR` override it. That package is Mozilla's CA bundle,
+  taken from a pinned and BLAKE3-checked certifi release by
+  `recipes/data/ca-certificates`: `ca-certificates.crt`, one PEM file per
+  certificate and OpenSSL hash links. The smoke images build it from
+  source even with `REPO_BINARY`.
 - **Proxies.** `HTTPS_PROXY`, `ALL_PROXY`, `HTTP_PROXY` and `NO_PROXY` are
   honored.
 - **Redirects.** Git requests do not follow redirects: a moved repository
