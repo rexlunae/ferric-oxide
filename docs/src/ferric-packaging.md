@@ -248,7 +248,8 @@ default remote, and it uses one only when both settings are given, in the
 | `remote_key` | `COOKBOOK_REMOTE_KEY` | Public key file (`pkgar-keys` format) that must have signed every package from the remote |
 
 Without a remote, or when its index cannot be fetched, `binary` recipes,
-and those the index does not list, are built from source with their build
+and those whose packages the index does not all list (the main package
+and every optional package, such as `<name>.dev`), are built from source with their build
 and dev dependencies (such as `host:python312` for `xcb-proto`), and the
 cookbook says why once. A remote without a
 key is refused: nothing from a remote is unpacked unless a key pinned on
