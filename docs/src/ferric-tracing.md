@@ -1977,10 +1977,14 @@ differences of `off` against `out` spread from -7% to +8%, or from -24% to
 +7%, around a true difference well under the 1% budget (issue
 [#340](https://github.com/rexlunae/ferric-oxide/issues/340)), so the median of
 ten pairs lands over the budget by chance. Each median therefore comes with
-distribution-free 95% confidence bounds from the sign test: with *n* pairs,
-the *k*-th smallest and *k*-th largest differences, for the largest *k* with
+distribution-free one-sided bounds from the sign test
+(`scripts/ferric-ci/sign-test.awk`): with *n* pairs, the *k*-th smallest
+difference is a lower bound on the true median paired difference and the
+*k*-th largest an upper bound, for the largest *k* with
 P(Binomial(*n*, 1/2) < *k*) at most 5% (*k* = 2 for 10 pairs, 6 for 20, 11 for
-30). The sign test only assumes that the pairs are independent; it does not
+30, for a single look). Each bound alone holds with 95% confidence; together
+they form a 90% interval. Only the lower bound decides; the upper one shows the
+spread. The sign test only assumes that the pairs are independent; it does not
 assume the differences are normal or symmetric, which they are not, since a
 stall only ever slows a boot down. Each budgeted comparison has one of three
 outcomes:
@@ -1988,7 +1992,7 @@ outcomes:
 | Outcome | When | Effect |
 | --- | --- | --- |
 | pass | the median paired difference is within the budget | none |
-| fail | the 95% lower bound is over the budget, so the runner's noise cannot explain the regression | an error naming the median and the bound; the job fails |
+| fail | the one-sided 95% lower bound is over the budget, so the runner's noise cannot explain the regression | an error naming the median and the bound; the job fails |
 | inconclusive | the median is over the budget but the lower bound is not: the runner's noise is larger than the budget | a warning with the bounds; the job boots more pairs |
 
 The script exits 0, 1 or 3 for the three outcomes (2 for a usage error). On 3
@@ -2003,12 +2007,28 @@ warning says so instead of failing unrelated pull requests or passing in
 silence. Fewer than five pairs give no 95% bound, so with them a median over
 the budget is always inconclusive.
 
+Judging the same growing set of pairs again raises the chance of a false
+failure: with every look at 95%, a change exactly on the budget would fail at
+one of the looks at 10, 15, 20, 25 and 30 pairs 6.6% of the time. The job
+therefore passes the pair counts it may judge at in `TRACE_OVERHEAD_LOOKS`,
+and `sign-test.awk` gives every look the same stricter level, the largest one
+for which the exact chance of a false lower bound at any look is at most 5%.
+It computes that chance by dynamic programming over the number of pairs at or
+below the true median, a fair binomial walk when the median is on the budget
+(4.7% for the job's looks; *k* = 10 instead of 11 at 30 pairs, the other
+looks unchanged). Stopping early on a pass only lowers it. Without
+`TRACE_OVERHEAD_LOOKS` the current pair count is the only look, and a pair
+count not in the list is a usage error.
+
 The script's regression test, `scripts/ferric-ci/test-check-trace-overhead.sh`,
 replays the per-boot results of a recorded noisy job, with stalls and a change
 of load added, and a real regression on the same noise. It also replays the
 paired differences quoted in issue #340 (inconclusive), the same differences
 with a 6% regression added (fails), more pairs narrowing an inconclusive
-result into a failure, and too few pairs for a bound.
+result into a failure, and too few pairs for a bound. For repeated looks it
+checks the per-look *k* and the exact overall rate, simulates the job's
+stopping rule on null-distributed sign sequences (under 5% adjusted, over 5%
+without the adjustment) and checks that the planned looks change a verdict.
 
 Every boot's bench and trace result lines go into a few workflow annotations
 per image (GitHub keeps ten notices per step and 4 KiB of each). A boot that

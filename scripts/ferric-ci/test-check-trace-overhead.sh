@@ -156,11 +156,11 @@ off_from_out() {
 # job cannot tell, and says so instead of passing or failing (exit 3).
 recorded | logs recorded
 expect recorded 3
-grep -qF "on 2.690% vs pairoff (median of pairs, 95% bounds +2.301% to +3.441%" "$work/output" ||
+grep -qF "on 2.690% vs pairoff (median of pairs, one-sided 95% bounds +2.301% and +3.441%;" "$work/output" ||
     fail recorded "io on paired median and bounds"
-grep -qF "off 4.780% vs out (median of pairs, 95% bounds -2.874% to +21.792%" "$work/output" ||
+grep -qF "off 4.780% vs out (median of pairs, one-sided 95% bounds -2.874% and +21.792%;" "$work/output" ||
     fail recorded "syscall off paired median and bounds"
-grep -qF "::warning title=trace overhead inconclusive::syscall off vs out: the median of 10 pairs, +4.780%, is over the 1% budget, but runner noise exceeds the budget: its 95% bounds are -2.874% to +21.792%" \
+grep -qF "::warning title=trace overhead inconclusive::syscall off vs out: the median of 10 pairs, +4.780%, is over the 1% budget, but runner noise exceeds the budget: its one-sided 95% lower bound is -2.874% (upper +21.792%)" \
     "$work/output" || fail recorded "inconclusive warning"
 ! grep -q "::error" "$work/output" || fail recorded "an inconclusive result failed"
 grep -qF "::warning title=trace overhead::356168 records were dropped" "$work/output" ||
@@ -189,7 +189,7 @@ echo "PASS: recorded noise with stalls and a load change"
 # 4. A real regression on the same noise fails, with the median and every pair.
 recorded | off_from_out 1.03 | logs regressed
 expect regressed 1
-grep -qF "compiled in but off is 3.000% slower than compiled out, as the median of paired boots (budget 1%), and its 95% lower bound, +3.000%, is over the budget too" \
+grep -qF "compiled in but off is 3.000% slower than compiled out, as the median of paired boots (budget 1%), and its one-sided 95% lower bound, +3.000%, is over the budget too" \
     "$work/output" || fail regressed "error message"
 grep -qF "each pair +3.00 +3.00" "$work/output" || fail regressed "per-pair list"
 echo "PASS: 3% regression"
@@ -246,7 +246,7 @@ from_pairs() {
 pr374="-4.35 5.33 6.56 7.08 0.49 -2.24 -6.43 7.77 -2.77 4.29"
 printf '%s 2\n' $pr374 | from_pairs | logs pr374
 expect pr374 3
-grep -qF "off 2.390% vs out (median of pairs, 95% bounds -4.350% to +7.080%" "$work/output" ||
+grep -qF "off 2.390% vs out (median of pairs, one-sided 95% bounds -4.350% and +7.080%;" "$work/output" ||
     fail pr374 "median and bounds"
 grep -qF "::warning title=trace overhead inconclusive::syscall off vs out: the median of 10 pairs, +2.390%, is over the 1% budget" \
     "$work/output" || fail pr374 "inconclusive warning"
@@ -258,7 +258,7 @@ echo "PASS: PR #374's noise is inconclusive"
 for d in $pr374; do awk -v d="$d" 'BEGIN { printf "%.2f 2\n", d + 6 }'; done | from_pairs |
     logs pr374-regressed
 expect pr374-regressed 1
-grep -qF "compiled in but off is 8.390% slower than compiled out, as the median of paired boots (budget 1%), and its 95% lower bound, +1.650%, is over the budget too" \
+grep -qF "compiled in but off is 8.390% slower than compiled out, as the median of paired boots (budget 1%), and its one-sided 95% lower bound, +1.650%, is over the budget too" \
     "$work/output" || fail pr374-regressed "error message"
 echo "PASS: a 6% regression on PR #374's noise fails"
 
@@ -269,9 +269,9 @@ echo "PASS: a 6% regression on PR #374's noise fails"
 paste -d ' ' <(printf '%s\n' -23.97 -3.10 -1.20 0.40 1.50 1.876 2.90 4.10 5.50 7.36) \
     <(printf '%s\n' 3.07 3.30 3.45 3.52 3.59 3.59 3.70 3.90 4.10 4.43) | from_pairs | logs pr381
 expect pr381 3
-grep -qF "off 1.688% vs out (median of pairs, 95% bounds -3.100% to +5.500%" "$work/output" ||
+grep -qF "off 1.688% vs out (median of pairs, one-sided 95% bounds -3.100% and +5.500%;" "$work/output" ||
     fail pr381 "syscall median and bounds"
-grep -qF "on 3.590% vs pairoff (median of pairs, 95% bounds +3.300% to +4.100%" "$work/output" ||
+grep -qF "on 3.590% vs pairoff (median of pairs, one-sided 95% bounds +3.300% and +4.100%;" "$work/output" ||
     fail pr381 "io on median and bounds"
 ! grep -q "io on vs pairoff" "$work/output" || fail pr381 "io on was not a pass"
 echo "PASS: PR #381's noise is inconclusive, its io on passes"
@@ -283,14 +283,70 @@ from_pairs < "$work/pr374-2" | logs ten
 expect ten 3
 printf '%s 2\n' 1.2 1.4 1.5 1.6 1.8 2.0 2.2 2.4 2.6 3.0 | cat "$work/pr374-2" - | from_pairs | logs twenty
 expect twenty 1
-grep -qF "95% lower bound, +1.400%, is over the budget too" "$work/output" || fail twenty "k = 6 bound"
+grep -qF "one-sided 95% lower bound, +1.400%, is over the budget too" "$work/output" || fail twenty "k = 6 bound"
 echo "PASS: more pairs narrow the bounds"
 
 # 12. Fewer than five pairs give no 95% bound, so over the budget they are inconclusive
 # however large the difference; five identical pairs (k = 1) are enough to fail.
 printf '3 2\n3 2\n3 2\n3 2\n' | from_pairs | logs four
 expect four 3
-grep -qF "its 95% bounds are none to none" "$work/output" || fail four "no bound"
+grep -qF "its one-sided 95% lower bound is none (upper none)" "$work/output" || fail four "no bound"
 printf '3 2\n3 2\n3 2\n3 2\n3 2\n' | from_pairs | logs five
 expect five 1
 echo "PASS: too few pairs for a bound"
+
+# 13. Repeated looks (issue #340 review): image.yml judges the same growing set of pairs at
+# 10, 15, 20, 25 and 30 pairs. With each look at 95% the chance that some look fails a
+# change exactly on the budget is about 6.6%; with TRACE_OVERHEAD_LOOKS every look uses the
+# stricter level that keeps the overall chance at or under 5% (k = 10 at 30 pairs, not 11).
+signtest="$(cd "$(dirname "$0")" && pwd)/sign-test.awk"
+looks="10 15 20 25 30"
+[ "$(awk -v mode=k -v looks="$looks" -f "$signtest" /dev/null | tr '\n' ' ')" = "10 2 15 4 20 6 25 8 30 10 " ] ||
+    fail looks "per-look k"
+single=""
+for n in $looks; do single="$single $(awk -v mode=k -v looks="$n" -f "$signtest" /dev/null | cut -d ' ' -f 2)"; done
+[ "$single" = " 2 4 6 8 11" ] || fail looks "single-look k: $single"
+read -r level adjusted unadjusted < <(awk -v mode=rate -v looks="$looks" -f "$signtest" /dev/null)
+awk -v a="$adjusted" -v u="$unadjusted" -v l="$level" 'BEGIN { exit !(a <= 0.05 && u > 0.05 && l < 0.05) }' ||
+    fail looks "exact rates: level $level, adjusted $adjusted, unadjusted $unadjusted"
+echo "PASS: per-look level for repeated looks (overall $adjusted, unadjusted $unadjusted)"
+
+# 14. The job's stopping rule on null-distributed sign sequences, simulated independently of
+# sign-test.awk's dynamic programming: each pair is at or below the true median (the
+# budget) with probability 1/2; a look fails when fewer than its k pairs are, and stops
+# (passes) when the median is within budget, taken conservatively as more than half the
+# pairs at or below. The false-failure rate must stay at or under 5% (three standard errors
+# of slack), and the unadjusted per-look k must exceed it.
+simulate() {
+    awk -v ks="$1" -v looks="$looks" 'BEGIN {
+        srand(340); trials = 200000
+        m = split(looks, n, " "); split(ks, k, " ")
+        for (t = 0; t < trials; t++) {
+            below = 0; done = 0
+            for (j = 1; j <= m && !done; j++) {
+                for (i = (j > 1 ? n[j - 1] : 0); i < n[j]; i++) if (rand() < 0.5) below++
+                if (below < k[j]) { fails++; done = 1 }
+                else if (2 * below > n[j]) done = 1
+            }
+        }
+        printf "%.5f\n", fails / trials
+    }'
+}
+adjusted_mc="$(simulate "2 4 6 8 10")"
+unadjusted_mc="$(simulate "2 4 6 8 11")"
+awk -v a="$adjusted_mc" -v u="$unadjusted_mc" 'BEGIN { exit !(a <= 0.05 + 3 * 0.00049 && u > 0.05 + 3 * 0.00049) }' ||
+    fail stopping "simulated false failures: adjusted $adjusted_mc, unadjusted $unadjusted_mc"
+echo "PASS: stopping rule on null sign sequences (adjusted $adjusted_mc, unadjusted $unadjusted_mc)"
+
+# 15. The checker uses the planned looks: thirty pairs whose 10th smallest difference is
+# within the 1% budget and 11th is over fail as a single look but are inconclusive as the
+# last of the job's looks. A pair count that is not a planned look is a usage error.
+{ for i in $(seq 10); do echo "0.5 2"; done; for i in $(seq 20); do echo "3 2"; done; } | from_pairs | logs thirty
+expect thirty 1
+TRACE_OVERHEAD_LOOKS="$looks" expect thirty 3
+grep -qF "its one-sided 95% lower bound is +0.500% (upper +3.000% over looks at $looks pairs)" "$work/output" ||
+    fail thirty "looks note"
+printf '%s 2\n' $pr374 | from_pairs | logs pr374
+TRACE_OVERHEAD_LOOKS="15 20" expect pr374 2
+grep -qF "10 pairs is not one of TRACE_OVERHEAD_LOOKS (15 20)" "$work/output" || fail pr374 "looks usage"
+echo "PASS: planned looks"

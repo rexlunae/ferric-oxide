@@ -20,13 +20,23 @@
 #   "on" vs "pairoff" pairs the two states of one boot, whose rounds alternate.
 # The median of the paired differences keeps one unlucky pair (a stall that
 # hit one boot of it) from deciding. Each median comes with distribution-free
-# 95% confidence bounds from the sign test: with n pairs, the k-th smallest
-# and k-th largest differences, for the largest k with P(Binomial(n, 1/2) < k)
-# at most 5%, bound the true median paired difference from below and above
-# with at least 95% confidence each (for 10 pairs k is 2; for 20, 6). The sign
-# test assumes only that the pairs are independent, not that the differences
-# are normal or symmetric: a stall only ever slows one boot down. A judged
-# comparison has three outcomes:
+# one-sided bounds from the sign test (sign-test.awk): with n pairs, the k-th
+# smallest difference is a lower bound on the true median paired difference,
+# and the k-th largest an upper one. The sign test assumes only that the pairs
+# are independent, not that the differences are normal or symmetric: a stall
+# only ever slows one boot down. Only the lower bound decides; the upper one
+# shows the spread. Each bound alone holds with 95% confidence (together they
+# form a 90% interval).
+#
+# When the job may judge the same growing set of pairs several times (image.yml
+# adds pairs while a comparison is inconclusive), TRACE_OVERHEAD_LOOKS lists the
+# pair counts at which it may run, ascending, such as "10 15 20 25 30". Every
+# look then uses the same stricter per-look level, chosen so that the chance of
+# a false failure over all the looks is at most 5%; without it the looks would
+# add up to about 6.6%. Without TRACE_OVERHEAD_LOOKS the current pair count is
+# the only look. A pair count not in the list is a usage error.
+#
+# A judged comparison has three outcomes:
 #   pass          the median is within the budget;
 #   fail          the lower bound is over the budget: a regression that the
 #                 runner's noise cannot explain;
@@ -48,7 +58,8 @@
 # reference.
 #
 # Exit status: 0 when every judged comparison passes, 1 when one fails or
-# results are missing, 2 for a usage error, and 3 when none fails but one is
+# results are missing, 2 for a usage error (including a pair count that is not
+# in TRACE_OVERHEAD_LOOKS), and 3 when none fails but one is
 # inconclusive.
 #
 # "off" and "out" run on two kernels built separately, so their
@@ -90,6 +101,17 @@ if [ "${#out_logs[@]}" -ne "${#in_logs[@]}" ]; then
     exit 2
 fi
 pairs="${#out_logs[@]}"
+here="$(cd "$(dirname "$0")" && pwd)"
+
+looks="${TRACE_OVERHEAD_LOOKS:-$pairs}"
+looks_note=""
+if [ "$looks" != "$pairs" ]; then
+    looks_note=" over looks at $looks pairs"
+fi
+if ! grep -qxF "$pairs" <(tr -s ' ' '\n' <<< "$looks"); then
+    echo "check-trace-overhead: $pairs pairs is not one of TRACE_OVERHEAD_LOOKS ($looks)" >&2
+    exit 2
+fi
 
 # Sets `result` to each log's first min_ns for WORKLOAD in STATE, one per line
 # in LOGS order, and `missing` to the logs that have no such line. `result` is
@@ -132,23 +154,14 @@ paired_pct() {
         | awk '{ printf "%.9f\n", ($1 / $2 - 1) * 100 }'
 }
 
-# The sign test's 95% lower and upper bounds on the median of the numbers on
-# standard input, one per line, unrounded and separated by a space; "none none"
-# when there are too few numbers for a 95% bound (fewer than 5). The bounds are
-# the k-th smallest and k-th largest numbers, for the largest k with
-# P(Binomial(n, 1/2) <= k - 1) <= 5%. The binomial terms are computed in log
-# space, so 2^n and the binomial coefficients cannot overflow for many pairs.
+# The sign test's lower and upper bounds on the median of the numbers on
+# standard input, one per line, for the planned looks, unrounded and separated
+# by a space; "none none" when there are too few numbers for a bound at the
+# level (see sign-test.awk).
 bounds() {
-    sort -g | awk '{ v[NR] = $1 } END {
-        n = NR; k = 0; logp = -n * log(2); cdf = 0
-        for (i = 0; i < n; i++) {
-            cdf += exp(logp)
-            if (cdf > 0.05) break
-            k = i + 1
-            logp += log(n - i) - log(i + 1)
-        }
-        if (k == 0) print "none none"; else printf "%.9f %.9f\n", v[k], v[n + 1 - k]
-    }'
+    local b
+    b="$(awk -v looks="$looks" -f "$here/sign-test.awk")"
+    echo "${b#* }"
 }
 
 # True when PCT is more than BUDGET percent. It compares unrounded values: the
@@ -159,14 +172,14 @@ over_budget() {
     [ "$1" != none ] && awk -v pct="$1" -v b="$2" 'BEGIN { exit !(pct > b) }'
 }
 
-# A bound for the summary: "+1.234%", or "none" when there is no 95% bound.
+# A bound for the summary: "+1.234%", or "none" when there is no bound.
 shown() {
     if [ "$1" = none ]; then echo none; else awk -v v="$1" 'BEGIN { printf "%+.3f%%\n", v }'; fi
 }
 
 # Judges the paired differences DIFFS (one per line) against BUDGET percent and
 # sets `verdict` to pass, fail or inconclusive, `median_pct` to their unrounded
-# median and `low` and `high` to their 95% bounds (see `bounds`).
+# median and `low` and `high` to its bounds (see `bounds`).
 judge() {
     local diffs="$1" budget="$2" b
     median_pct="$(median %.9f <<< "$diffs")"
@@ -185,7 +198,7 @@ judge() {
 # The sentence that reports an inconclusive comparison NAME (median MEDIAN,
 # bounds LOW and HIGH, BUDGET percent).
 inconclusive_text() {
-    echo "$1: the median of $pairs pairs, $(shown "$2"), is over the $5% budget, but runner noise exceeds the budget: its 95% bounds are $(shown "$3") to $(shown "$4"), so the lower bound is not over the budget and the overhead cannot be judged on this runner (not failed; more pairs narrow the bounds)"
+    echo "$1: the median of $pairs pairs, $(shown "$2"), is over the $5% budget, but runner noise exceeds the budget: its one-sided 95% lower bound is $(shown "$3") (upper $(shown "$4")$looks_note), so it is not over the budget and the overhead cannot be judged on this runner (not failed; more pairs narrow the bounds)"
 }
 
 # The paired differences, rounded for the summary: "+0.123 -0.456 ...".
@@ -219,7 +232,7 @@ for workload in io syscall; do
     on_pct="$(median <<< "$on_pairs")"
     off_bounds="$(bounds <<< "$off_pairs")"
     on_bounds="$(bounds <<< "$on_pairs")"
-    summary="$workload ($pairs pairs of boots' fastest rounds): off ${off_pct}% vs out (median of pairs, 95% bounds $(shown "${off_bounds% *}") to $(shown "${off_bounds#* }"); each pair $(listed "$off_pairs")), on ${on_pct}% vs pairoff (median of pairs, 95% bounds $(shown "${on_bounds% *}") to $(shown "${on_bounds#* }"); each boot $(listed "$on_pairs")); medians over boots: out $(median <<< "$out") ns, off $(median <<< "$off") ns, pairoff $(median <<< "$pairoff") ns, on $(median <<< "$on") ns"
+    summary="$workload ($pairs pairs of boots' fastest rounds): off ${off_pct}% vs out (median of pairs, one-sided 95% bounds $(shown "${off_bounds% *}") and $(shown "${off_bounds#* }")$looks_note; each pair $(listed "$off_pairs")), on ${on_pct}% vs pairoff (median of pairs, one-sided 95% bounds $(shown "${on_bounds% *}") and $(shown "${on_bounds#* }")$looks_note; each boot $(listed "$on_pairs")); medians over boots: out $(median <<< "$out") ns, off $(median <<< "$off") ns, pairoff $(median <<< "$pairoff") ns, on $(median <<< "$on") ns"
     echo "$summary"
     echo "::notice title=trace overhead ($workload)::$summary"
     case "$workload" in
@@ -238,7 +251,7 @@ for workload in io syscall; do
     esac
     case "$verdict" in
         fail)
-            echo "::error title=trace overhead::$failure, and its 95% lower bound, $(shown "$low"), is over the budget too: $summary"
+            echo "::error title=trace overhead::$failure, and its one-sided 95% lower bound, $(shown "$low")$looks_note, is over the budget too: $summary"
             status=1
             ;;
         inconclusive)

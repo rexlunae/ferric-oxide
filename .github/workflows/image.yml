@@ -837,7 +837,12 @@ jobs:
           # noise leaves a comparison inconclusive (exit 3: the median is over budget but its
           # 95% lower bound is not), boot more pairs, which narrow the bounds, up to
           # BENCH_MAX_BOOTS. An inconclusive result after that is a warning, not a failure;
-          # a lower bound over the budget fails at any point.
+          # a lower bound over the budget fails at any point. The check is told every pair
+          # count it may be run at, so that the lower bounds of all the looks together, not
+          # each alone, hold at 95%.
+          looks="$(seq "$BENCH_BOOTS" "$BENCH_EXTRA_BOOTS" "$BENCH_MAX_BOOTS" | tr '\n' ' ')"
+          case " $looks" in *" $BENCH_MAX_BOOTS ") ;; *) looks="$looks$BENCH_MAX_BOOTS" ;; esac
+          export TRACE_OVERHEAD_LOOKS="${looks% }"
           runs="$BENCH_BOOTS"
           while :; do
             status=0
