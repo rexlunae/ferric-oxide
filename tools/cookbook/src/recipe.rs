@@ -244,8 +244,9 @@ pub struct CookRecipe {
     /// If false, it's listed on install config
     pub is_deps: bool,
     pub rule: String,
-    /// whether if this recipe is pinned from cookbook.lock
-    pub pinned: bool,
+    /// The git revision `cookbook.lock` pins this recipe to, if any; see
+    /// [`CookRecipe::pin_rev`].
+    pub pinned_rev: Option<String>,
 }
 
 /// Where recipe `name`, built from `build`, runs as a build tool.
@@ -371,7 +372,7 @@ impl CookRecipe {
             target,
             is_deps: false,
             rule: "".into(),
-            pinned: false,
+            pinned_rev: None,
         })
     }
 
@@ -382,7 +383,7 @@ impl CookRecipe {
             name: name.clone(),
             recipe: Recipe::default(),
             target: redoxer::target(),
-            pinned: false,
+            pinned_rev: None,
             rule: "".into(),
         }
     }
@@ -566,14 +567,44 @@ impl CookRecipe {
     }
 
     /// reload self back to the recipe.toml, with preserving effect from `self.rule`
+    /// Rereads `recipe.toml`, applies the recipe's rule again and, for a
+    /// recipe `cookbook.lock` pins, its pinned revision, so a rule change
+    /// (such as a prebuilt falling back to `source`) takes effect on
+    /// pinned recipes too.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `recipe.toml` cannot be read or parsed.
     pub fn reload_recipe(&mut self) -> Result<(), PackageError> {
-        if self.pinned {
-            // TODO: print?
-            return Ok(());
-        }
         self.recipe = Self::from_path(&self.dir, true, self.name.is_host())?.recipe;
         let _ = self.apply_filesystem_config(&self.rule.clone());
+        self.apply_pinned_rev();
         Ok(())
+    }
+
+    /// Pins this recipe to the git revision `rev` from `cookbook.lock`, now
+    /// and after every [`reload_recipe`](Self::reload_recipe).
+    ///
+    /// Returns whether the recipe's current source is git, so the revision
+    /// was applied; a recipe whose rule drops its source (such as a
+    /// prebuilt) gets it once a reload gives it a git source again.
+    pub fn pin_rev(&mut self, rev: String) -> bool {
+        self.pinned_rev = Some(rev);
+        self.apply_pinned_rev()
+    }
+
+    fn apply_pinned_rev(&mut self) -> bool {
+        let Some(pinned) = &self.pinned_rev else {
+            return false;
+        };
+        match &mut self.recipe.source {
+            Some(SourceRecipe::Git { rev, branch, .. }) => {
+                *rev = Some(pinned.clone());
+                *branch = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// returns stage dir, pkgar file and toml file.
@@ -1184,6 +1215,51 @@ mod tests {
         assert_eq!(curl.rule, "binary");
         assert_eq!(curl.recipe.build.kind, BuildKind::Remote);
         assert!(curl.recipe.source.is_none());
+    }
+
+    #[test]
+    fn pinned_prebuilt_falling_back_to_source_builds_the_pinned_rev() {
+        use crate::recipe::{BuildKind, SourceRecipe};
+
+        let root = tempfile::tempdir().unwrap();
+        let mut recipe = write_recipe(
+            root.path(),
+            "ion",
+            "[source]\ngit = \"https://example.org/ion.git\"\nbranch = \"main\"\n\n[build]\ntemplate = \"cargo\"\n",
+        );
+        recipe.apply_filesystem_config("binary").unwrap();
+        assert!(!recipe.pin_rev("0123abcd".into()));
+        assert_eq!(recipe.recipe.build.kind, BuildKind::Remote);
+
+        recipe.rule = "source".into();
+        recipe.reload_recipe().unwrap();
+
+        assert!(matches!(recipe.recipe.build.kind, BuildKind::Cargo { .. }));
+        let Some(SourceRecipe::Git { rev, branch, .. }) = &recipe.recipe.source else {
+            panic!("expected a git source, got {:?}", recipe.recipe.source);
+        };
+        assert_eq!(rev.as_deref(), Some("0123abcd"));
+        assert_eq!(branch, &None);
+    }
+
+    #[test]
+    fn pinned_rev_survives_a_reload() {
+        use crate::recipe::SourceRecipe;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut recipe = write_recipe(
+            root.path(),
+            "ion",
+            "[source]\ngit = \"https://example.org/ion.git\"\nrev = \"ffff\"\n\n[build]\ntemplate = \"cargo\"\n",
+        );
+        recipe.apply_filesystem_config("source").unwrap();
+        assert!(recipe.pin_rev("0123abcd".into()));
+        recipe.reload_recipe().unwrap();
+
+        assert!(matches!(
+            &recipe.recipe.source,
+            Some(SourceRecipe::Git { rev: Some(rev), .. }) if rev == "0123abcd"
+        ));
     }
 
     #[test]
