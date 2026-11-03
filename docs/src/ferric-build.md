@@ -652,7 +652,9 @@ fetches from upstream Redox at build time.
 - Nothing in this repository syncs from upstream Redox. Recipes that fetch
   their own component trees from upstream Redox, and the prebuilt toolchain
   and package downloads from `static.redox-os.org`, are outside this list and
-  remain to be migrated.
+  remain to be migrated. `ca-certificates` has been: its recipe builds
+  Mozilla's CA bundle from a pinned certifi release on PyPI, and the smoke
+  configuration builds it from source.
 
 Device-tree parsing for the kernel and ARM64/RISC-V bootloader goes through
 `crates/devicetree/` (`ferric-devicetree`), which uses crates.io's

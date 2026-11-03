@@ -20,19 +20,20 @@ for arg in "$@"; do
     esac
 done
 
-# Programs recipes run while building from source, OpenSSL 3 headers for the
-# build-time Python (host:python312), NASM (x86-64 kernel)
+# Programs recipes run while building from source (the openssl command hashes
+# ca-certificates), OpenSSL 3 headers for the build-time Python (host:python312),
+# NASM (x86-64 kernel)
 # and QEMU with UEFI firmware (only to run the image).
 debian_packages=(
     clang git curl tar make nasm
     autoconf automake autopoint bison cmake flex m4 texinfo meson ninja-build
-    patch perl pkg-config python3 libssl-dev
+    patch perl pkg-config python3 openssl libssl-dev
     qemu-system-x86 qemu-system-arm qemu-efi-aarch64 ovmf
 )
 fedora_packages=(
     clang git curl tar make nasm
     autoconf automake gettext-devel bison cmake flex m4 texinfo meson ninja-build
-    patch perl pkgconf-pkg-config python3 openssl-devel
+    patch perl pkgconf-pkg-config python3 openssl openssl-devel
     qemu-system-x86 qemu-system-aarch64 edk2-ovmf edk2-aarch64
 )
 # Xcode Command Line Tools supply Clang, Git, Make, Perl, patch and Python 3.

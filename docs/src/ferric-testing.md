@@ -291,6 +291,7 @@ regressions. Record image/configuration details and every skipped check.
 | `scripts/ferric-ci/check-kernel-shstk.sh <kernel.all>` | Checks shadow-stack enable, context-switch and syscall alternatives, WRSS, and the #CP handler with IBT on/off |
 | `scripts/ferric-ci/check-trace-overhead.sh --out LOG... --in LOG...` | Compares `ferric-trace-bench` results from paired boots without and with `kernel.trace` (the Nth of each list is a pair) against the tracing overhead budget, on the median of the pairs' differences |
 | `scripts/ferric-ci/print-test-fails.sh LOG TITLE` | Prints each `FERRIC_TEST_FAIL` line of a console log with the 40 lines before it, in a log group, for steps that keep only a boot's last lines |
+| `scripts/ferric-ci/annotate-build-errors.sh LOG TITLE` | Prints one error annotation for a failed image build: the log's error lines (`cook … - failed`, `Failed to run`, `error:`/`error[E…]:` at a line start or after `file:line: `, `make: ***`) with the 5 lines before and 2 after each, within about 3.5 KiB; the log's last 40 lines when none match |
 
 The kernel workflow installs its declared nightly toolchain, `rust-src`,
 Clippy and `nasm` as needed. Use the kernel Makefile/custom target path;
@@ -469,6 +470,28 @@ toolchain remain available. Its log reports capacity before and after cleanup.
 Run `bash scripts/ferric-ci/test-prepare-image-runner.sh` for disposable-directory
 regressions covering environment guards, missing bindings, hidden/nested files
 and symlink targets; the tests mock mount discovery without touching host SDKs.
+
+The image, profiler-image and CET-image "Build image" steps keep `make all`'s
+output and, when it fails, report it with `annotate-build-errors.sh`. An
+annotation keeps only its first few KiB, so it carries the error lines with a
+little context, earliest first, rather than the end of the log, which is
+usually pages of strip and copy lines printed after the error. Colour codes are
+removed, and a progress bar redrawn with carriage returns keeps only what the
+terminal last showed.
+`scripts/ferric-ci/test-annotate-build-errors.sh` (host-tools CI) checks the
+excerpt, the merging of overlapping context, quoted source that only contains
+`error:`, the size budget, the fallback to the log's tail and the escaping of
+the title and message.
+
+The smoke configuration builds `ca-certificates` from source, so image builds do
+not download it from Redox's package server. Its recipe takes Mozilla's CA
+bundle from a pinned certifi release (checked by BLAKE3) and installs it with
+`recipes/data/ca-certificates/install-certs.sh`, which needs `openssl` on the
+build host. `scripts/ferric-ci/test-ca-certificates.sh` (host-tools CI) runs
+that script on generated bundles: each certificate is installed once with its
+current and pre-1.0 OpenSSL hash links and verifies through `-CApath`, and an
+empty bundle, a repeated certificate or a block that is not a certificate fails
+the build.
 
 `.github/workflows/image.yml` generates feature settings, forces KPTI on,
 enables IOMMU `auto`, shadow-stack policy `auto`, registered buffers,

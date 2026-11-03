@@ -18,6 +18,9 @@ redoxfs = "source"
 base = "source"
 # The recipe carries the dd short-output-write correction (#353).
 uutils = "source"
+# Mozilla's CA bundle from a pinned, checksummed certifi release, not Redox's package
+# server (#337).
+ca-certificates = "source"
 ferric-xstate-test = "source"
 ferric-aslr-test = "source"
 ferric-guard-test = "source"

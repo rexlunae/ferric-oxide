@@ -51,6 +51,7 @@ on:
       - "recipes/tests/ferric-trace-test/**"
       - "recipes/tests/ferric-xstate-test/**"
       - "recipes/tests/ferric-perf/**"
+      - "recipes/data/ca-certificates/**"
       - ".github/workflows/host-tools.yml"
       - ".gitmodules"
       - ".github/actions/prepare-cargo-git/**"
@@ -83,6 +84,10 @@ jobs:
         run: bash scripts/ferric-ci/test-ld-so-errors.sh
       - name: Failed-test log printer tests
         run: bash scripts/ferric-ci/test-print-test-fails.sh
+      - name: Build error annotation tests
+        run: bash scripts/ferric-ci/test-annotate-build-errors.sh
+      - name: CA certificate install tests
+        run: bash scripts/ferric-ci/test-ca-certificates.sh
       - name: Native toolchain regression tests
         run: bash scripts/ferric-ci/test-native-toolchain.sh
       - name: Build-tool manifest regression tests

@@ -97,7 +97,14 @@ jobs:
           echo "FERRIC_KERNEL_CONFIG=$out/kernel-config.toml" >> "$GITHUB_ENV"
 
       - name: Build image
-        run: make all CONFIG_NAME="$CONFIG_NAME"
+        run: |
+          # Log downloads are not always available to reviewers, so a failed build also
+          # reports its error lines, with a few lines of context, as one annotation.
+          set -o pipefail
+          if ! make all CONFIG_NAME="$CONFIG_NAME" 2>&1 | tee "$RUNNER_TEMP/build.log"; then
+            bash scripts/ferric-ci/annotate-build-errors.sh "$RUNNER_TEMP/build.log" "Build image failed"
+            exit 1
+          fi
 
       - name: Compress image
         run: zstd -T0 -10 "build/x86_64/$CONFIG_NAME/harddrive.img" -o harddrive.img.zst
