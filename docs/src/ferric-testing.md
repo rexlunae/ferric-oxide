@@ -1294,6 +1294,19 @@ an intervening flush cleans the recorded pages, then the hint writes just one
 later dirty run while a concurrent rewrite remains dirty. This pins the
 intentional start-hint semantics and the take-size work bound.
 
+### Network driver startup errors
+
+`cargo test --locked --manifest-path userspace/base/Cargo.toml -p driver-network
+-p common` covers how a network driver starts and reports failure. The
+`driver-network` tests drive the setup order behind `NetworkScheme::new` with
+injected failures: a socket or wake-pipe failure returns `Socket` or
+`WakePipe` without running the adapter initialiser, a registration failure
+returns `Register` naming the scheme, and on success the steps run as socket,
+wake pipe, adapter, registration. The `common` tests check that
+`error_chain` lists an error and every cause, outermost first, which is what
+`exit_with_error` logs. The real socket and registration calls need a Redox
+target, so they are only compile-checked here.
+
 ### Driver executor event reads
 
 `cargo test --locked --manifest-path userspace/base/Cargo.toml -p executor`

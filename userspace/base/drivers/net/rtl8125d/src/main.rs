@@ -29,6 +29,8 @@ enum DriverError {
     Controller(#[source] syscall::Error),
     #[error("cannot create the event queue")]
     EventQueue(#[source] libredox::error::Error),
+    #[error("cannot set up the network scheme")]
+    SchemeSetup(#[source] driver_network::NetworkSchemeError),
     #[error("cannot subscribe to interrupts")]
     SubscribeInterrupt(#[source] libredox::error::Error),
     #[error("cannot subscribe to the network scheme")]
@@ -49,13 +51,7 @@ enum DriverError {
 
 /// Print the full error chain only at the daemon's outer boundary.
 fn exit_with_error(error: DriverError) -> ! {
-    log::error!("rtl8125d: {error}");
-    let mut cause = std::error::Error::source(&error);
-    while let Some(source) = cause {
-        log::error!("rtl8125d: caused by: {source}");
-        cause = source.source();
-    }
-    std::process::exit(1)
+    common::exit_with_error("rtl8125d", &error)
 }
 
 /// Map the controller's memory BAR.
@@ -134,7 +130,8 @@ fn serve(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> Result<(
         },
         daemon,
         format!("network.{name}"),
-    );
+    )
+    .map_err(DriverError::SchemeSetup)?;
 
     user_data! {
         enum Source {
