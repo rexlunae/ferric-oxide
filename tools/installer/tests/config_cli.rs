@@ -24,3 +24,32 @@ fn bundled_image_configuration_reports_size_and_packages() {
     assert!(packages.lines().any(|line| line == "kernel"));
     assert!(packages.lines().any(|line| line == "bootloader"));
 }
+
+#[test]
+fn config_option_accepts_every_value_form() {
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/test.toml");
+    let config = config.to_str().unwrap();
+    for args in [
+        vec!["--config", config],
+        vec![&format!("--config={config}")],
+        vec!["-c", config],
+    ] {
+        let size = Command::new(env!("CARGO_BIN_EXE_redox_installer"))
+            .args(&args)
+            .arg("--filesystem-size")
+            .output()
+            .unwrap();
+        assert!(size.status.success(), "{args:?}: {:?}", size.stderr);
+        assert_eq!(String::from_utf8(size.stdout).unwrap().trim(), "196");
+    }
+}
+
+#[test]
+fn unknown_option_is_rejected() {
+    let output = Command::new(env!("CARGO_BIN_EXE_redox_installer"))
+        .args(["--no-such-option", "--list-packages"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--no-such-option"));
+}

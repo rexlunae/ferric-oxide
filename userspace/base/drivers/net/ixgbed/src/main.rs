@@ -20,6 +20,14 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
     let mut name = pci_config.func.name();
     name.push_str("_ixgbe");
 
+    common::setup_logging(
+        "net",
+        "pci",
+        &name,
+        common::output_level(),
+        common::file_level(),
+    );
+
     let irq = pci_config
         .func
         .legacy_interrupt_line
@@ -40,7 +48,8 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
         },
         daemon,
         format!("network.{name}"),
-    );
+    )
+    .unwrap_or_else(|error| common::exit_with_error("ixgbed", &error));
 
     user_data! {
         enum Source {

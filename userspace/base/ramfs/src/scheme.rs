@@ -762,9 +762,7 @@ impl SchemeSync for Scheme<'_> {
             .get_mut(&inode)
             .ok_or(Error::new(EBADFD))?;
 
-        if !matches!((fcntl_flags as usize) & O_ACCMODE, O_RDONLY | O_RDWR) {
-            return Err(Error::new(EBADF));
-        }
+        check_open_for(fcntl_flags, Direction::Read)?;
 
         file.read(offset, buf)
     }
@@ -786,6 +784,9 @@ impl SchemeSync for Scheme<'_> {
             .files
             .get_mut(&inode)
             .ok_or(Error::new(EBADFD))?;
+
+        // Ferric Oxide: the kernel does not check the descriptor's access mode (#400).
+        check_open_for(fcntl_flags, Direction::Write)?;
 
         // Ferric Oxide (#244): an append ignores the cursor the kernel passes.
         if fcntl_flags as usize & O_APPEND != 0 {
@@ -1513,4 +1514,64 @@ fn check_permissions(flags: usize, single_mode: u8) -> Result<()> {
         return Err(Error::new(EACCES));
     }
     Ok(())
+}
+
+/// Ferric Oxide: the transfer a descriptor must have been opened for.
+#[derive(Clone, Copy, Debug)]
+enum Direction {
+    Read,
+    Write,
+}
+
+/// Checks that the descriptor whose `fcntl_flags` the kernel passed was opened for
+/// `direction`.
+///
+/// # Errors
+/// `EBADF`, as POSIX `read` and `write` return, when its `O_ACCMODE` bits do not allow it.
+fn check_open_for(fcntl_flags: u32, direction: Direction) -> Result<()> {
+    let mode = fcntl_flags as usize & O_ACCMODE;
+    let allowed = match direction {
+        Direction::Read => matches!(mode, O_RDONLY | O_RDWR),
+        Direction::Write => matches!(mode, O_WRONLY | O_RDWR),
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(Error::new(EBADF))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use syscall::flag::{O_APPEND, O_NONBLOCK};
+    use syscall::EBADF;
+
+    use super::{check_open_for, Direction, TryFrom, O_RDONLY, O_RDWR, O_WRONLY};
+
+    fn flags(flags: usize) -> u32 {
+        u32::try_from(flags).expect("open flags fit in the fcntl flags")
+    }
+
+    /// #400: a descriptor opened read-only cannot write, whatever else is set.
+    #[test]
+    fn a_read_only_descriptor_cannot_write() {
+        for extra in [0, O_APPEND, O_NONBLOCK] {
+            let err = check_open_for(flags(O_RDONLY | extra), Direction::Write).unwrap_err();
+            assert_eq!(err.errno, EBADF);
+        }
+    }
+
+    #[test]
+    fn a_write_only_descriptor_cannot_read() {
+        let err = check_open_for(flags(O_WRONLY), Direction::Read).unwrap_err();
+        assert_eq!(err.errno, EBADF);
+    }
+
+    #[test]
+    fn each_mode_allows_its_own_transfers() {
+        check_open_for(flags(O_RDONLY), Direction::Read).unwrap();
+        check_open_for(flags(O_WRONLY | O_APPEND), Direction::Write).unwrap();
+        check_open_for(flags(O_RDWR), Direction::Read).unwrap();
+        check_open_for(flags(O_RDWR), Direction::Write).unwrap();
+    }
 }

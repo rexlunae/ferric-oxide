@@ -733,8 +733,13 @@ assumed to share this cause.
 ld.so's fatal message is followed by a second `[ld.so]:` line with the reason
 for the failing attempt: the path, original errno and exact operation (`open`,
 `fstat`, the `pread` of the object's headers, or `mmap`, including the requested
-mapping length), or the search paths
-a library is in none of. Thus an `ENOMEM` while loading a library does not by
+mapping length), the search paths
+a library is in none of, or why an opened object could not be loaded (invalid
+ELF headers, a missing `PT_LOAD` or `PT_DYNAMIC` segment, an invalid dynamic
+segment or section with the `object` crate's error, a segment outside the file
+or the mapping, or the `mmap` of its segments with the requested length and
+errno). `dlerror` returns a distinct message for each of these load failures
+instead of one generic "malformed" message. Thus an `ENOMEM` while loading a library does not by
 itself establish physical memory exhaustion or even that `open` failed. The next
 occurrence names the file and error without `LD_DEBUG`. Context is carried
 by the typed load error, with its original errno, so a later malformed object
@@ -743,7 +748,10 @@ or TLS failure cannot reuse an earlier search diagnostic. The host check
 mapping ownership, error, fatal-message formatter and errno modules. It checks
 candidate order,
 successful fallback, missing and inaccessible libraries reaching the fatal
-output, isolation from a later parse/TLS failure, stable `dlerror` messages,
+output, isolation from a later parse/TLS failure, stable `dlerror` messages
+(one per load failure kind), load failures naming the object and keeping their
+`object::Error` or errno source, every loader error's `core::error::Error`
+source chain down to that error,
 and descriptor cleanup after failed stat, header-read and map operations. File
 descriptors are owned immediately after open, including on error paths; a
 successful mapping retains its descriptor until after unmap. It also checks that
@@ -1294,6 +1302,19 @@ an intervening flush cleans the recorded pages, then the hint writes just one
 later dirty run while a concurrent rewrite remains dirty. This pins the
 intentional start-hint semantics and the take-size work bound.
 
+### Network driver startup errors
+
+`cargo test --locked --manifest-path userspace/base/Cargo.toml -p driver-network
+-p common` covers how a network driver starts and reports failure. The
+`driver-network` tests drive the setup order behind `NetworkScheme::new` with
+injected failures: a socket or wake-pipe failure returns `Socket` or
+`WakePipe` without running the adapter initialiser, a registration failure
+returns `Register` naming the scheme, and on success the steps run as socket,
+wake pipe, adapter, registration. The `common` tests check that
+`error_chain` lists an error and every cause, outermost first, which is what
+`exit_with_error` logs. The real socket and registration calls need a Redox
+target, so they are only compile-checked here.
+
 ### Driver executor event reads
 
 `cargo test --locked --manifest-path userspace/base/Cargo.toml -p executor`
@@ -1477,23 +1498,28 @@ alone does not exercise the credential check.
 ## ramfs ownership changes
 
 `ferric-owner-test` runs in the smoke image and checks `ramfs`'s `fchown` and
-`fchmod` (#246) on `/scheme/logging`, the instance every image runs. As root it
-creates a file root owns that anyone may open for writing, and one user 1000
-owns with mode `6755`, then runs itself as user 1000:
+`fchmod` (#246), and its `write` access check (#400), on `/scheme/logging`,
+the instance every image runs. As root it creates a file root owns that anyone
+may open for writing, and one user 1000 owns with mode `6755`, then runs itself
+as user 1000:
 
 - `owner-refused`: on root's file, `fchown` to its own user or group and
   `fchmod` are refused, and root then finds the file unchanged;
 - `owner-allowed`: on its own file it may set its own group, which clears the
   set-ID bits, and change the mode, but not give the file to root; root then
-  finds the owner, group and mode it set.
+  finds the owner, group and mode it set;
+- `owner-write`: `write` through a descriptor it opened read-only is refused
+  (`EBADF`), even on its own file, and allowed through one it opened
+  write-only on root's writable file; root then finds its own file empty and
+  root's holding the bytes written (#400).
 
 `fchown` reaches `ramfs` as the kernel's direct call and `fchmod` as a
-`StdFsCall`, so the two steps cover both ways `ramfs` learns the caller's IDs.
+`StdFsCall`, so the first two steps cover both ways `ramfs` learns the caller's IDs.
 Without `/scheme/logging` it prints a skip. The rules themselves have host
 tests in `crates/abi` (`ferric_abi::id`) and `userspace/base/ramfs`, which the
 base-workspace job in `host-tools.yml` runs with `scheme-utils`' credential
 decoding. `host-tools.yml` also checks the test's formatting, target Clippy and
-Rustdoc; the image workflow requires both steps.
+Rustdoc; the image workflow requires all three steps.
 
 ## O_APPEND cursors
 

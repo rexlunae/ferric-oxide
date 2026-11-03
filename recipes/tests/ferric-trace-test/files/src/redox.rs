@@ -225,10 +225,10 @@ fn drain(step: &'static str, cpus: &[u32]) -> Result<Vec<Vec<Entry>>, Failure> {
             let mut buf = vec![0u8; READ_LEN];
             loop {
                 let len = file.read(&mut buf).map_err(io_failure(step, &path))?;
-                if len == 0 {
+                decode(step, *cpu, buf.get(..len).unwrap_or_default(), &mut entries)?;
+                if abi::read_caught_up(len, buf.len()) {
                     return Ok(entries);
                 }
-                decode(step, *cpu, buf.get(..len).unwrap_or_default(), &mut entries)?;
             }
         })
         .collect()
