@@ -10,6 +10,9 @@
 //! - `owner-allowed`: on its own file it may set the group to its own group, which clears
 //!   the set-user-ID and set-group-ID bits, and change the mode, but not give the file away;
 //!   root then finds the owner, group and mode the child set.
+//! - `owner-write`: `write` through a descriptor it opened read-only, on its own file, is
+//!   refused (`EBADF`), and through one it opened write-only, on root's writable file, it is
+//!   allowed (#400); root then finds its own file empty and root's holding what was written.
 //!
 //! `fchown` reaches ramfs as the kernel's fchown call and `fchmod` as a `StdFsCall`, so the
 //! steps cover both ways ramfs learns who the caller is. Without `/scheme/logging` it prints
@@ -20,7 +23,7 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions, Permissions};
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, chown, fchown};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
@@ -34,6 +37,9 @@ const MINE: &str = "/scheme/logging/ferric-owner-test.mine";
 
 /// The argument the unprivileged child runs with.
 const AS_USER: &str = "--as-user";
+/// What the child writes into [`THEIRS`].
+const WRITTEN: &[u8] = b"written";
+
 /// The unprivileged user (and group) the child runs as.
 const USER: u32 = 1000;
 /// The group [`MINE`] starts in, which the child is not a member of.
@@ -78,6 +84,18 @@ fn refused(what: &str, result: io::Result<()>) -> Result<(), Failure> {
     }
 }
 
+/// Succeeds when `result` is the `EBADF` a transfer through a descriptor not opened for it
+/// returns.
+fn bad_descriptor(what: &str, result: io::Result<usize>) -> Result<(), Failure> {
+    match result {
+        Err(err) if err.raw_os_error() == Some(libc::EBADF) => Ok(()),
+        Err(err) => Err(Failure::Check(format!("{what}: {err}, expected EBADF"))),
+        Ok(written) => Err(Failure::Check(format!(
+            "{what} was allowed ({written} bytes)"
+        ))),
+    }
+}
+
 /// Root's part before the child runs: the two files, with their owners and modes.
 fn create_files() -> Result<(), Failure> {
     File::create(THEIRS).map_err(io("create root's file"))?;
@@ -117,9 +135,27 @@ fn child_mine() -> Result<(), Failure> {
     refused("fchown to root", fchown(&file, Some(0), None))
 }
 
-/// The unprivileged child: both sets of checks, reported through the exit status.
+/// The child's `write` checks: refused through a read-only descriptor, even on its own file,
+/// and allowed through a write-only one.
+fn child_write() -> Result<(), Failure> {
+    let mut read_only = File::open(MINE).map_err(io("open own file read-only"))?;
+    bad_descriptor(
+        "write through a read-only descriptor",
+        read_only.write(WRITTEN),
+    )?;
+    OpenOptions::new()
+        .write(true)
+        .open(THEIRS)
+        .and_then(|mut file| file.write_all(WRITTEN))
+        .map_err(io("write through a write-only descriptor"))
+}
+
+/// The unprivileged child: every set of checks, reported through the exit status.
 fn as_user() -> ExitCode {
-    match child_theirs().and_then(|()| child_mine()) {
+    match child_theirs()
+        .and_then(|()| child_mine())
+        .and_then(|()| child_write())
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("ferric-owner-test: as user {USER}: {err}");
@@ -159,6 +195,20 @@ fn run() -> Result<(), Failure> {
         )));
     }
     println!("FERRIC_TEST_PASS owner-allowed");
+
+    let mine = fs::read(MINE).map_err(io("read the user's file"))?;
+    if !mine.is_empty() {
+        return Err(Failure::Check(format!(
+            "the user's file holds {mine:?} after a refused write, expected nothing"
+        )));
+    }
+    let theirs = fs::read(THEIRS).map_err(io("read root's file"))?;
+    if theirs != WRITTEN {
+        return Err(Failure::Check(format!(
+            "root's file holds {theirs:?}, expected {WRITTEN:?}"
+        )));
+    }
+    println!("FERRIC_TEST_PASS owner-write");
     Ok(())
 }
 

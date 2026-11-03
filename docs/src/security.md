@@ -77,6 +77,11 @@ does for `fchmod`. The
 [`ferric-owner-test`](./ferric-testing.md#ramfs-ownership-changes) regression
 checks `ramfs` as root and as user 1000.
 
+The kernel passes each `read` and `write` the descriptor's open flags but does
+not check its access mode itself, so `ramfs` refuses a `read` through a
+descriptor not opened for reading and a `write` through one not opened for
+writing, with `EBADF` (#400).
+
 ## Hardware mitigations
 
 | Mitigation | Status | Option |

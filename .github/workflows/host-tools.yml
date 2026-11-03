@@ -37,6 +37,8 @@ on:
       - "userspace/base/drivers/executor/**"
       - "userspace/base/drivers/storage/nvmed/**"
       - "userspace/base/drivers/pcid/**"
+      - "userspace/base/drivers/common/**"
+      - "userspace/base/drivers/net/driver-network/**"
       - "recipes/tests/ferric-iobench/**"
       - "recipes/tests/ferric-blkgrant-test/**"
       - "recipes/tests/ferric-ring-test/**"
@@ -174,6 +176,8 @@ jobs:
         run: |
           rustc --edition=2024 --test -D warnings crates/relibc/redox-rt/tests/vector_state.rs -o "$RUNNER_TEMP/vector-state-tests"
           "$RUNNER_TEMP/vector-state-tests"
+          rustc --edition=2024 --test -D warnings crates/relibc/redox-rt/tests/signal_defaults.rs -o "$RUNNER_TEMP/signal-defaults-tests"
+          "$RUNNER_TEMP/signal-defaults-tests"
           cargo fmt --manifest-path crates/relibc/Cargo.toml -p redox-rt -p relibc --check
           cargo build --locked --manifest-path crates/relibc/Cargo.toml -p redox-rt --target x86_64-unknown-redox
           cargo clippy --locked --manifest-path crates/relibc/Cargo.toml -p redox-rt --all-targets --target x86_64-unknown-redox --no-deps -- -D warnings
@@ -552,7 +556,7 @@ jobs:
           key: userspace-base-${{ hashFiles('userspace/base/Cargo.lock') }}
           restore-keys: userspace-base-
       - name: Test
-        run: cargo test --locked -p executor -p driver-block -p netstack -p rtl8125d -p nvmed -p pcid -p ramfs -p scheme-utils
+        run: cargo test --locked -p executor -p driver-block -p netstack -p common -p driver-network -p rtl8125d -p nvmed -p pcid -p ramfs -p scheme-utils
       - name: Compile NVMe timing with buffered and DMA paths
         run: |
           rustup target add x86_64-unknown-redox

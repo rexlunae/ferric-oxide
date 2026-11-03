@@ -52,6 +52,9 @@ mod clone;
 mod dir;
 mod disk;
 mod filesystem;
+// The mapping buffers of the Redox scheme; tested on the host.
+#[cfg(all(feature = "std", any(target_os = "redox", test)))]
+mod fmap;
 mod header;
 mod htree;
 // Used by the page cache, which only Redox builds; tested on the host.

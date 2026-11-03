@@ -11,6 +11,7 @@ daemon = { path = "../../../daemon" }
 redox-scheme.workspace = true
 scheme-utils = { path = "../../../scheme-utils" }
 redox_syscall = { workspace = true, features = ["std"] }
+thiserror.workspace = true
 # Ferric Oxide: the queue socket ABI and copy mode, and registered-buffer grants, for the
 # `bypass` feature.
 ferric-netq = { path = "../../../../../crates/netq", optional = true }

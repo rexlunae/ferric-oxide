@@ -219,7 +219,7 @@ mod tests {
             target: "x86_64-unknown-redox",
             is_deps: false,
             rule: String::new(),
-            pinned: false,
+            pinned_rev: None,
         }
     }
 

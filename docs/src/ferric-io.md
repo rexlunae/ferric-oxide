@@ -746,6 +746,17 @@ a ramp-up period (`ramp_time` is 0 by default).
    uncertain first installations, failed teardowns and one-time release on
    blocked and unblocked closes; the kernel path itself only runs when
    hardware fails an invalidation.
+6. Moving memory away with `mremap` or a proc transfer (`AddrSpace::r#move`)
+   releases the source's translations one grant at a time, right after that
+   grant has left the source (`ferric_iommu::dma::moved`). A move that fails
+   part way, for example when a destination page table cannot be allocated,
+   keeps the translations of the grants still mapped in the source, so the
+   device can keep using them. In a move within one process, the destination
+   span is not released. The tail a shrinking move unmaps, and
+   a fixed destination it replaces, follow `munmap` and are released even when
+   the unmap stops early. A translation shared by a moved and an unmoved
+   grant is retired whole, as for a partial `munmap`
+   ([#306](https://github.com/rexlunae/ferric-oxide/issues/306)).
 
 The entry points are `userspace/base/drivers/pcid/src/iommu.rs`,
 `src/driver_interface/mod.rs`, `crates/kernel/src/scheme/iommu.rs`, and
@@ -970,6 +981,10 @@ another thread's `Enter` (`EINTR` on a signal, `EINVAL` above the CQ's size);
 Closing the ring cancels the worker for good, as a signal that never clears:
 the wait the running chain is in ends, as does any it starts later, and the
 queued chains complete with `ECANCELED`.
+
+[Batched asynchronous system calls](ferric-async-syscalls.md) designs the
+next extension (planned): more opcodes, kernel service points that take
+entries without `Enter`, and an `async` Rust runtime.
 
 Registered-buffer grants as SQE buffers, polled (`SqPoll`) and `UMWAIT`
 notification, and rings served natively by user schemes come later (see the design in
@@ -1922,7 +1937,12 @@ netstack.
   the null namespace, which each network driver's event loop watches next to
   the scheme socket (`NetworkScheme::wake_handle`). Asking
   from the request loop deadlocked the two whenever netstack was in a read
-  (#323). The netstack
+  (#323). `NetworkScheme::new` makes the scheme socket and the pipe before it
+  initialises the adapter; if either, or the scheme registration, fails it
+  returns a `NetworkSchemeError` rather than panicking, and every network
+  driver logs that error with its full source chain
+  (`common::exit_with_error`) and exits without reporting readiness to init
+  (#325). The netstack
   socket must be bound to one address: one bound to `0.0.0.0` (or `::`) is
   refused with `EINVAL` (`OwnError::UnspecifiedAddress`), since owning a port
   on every address would let the socket send from any source address. So an
