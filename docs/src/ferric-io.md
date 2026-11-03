@@ -732,14 +732,20 @@ a ramp-up period (`ramp_time` is 0 by default).
 5. Removing write access with `mprotect` narrows device permissions too.
    Unmapping memory, process exit and domain closure retire translations
    with the required invalidations before frames can be released. A
-   translation whose installation could not confirm its invalidation may
-   still be reachable by the device, so the kernel keeps its IOVA block and
-   frame pins owned, by IOVA, without recording a mapping; only a domain
-   closure that blocks every device releases them, and exactly once. A
-   closure that cannot block them keeps them pinned. No test injects a failed
-   installation: the shared crate's unit test covers the retained entries and
-   the ordering of their release, and the kernel path is compiled for the
-   target but only runs when hardware fails an invalidation.
+   translation whose installation could not confirm its invalidation, or a
+   mapping whose strict unmap failed, may still be reachable by the device,
+   so the kernel keeps its IOVA block and frame pins owned without a mapping
+   record; only a domain closure that blocks every device releases them, and
+   exactly once. A closure that cannot block them keeps them pinned. The
+   physical range is reserved before frames are pinned, and
+   `ferric_iommu::dma::Retained::install` decides from the installation's
+   outcome whether its block and pins go to the new mapping, back to the
+   allocators (a table failure that `Domain::map` rolled back), or to the
+   retained set, so no failure path drops them unowned. Host fault-injection
+   tests in `crates/iommu/tests/translation_failures.rs` cover clean and
+   uncertain first installations, failed teardowns and one-time release on
+   blocked and unblocked closes; the kernel path itself only runs when
+   hardware fails an invalidation.
 6. Moving memory away with `mremap` or a proc transfer (`AddrSpace::r#move`)
    releases the source's translations one grant at a time, right after that
    grant has left the source (`ferric_iommu::dma::moved`). A move that fails
@@ -1525,6 +1531,14 @@ remains available to other mounts of the same daemon binary.
   own owner and group. The kernel checks first, before the scheme sees the
   call: a caller other than root may name only its own effective UID and GID,
   or `-1` in either position (`crates/kernel/src/scheme/chown.rs`).
+- **The caller's IDs:** `fchown` (the kernel's direct call) and `openat`
+  arrive with the caller's effective UID and GID. `fchmod` and `futimens`
+  arrive as a `StdFsCall`, whose caller IDs read as root, so the scheme asks
+  procmgr for the calling process's effective IDs through the
+  `proc-creds-capability` handle it opens at mount, before leaving its
+  namespace (`ferric-proc-creds`, `crates/proc-creds`; issue
+  [#399](https://github.com/rexlunae/ferric-oxide/issues/399)). `ftruncate` and
+  `write` use no IDs: opening the file for writing was checked.
 - **`write`** (`Fs::write`, `ext4d::write::write_data`) writes into the
   blocks a regular file already has, as ext4's default ordered mode does: the
   data is written home and flushed without going through the journal, then

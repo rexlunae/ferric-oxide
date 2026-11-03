@@ -4,8 +4,8 @@ version = "0.0.0"
 edition = "2024"
 
 [dependencies]
+ferric-proc-creds.workspace = true
 libredox.workspace = true
-plain.workspace = true
 redox-scheme.workspace = true
 redox_syscall.workspace = true
 

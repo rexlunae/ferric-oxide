@@ -54,6 +54,7 @@ on:
       - "recipes/tests/ferric-trace-test/**"
       - "recipes/tests/ferric-xstate-test/**"
       - "recipes/tests/ferric-perf/**"
+      - "recipes/data/ca-certificates/**"
       - ".github/workflows/host-tools.yml"
       - ".gitmodules"
       - ".github/actions/prepare-cargo-git/**"
@@ -86,6 +87,10 @@ jobs:
         run: bash scripts/ferric-ci/test-ld-so-errors.sh
       - name: Failed-test log printer tests
         run: bash scripts/ferric-ci/test-print-test-fails.sh
+      - name: Build error annotation tests
+        run: bash scripts/ferric-ci/test-annotate-build-errors.sh
+      - name: CA certificate install tests
+        run: bash scripts/ferric-ci/test-ca-certificates.sh
       - name: Native toolchain regression tests
         run: bash scripts/ferric-ci/test-native-toolchain.sh
       - name: Build-tool manifest regression tests
@@ -197,7 +202,7 @@ jobs:
           cargo clippy --locked --manifest-path "$manifest" --all-targets --target x86_64-unknown-redox -- -D warnings
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --manifest-path "$manifest" --target x86_64-unknown-redox
       - name: Docs
-        run: cargo doc --locked --no-deps -p ferric-build -p ferric-harness -p ferric-abi -p ferric-fwcfg -p ferric-aligned-buffer -p ferric-boot-time -p ferric-heap -p ferric-sched-core -p ferric-exec-core -p ferric-devicetree -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-iommu -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-timed -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-guest-ram -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry && cargo doc --locked --no-deps --all-features -p ferric-iommu -p ferric-trace && cargo doc --locked --no-deps --all-features -p fox-core
+        run: cargo doc --locked --no-deps -p ferric-build -p ferric-harness -p ferric-abi -p ferric-fwcfg -p ferric-aligned-buffer -p ferric-boot-time -p ferric-heap -p ferric-sched-core -p ferric-exec-core -p ferric-devicetree -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-iommu -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-proc-creds -p ferric-procinfo -p ferric-svm -p ferric-timed -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-guest-ram -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry && cargo doc --locked --no-deps --all-features -p ferric-iommu -p ferric-trace && cargo doc --locked --no-deps --all-features -p fox-core
         env:
           RUSTDOCFLAGS: -D warnings
       # Imported host tools have existing upstream lint warnings, so
@@ -205,7 +210,7 @@ jobs:
       # --no-deps keeps imported path dependencies (including the installer
       # used by ferric-config's integration tests) outside that strict scope.
       - name: Clippy
-        run: cargo clippy --locked --no-deps --all-targets -p ferric-build -p ferric-config -p ferric-harness -p ferric-abi -p ferric-fwcfg -p ferric-aligned-buffer -p ferric-boot-time -p ferric-heap -p ferric-sched-core -p ferric-exec-core -p ferric-devicetree -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-procinfo -p ferric-svm -p ferric-timed -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-guest-ram -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry -- -D warnings
+        run: cargo clippy --locked --no-deps --all-targets -p ferric-build -p ferric-config -p ferric-harness -p ferric-abi -p ferric-fwcfg -p ferric-aligned-buffer -p ferric-boot-time -p ferric-heap -p ferric-sched-core -p ferric-exec-core -p ferric-devicetree -p ferric-amdvi -p ferric-cet -p ferric-codecache -p ferric-hwrand -p ferric-irq -p ferric-netq -p ferric-nospec -p ferric-proc-creds -p ferric-procinfo -p ferric-svm -p ferric-timed -p ferric-trace -p ferric-trace-cli -p ferric-trace-map -p ferric-guest-ram -p ferric-vm -p ferric-vmx -p ferric-vtd -p fox-core -p fox-git -p fox-build -p fox-sbom -p fox-store -p fox-index -p fox -p cargo-fox -p fox-registry -- -D warnings
       # fox-core's types and head verification are no_std; check them without
       # the std file-access layer the other fox crates turn on.
       - name: Clippy (fox-core without std)

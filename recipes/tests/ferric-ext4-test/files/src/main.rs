@@ -18,14 +18,18 @@
 //!   ext4d exiting before it mounts (a failed replay) fails the step.
 //! - `ext4-write`: a separate default mount writes, truncates and creates regular files
 //!   when the daemon advertises `write` (`fs.ext4_write`). Without that capability it
-//!   prints `FERRIC_TEST_SKIP ext4-write`. Read-only and journal checks still run.
+//!   prints `FERRIC_TEST_SKIP ext4-write`. Read-only and journal checks still run. On the
+//!   same mount, a child running as user 2000 must be refused `fchmod`, `futimens` and
+//!   `fchown` on root's file (`EPERM`, or `EACCES` for `futimens` to now without write
+//!   access) and allowed `fchmod` and `futimens` on its own; it reports `ext4-owner`.
 //!
 //! Without `/usr/bin/ext4d` (fs.ext4 off) it prints `FERRIC_TEST_SKIP ext4`. The images are
 //! `basic.ext4` and `journal-v3.ext4.gz` from `userspace/ext4d/tests/fixtures/`, whose
 //! script lists their contents. Failed checks or daemon teardown leave the backing
 //! images in `/tmp` for diagnosis; only successful checks and teardown remove them.
 
-#![forbid(unsafe_code)]
+// Only `futimens`, which has no safe wrapper on Redox, is unsafe; it says so.
+#![deny(unsafe_code)]
 
 use std::process::ExitCode;
 

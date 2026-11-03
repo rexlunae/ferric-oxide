@@ -1,11 +1,20 @@
+# Mozilla's CA certificates, built from a pinned, checksummed source rather
+# than fetched as Redox's prebuilt package. certifi's sdist carries the bundle
+# curl extracts from Mozilla's certdata.txt (MPL-2.0 data; LICENSE is shipped
+# with it). Update by moving `tar` to a newer certifi release and replacing
+# `blake3`.
 [source]
-git = "https://gitlab.redox-os.org/redox-os/ca-certificates.git"
+tar = "https://files.pythonhosted.org/packages/fd/11/b524cbd9bbdaca58608e4cf4053fd463417549e1959fa8d3aa18319f9555/certifi-2026.10.23.tar.gz"
+blake3 = "2b9d27ce2de536f3070eb35a391946bb796f864f7b6ff53ae5959743969f10ee"
 
 [build]
 template = "custom"
 script = """
-mkdir -pv "${COOKBOOK_STAGE}/etc/ssl"
-cp -rv "${COOKBOOK_SOURCE}/certs" "${COOKBOOK_STAGE}/etc/ssl/certs"
+bash "${COOKBOOK_RECIPE}/install-certs.sh" \
+    "${COOKBOOK_SOURCE}/certifi/cacert.pem" \
+    "${COOKBOOK_STAGE}/etc/ssl/certs"
+mkdir -pv "${COOKBOOK_STAGE}/usr/share/licenses/ca-certificates"
+cp -v "${COOKBOOK_SOURCE}/LICENSE" "${COOKBOOK_STAGE}/usr/share/licenses/ca-certificates/LICENSE"
 #TODO: remove deprecated location after all recipes are fixed
 ln -s etc/ssl "${COOKBOOK_STAGE}/ssl"
 """

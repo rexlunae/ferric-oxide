@@ -61,6 +61,9 @@ pub(crate) mod handoff;
 /// Context switch function
 pub mod switch;
 
+/// Spurious user page-fault classification, shared with host regression tests.
+pub(crate) mod fault_access;
+
 /// File struct - defines a scheme and a file number
 pub mod file;
 
