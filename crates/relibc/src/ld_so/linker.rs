@@ -758,7 +758,7 @@ impl Linker {
                 source,
             };
             if debug {
-                eprintln!("[ld.so]: failed to load '{name}': {error}");
+                eprintln!("[ld.so]: failed to load '{name}': {}", error.report());
             }
             error
         })?;

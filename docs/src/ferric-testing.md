@@ -750,7 +750,8 @@ candidate order,
 successful fallback, missing and inaccessible libraries reaching the fatal
 output, isolation from a later parse/TLS failure, stable `dlerror` messages
 (one per load failure kind), load failures naming the object and keeping their
-`object::Error` or errno source,
+`object::Error` or errno source, every loader error's `core::error::Error`
+source chain down to that error,
 and descriptor cleanup after failed stat, header-read and map operations. File
 descriptors are owned immediately after open, including on error paths; a
 successful mapping retains its descriptor until after unmap. It also checks that

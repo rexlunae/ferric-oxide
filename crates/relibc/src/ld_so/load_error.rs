@@ -173,6 +173,11 @@ impl DlError {
         FatalDiagnostic { path, error: self }
     }
 
+    /// This error followed by each of its sources, for diagnostics.
+    pub(super) fn report(&self) -> Report<'_> {
+        Report(self)
+    }
+
     /// Returns the stable, null-terminated message used by `dlerror`.
     pub const fn repr(&self) -> &'static CStr {
         match self {
@@ -186,6 +191,28 @@ impl DlError {
             Self::InvalidHandle => c"Invalid DSO handle. Set `LD_DEBUG=all` for more information.",
             Self::Oom => c"Out of memory.",
         }
+    }
+}
+
+/// Display adapter for an error and its whole source chain, on one line.
+///
+/// An [`Errno`] in the chain is followed by its number, since the message table
+/// may not name every value.
+pub(super) struct Report<'a>(&'a (dyn core::error::Error + 'static));
+
+impl fmt::Display for Report<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut error = Some(self.0);
+        let mut separator = "";
+        while let Some(current) = error {
+            write!(f, "{separator}{current}")?;
+            if let Some(errno) = current.downcast_ref::<Errno>() {
+                write!(f, " (errno {})", errno.0)?;
+            }
+            separator = ": ";
+            error = current.source();
+        }
+        Ok(())
     }
 }
 
@@ -206,7 +233,7 @@ impl fmt::Display for FatalDiagnostic<'_> {
             self.error,
             DlError::Search { .. } | DlError::Open { .. } | DlError::Load { .. }
         ) {
-            writeln!(f, "[ld.so]: {}", self.error)?;
+            writeln!(f, "[ld.so]: {}", self.error.report())?;
         }
         f.write_str("[ld.so]: enable debug output with `LD_DEBUG=all` for more information")
     }
@@ -216,36 +243,40 @@ impl fmt::Display for DlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Search {
-                access_error: Some((path, source)),
+                access_error: Some((path, _)),
                 ..
-            } => write!(f, "access '{path}' failed: {source} (errno {})", source.0),
+            } => write!(f, "access '{path}' failed"),
             Self::Search { name, paths, .. } => write!(f, "'{name}' is in none of {paths:?}"),
             Self::Open {
-                path,
-                operation,
-                source,
-            } => {
-                match operation {
-                    ObjectIoOperation::Open => write!(f, "opening '{path}' failed"),
-                    ObjectIoOperation::Stat => write!(f, "reading size of '{path}' failed"),
-                    ObjectIoOperation::Read => write!(f, "reading the headers of '{path}' failed"),
-                    ObjectIoOperation::Map { size } => {
-                        write!(f, "mapping '{path}' ({size} bytes) failed")
-                    }
-                }?;
-                write!(f, ": {source} (errno {})", source.0)
-            }
-            Self::Load { path, source } => {
-                write!(f, "loading '{path}' failed: {source}")?;
-                if let Some(cause) = core::error::Error::source(source) {
-                    write!(f, ": {cause}")?;
+                path, operation, ..
+            } => match operation {
+                ObjectIoOperation::Open => write!(f, "opening '{path}' failed"),
+                ObjectIoOperation::Stat => write!(f, "reading size of '{path}' failed"),
+                ObjectIoOperation::Read => write!(f, "reading the headers of '{path}' failed"),
+                ObjectIoOperation::Map { size } => {
+                    write!(f, "mapping '{path}' ({size} bytes) failed")
                 }
-                if let LoadError::Map { source: errno, .. } = source {
-                    write!(f, " (errno {})", errno.0)?;
-                }
-                Ok(())
-            }
+            },
+            Self::Load { path, .. } => write!(f, "loading '{path}' failed"),
             _ => f.write_str(self.repr().to_str().expect("loader messages are ASCII")),
+        }
+    }
+}
+
+impl core::error::Error for DlError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Search {
+                access_error: Some((_, source)),
+                ..
+            }
+            | Self::Open { source, .. } => Some(source),
+            Self::Load { source, .. } => Some(source),
+            Self::NotFound
+            | Self::Search { .. }
+            | Self::Malformed
+            | Self::InvalidHandle
+            | Self::Oom => None,
         }
     }
 }
@@ -285,15 +316,17 @@ mod tests {
             paths: vec!["/lib".into()],
             access_error: Some(("/lib/blocked.so".into(), Errno(13))),
         };
-        assert!(format!("{access}").contains("access '/lib/blocked.so' failed:"));
-        assert!(format!("{access}").ends_with("(errno 13)"));
+        assert_eq!(format!("{access}"), "access '/lib/blocked.so' failed");
+        assert!(format!("{}", access.report()).starts_with("access '/lib/blocked.so' failed: "));
+        assert!(format!("{}", access.report()).ends_with("(errno 13)"));
         let opened = DlError::Open {
             path: "/lib/open.so".into(),
             operation: ObjectIoOperation::Open,
             source: Errno(5),
         };
-        assert!(format!("{opened}").contains("opening '/lib/open.so' failed:"));
-        assert!(format!("{opened}").ends_with("(errno 5)"));
+        assert_eq!(format!("{opened}"), "opening '/lib/open.so' failed");
+        assert!(format!("{}", opened.report()).starts_with("opening '/lib/open.so' failed: "));
+        assert!(format!("{}", opened.report()).ends_with("(errno 5)"));
         let fatal = format!("{}", opened.fatal("/bin/ion"));
         assert!(fatal.starts_with("[ld.so]: failed to link '/bin/ion': Open"));
         assert!(fatal.contains("\n[ld.so]: opening '/lib/open.so' failed:"));
@@ -353,7 +386,8 @@ mod tests {
             path: "/lib/bad.so".into(),
             source: LoadError::Parse(parse_error()),
         };
-        let message = format!("{parse}");
+        assert_eq!(format!("{parse}"), "loading '/lib/bad.so' failed");
+        let message = format!("{}", parse.report());
         assert!(
             message.starts_with("loading '/lib/bad.so' failed: invalid ELF headers: "),
             "{message}"
@@ -375,10 +409,69 @@ mod tests {
                 source: Errno(12),
             },
         };
-        let message = format!("{mapped}");
+        let message = format!("{}", mapped.report());
         assert!(message.starts_with("loading '/lib/big.so' failed: mapping 8192 bytes failed: "));
         assert!(message.ends_with(" (errno 12)"), "{message}");
         assert_eq!(message.matches("errno").count(), 1);
+    }
+
+    #[test]
+    fn dl_errors_expose_their_whole_source_chain() {
+        use core::error::Error;
+        let mapped = DlError::Load {
+            path: "/lib/big.so".into(),
+            source: LoadError::Map {
+                size: 1,
+                source: Errno(12),
+            },
+        };
+        let load = mapped.source().expect("a load failure keeps its cause");
+        assert!(matches!(
+            load.downcast_ref::<LoadError>(),
+            Some(LoadError::Map { size: 1, .. })
+        ));
+        let errno = load.source().expect("a mapping failure keeps its errno");
+        assert_eq!(errno.downcast_ref::<Errno>(), Some(&Errno(12)));
+        assert!(errno.source().is_none());
+
+        let parse = DlError::Load {
+            path: "/lib/bad.so".into(),
+            source: LoadError::DynamicSection(parse_error()),
+        };
+        let object = parse
+            .source()
+            .and_then(Error::source)
+            .expect("an invalid dynamic section keeps the object crate's error");
+        assert!(object.downcast_ref::<object::Error>().is_some());
+
+        let opened = DlError::Open {
+            path: "/lib/open.so".into(),
+            operation: ObjectIoOperation::Open,
+            source: Errno(5),
+        };
+        let access = DlError::Search {
+            name: "blocked.so".into(),
+            paths: vec!["/lib".into()],
+            access_error: Some(("/lib/blocked.so".into(), Errno(13))),
+        };
+        for (error, errno) in [(&opened, 5), (&access, 13)] {
+            let source = error.source().and_then(|e| e.downcast_ref::<Errno>());
+            assert_eq!(source, Some(&Errno(errno)));
+        }
+        let missing = DlError::Search {
+            name: "missing.so".into(),
+            paths: vec![],
+            access_error: None,
+        };
+        for error in [
+            missing,
+            DlError::NotFound,
+            DlError::Malformed,
+            DlError::InvalidHandle,
+            DlError::Oom,
+        ] {
+            assert!(error.source().is_none(), "{error:?}");
+        }
     }
 
     #[test]
