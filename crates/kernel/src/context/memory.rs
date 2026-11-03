@@ -3191,21 +3191,40 @@ fn cow(
     })
 }
 
+/// Maps a new zeroed frame at `page` in `mapper`, whose address space `flusher` shoots down.
+///
+/// # Errors
+///
+/// [`PfError::Oom`] if no frame is free, or if a page table on `page`'s path cannot be
+/// allocated. In the second case the new frame and any page tables linked for it are queued
+/// on `flusher` to be freed, so a failed fault leaks nothing.
 fn map_zeroed(
     mapper: &mut PageMapper,
     page: Page,
     page_flags: PageFlags<RmmA>,
-    _writable: bool,
+    flusher: &mut impl GenericFlusher,
 ) -> Result<Frame, PfError> {
     let must_be_zero = true;
     let new_frame = init_frame(RefCount::One, must_be_zero)?;
 
-    unsafe {
+    // SAFETY: the caller holds the lock of `mapper`'s address space and `page` is not mapped,
+    // so no TLB holds an entry for it and the new mapping needs no flush; the tables this
+    // unlinks on failure go to `flusher`, which frees them only after its shootdown.
+    // TODO: huge pages?
+    let mapped = unsafe {
         mapper
-            // TODO: huge pages?
-            .map_phys(page.start_address(), new_frame.base(), page_flags, 0)
-            .ok_or(PfError::Oom)?
-            .ignore();
+            .map_phys_or_unlink(
+                page.start_address(),
+                new_frame.base(),
+                page_flags,
+                &mut queue_undone_borrow(flusher),
+            )
+            .map(|flush| flush.ignore())
+    };
+    if mapped.is_none() {
+        // Nothing maps the frame; dropping its only reference frees it.
+        flusher.queue(Some(page), new_frame, None, TlbShootdownActions::FREE);
+        return Err(PfError::Oom);
     }
 
     Ok(new_frame)
@@ -3305,6 +3324,9 @@ fn correct_inner<'l>(
     // TODO: Readahead backwards, i.e. MAP_GROWSDOWN.
 
     let mut allow_writable = true;
+    // Whether `frame` carries a reference taken for this mapping alone, which a failed mapping
+    // must give back. Other frames are already mapped here or not reference counted.
+    let mut frame_ref_taken = false;
 
     let frame = match grant_info.provider {
         Provider::Allocated { .. } | Provider::AllocatedShared { .. }
@@ -3332,7 +3354,7 @@ fn correct_inner<'l>(
                     &mut addr_space.table.utable,
                     faulting_page,
                     grant_flags,
-                    true,
+                    &mut flusher,
                 )?,
             }
         }
@@ -3358,7 +3380,7 @@ fn correct_inner<'l>(
                         &mut addr_space.table.utable,
                         faulting_page,
                         grant_flags,
-                        false,
+                        &mut flusher,
                     )?
                 }
             }
@@ -3430,7 +3452,10 @@ fn correct_inner<'l>(
                         get_page_info(src_frame).expect("all allocated frames need a PageInfo");
 
                     match info.add_ref(RefKind::Shared) {
-                        Ok(()) => src_frame,
+                        Ok(()) => {
+                            frame_ref_taken = true;
+                            src_frame
+                        }
                         Err(AddRefError::CowToShared) => {
                             let CowResult {
                                 new_frame,
@@ -3456,6 +3481,8 @@ fn correct_inner<'l>(
                                     });
                             }
 
+                            // `cow` gave the new frame a reference for this mapping.
+                            frame_ref_taken = true;
                             new_frame
                         }
                         Err(AddRefError::SharedToCow) => unreachable!(),
@@ -3471,11 +3498,12 @@ fn correct_inner<'l>(
 
                     // TODO: Should this be called?
                     crate::warn!("Mapped zero page since grant didn't exist");
+                    let mut foreign_flusher = Flusher::with_cpu_set(&foreign_address_space.used_by);
                     map_zeroed(
                         &mut guard.table.utable,
                         src_page,
                         grant_flags,
-                        access == AccessMode::Write,
+                        &mut foreign_flusher,
                     )?
                 }
             }
@@ -3550,14 +3578,21 @@ fn correct_inner<'l>(
     };
 
     let new_flags = grant_flags.write(grant_flags.has_write() && allow_writable);
-    let Some(flush) = (unsafe {
-        addr_space
-            .table
-            .utable
-            // TODO: huge pages?
-            .map_phys(faulting_page.start_address(), frame.base(), new_flags, 0)
-    }) else {
-        // TODO
+    // SAFETY: `addr_space` is locked for writing and the grant covers `faulting_page`; the
+    // tables this unlinks on failure go to `flusher`, which frees them only after its shootdown.
+    // TODO: huge pages?
+    let mapped = unsafe {
+        addr_space.table.utable.map_phys_or_unlink(
+            faulting_page.start_address(),
+            frame.base(),
+            new_flags,
+            &mut queue_undone_borrow(&mut flusher),
+        )
+    };
+    let Some(flush) = mapped else {
+        if frame_ref_taken {
+            flusher.queue(Some(faulting_page), frame, None, TlbShootdownActions::FREE);
+        }
         return Err(PfError::Oom);
     };
 
