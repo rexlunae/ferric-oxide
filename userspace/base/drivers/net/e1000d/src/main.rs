@@ -46,7 +46,8 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
         },
         daemon,
         format!("network.{name}"),
-    );
+    )
+    .unwrap_or_else(|error| common::exit_with_error("e1000d", &error));
 
     user_data! {
         enum Source {

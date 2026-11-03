@@ -80,6 +80,11 @@ workspace. The
 checks `ramfs` as root and as user 1000; `ferric-ext4-test`'s `ext4-owner` step
 checks `ext4d` as user 2000 when its writer (`fs.ext4_write`) is built in.
 
+The kernel passes each `read` and `write` the descriptor's open flags but does
+not check its access mode itself, so `ramfs` refuses a `read` through a
+descriptor not opened for reading and a `write` through one not opened for
+writing, with `EBADF` (#400).
+
 ## Hardware mitigations
 
 | Mitigation | Status | Option |

@@ -16,6 +16,7 @@ use super::{
     debug::{_r_debug, RTLDDebug},
     image::Image,
     linker::{__plt_resolve_trampoline, GLOBAL_SCOPE, Resolve, Scope, Symbol},
+    load_error::LoadError,
     tcb::Master,
 };
 use crate::{
@@ -442,8 +443,8 @@ impl DSO {
         id: usize,
         tls_module_id: usize,
         tls_offset: usize,
-    ) -> Result<(DSO, Option<Master>, Vec<ProgramHeader>), String> {
-        let elf = Image::parse(data).map_err(|err| err.to_string())?;
+    ) -> Result<(DSO, Option<Master>, Vec<ProgramHeader>), LoadError> {
+        let elf = Image::parse(data).map_err(LoadError::Parse)?;
         let (mmap, tcb_master, dynamic) =
             DSO::mmap_and_copy(path, &elf, data, base_addr, tls_offset)?;
 
@@ -578,7 +579,7 @@ impl DSO {
         data: &'a [u8],
         base_addr: Option<usize>,
         tls_offset: usize,
-    ) -> Result<(MemoryMapHandle, Option<Master>, Dynamic<'static>), String> {
+    ) -> Result<(MemoryMapHandle, Option<Master>, Dynamic<'static>), LoadError> {
         let endian = NativeEndian;
         log::trace!("# {}", path);
         // data for struct LinkMap
@@ -616,7 +617,7 @@ impl DSO {
                     _ => (),
                 }
             }
-            bounds_opt.ok_or_else(|| "Unable to find PT_LOAD section".to_string())?
+            bounds_opt.ok_or(LoadError::NoLoadSegment)?
         };
         log::trace!("  bounds {:#x}, {:#x}", bounds.0, bounds.1);
         // Allocate memory
@@ -648,7 +649,7 @@ impl DSO {
                     -1,
                     0,
                 )
-                .map_err(|e| format!("failed to map {}. errno: {}", path, e.0))?;
+                .map_err(|source| LoadError::Map { size, source })?;
 
                 if !(start as *mut c_void).is_null() {
                     assert_eq!(
@@ -681,7 +682,7 @@ impl DSO {
                         let range = offset..(offset + size as usize);
                         match data.get(range.clone()) {
                             Some(some) => some,
-                            None => return Err(format!("failed to read {:x?}", range)),
+                            None => return Err(LoadError::SegmentOutsideFile { range }),
                         }
                     };
 
@@ -695,9 +696,7 @@ impl DSO {
                         };
                         match mmap.get_mut(range.clone()) {
                             Some(some) => some,
-                            None => {
-                                return Err(format!("failed to write {:x?}", range));
-                            }
+                            None => return Err(LoadError::SegmentOutsideMapping { range }),
                         }
                     };
                     let _voff = ph.p_vaddr(endian) % ph.p_align(endian);
@@ -732,21 +731,23 @@ impl DSO {
                 }
 
                 elf::PT_DYNAMIC => {
-                    let entries = ph
+                    // `dynamic` returns `None` only for other segment types.
+                    if let Some(entries) = ph
                         .dynamic(endian, data)
-                        .map_err(|err| err.to_string())?
-                        .ok_or_else(|| "Unable to parse PT_DYNAMIC section".to_string())?;
-                    dynamic = Some((ph, entries));
+                        .map_err(LoadError::DynamicSegment)?
+                    {
+                        dynamic = Some((ph, entries));
+                    }
                 }
                 _ => (),
             }
         }
 
-        let dynamic = dynamic.ok_or_else(|| "Unable to find PT_DYNAMIC section".to_string())?;
+        let dynamic = dynamic.ok_or(LoadError::NoDynamicSegment)?;
 
         let (parsed_dynamic, debug) =
             Self::parse_dynamic(path, mmap.as_ptr(), is_pie_enabled(elf), dynamic.1)
-                .map_err(|e| e.to_string())?;
+                .map_err(LoadError::DynamicSection)?;
 
         if let Some(i) = debug {
             // FIXME: cleanup

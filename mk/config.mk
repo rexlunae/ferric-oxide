@@ -220,7 +220,6 @@ INSTALLER_FEATURES=
 REDOXFS_FEATURES=
 COOKBOOK_OPTS="--filesystem=$(FILESYSTEM_CONFIG)"
 ifeq ($(REPO_BINARY),1)
-INSTALLER_OPTS+=--repo-binary
 COOKBOOK_OPTS+=--repo-binary
 endif
 ## Ferric Oxide: finish the image root with fox (features.toml

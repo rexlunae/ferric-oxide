@@ -69,7 +69,8 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
         },
         daemon,
         format!("network.{name}"),
-    );
+    )
+    .unwrap_or_else(|error| common::exit_with_error("rtl8168d", &error));
 
     user_data! {
         enum Source {
