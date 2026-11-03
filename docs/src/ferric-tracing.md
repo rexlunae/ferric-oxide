@@ -840,6 +840,11 @@ this rule, `ferric-iommu-test` drained until 0 bytes. A trace-mode smoke boot wi
 cpu 2 about two million times a second, and the host capture grew by about
 200 MB/s. `ferric-trace-test` and `ferric-trace-bench` drain with the same rule.
 
+The rule detects that a reader has caught up; it does not snapshot the backlog.
+While other writers fill every read, a drain that stops only on it keeps going.
+A reader that needs a hard bound also stops after the `pending` words that
+`stats` listed before the drain started, as `ferric-trace capture` does.
+
 A write naming no known event gives `ENOENT`. A write naming only events that
 are not compiled in gives `EOPNOTSUPP`.
 

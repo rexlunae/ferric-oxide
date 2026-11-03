@@ -183,8 +183,12 @@ pub const READ_MIN: usize = crate::record::MAX_RECORD_WORDS * crate::record::WOR
 ///
 /// A read copies whole records until the next one does not fit, so one that left room for the
 /// longest record ([`READ_MIN`]) found no more. Records written after it, including the
-/// reader's own `syscall` records, are left for the next drain; stopping here bounds a drain
-/// to what was pending when it started (see [`CPU_DIR`]).
+/// reader's own `syscall` records, are left for the next drain (see [`CPU_DIR`]).
+///
+/// This detects that the reader has caught up with the writers; it is not a snapshot of the
+/// backlog. While writers keep every read full, a drain that stops only here goes on. A reader
+/// that needs a hard bound also stops after the bytes [`STATS_PATH`] listed as `pending`
+/// before it started, as `ferric-trace capture` does.
 ///
 /// # Examples
 ///
