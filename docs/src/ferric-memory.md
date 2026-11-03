@@ -452,7 +452,11 @@ returns to the source address space
 destination first also means a source unmap cannot empty, and so queue for
 freeing, a page table that a later destination page needs: such tables are
 never reused before the shootdown. Grants already moved by an earlier step of
-the same `r#move` stay moved; only the failing grant is rolled back.
+the same `r#move` stay moved; only the failing grant is rolled back. The
+source's IOMMU translations are released per grant after it moves, so the
+grant that is rolled back keeps its device access
+([Registered buffers and IOMMUs](ferric-io.md),
+[#306](https://github.com/rexlunae/ferric-oxide/issues/306)).
 
 ### Branch predictor barriers between processes
 

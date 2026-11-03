@@ -684,10 +684,11 @@ impl AddrSpaceWrapper {
                     PageSpan::new(base, new_page_count),
                     &unmapped,
                 );
-                let notify_files = unmapped?;
-                // Ferric Oxide: see `munmap`.
+                // Ferric Oxide: see `munmap`. Released before the error is returned, since
+                // the grants removed before an error are gone too.
                 #[cfg(iommu_enabled)]
                 crate::scheme::iommu::release(dst_lock, PageSpan::new(base, new_page_count));
+                let notify_files = unmapped?;
                 if let Some(notify_files_out) = notify_files_out.as_mut() {
                     notify_files_out.extend(notify_files);
                 }
@@ -722,21 +723,25 @@ impl AddrSpaceWrapper {
         if PageSpan::new(dst_base, new_page_count).intersects(src_span) {
             return Err(Error::new(EBUSY));
         }
+        // Ferric Oxide: the source's DMA mappings are released only for memory that has left
+        // it (`ferric_iommu::dma::moved`), so a move that fails part way keeps the device
+        // reach of what stayed. The destination span is never released here.
         #[cfg(iommu_enabled)]
-        crate::scheme::iommu::release(src_owner, src_span);
+        let released = |left: PageSpan| crate::scheme::iommu::release(src_owner, left);
+        #[cfg(not(iommu_enabled))]
+        let released = |_: PageSpan| ();
 
         if new_page_count < src_span.count {
             let unpin = false;
-            let notify_files = AddrSpace::munmap_inner(
-                src_grants,
-                src_mapper,
-                src_flusher,
-                PageSpan::new(
-                    src_span.base.next_by(new_page_count),
-                    src_span.count - new_page_count,
-                ),
-                unpin,
-            )?;
+            let shrunk = PageSpan::new(
+                src_span.base.next_by(new_page_count),
+                src_span.count - new_page_count,
+            );
+            let unmapped =
+                AddrSpace::munmap_inner(src_grants, src_mapper, src_flusher, shrunk, unpin);
+            // As in `munmap`: whatever was removed before an error has left as well.
+            released(shrunk);
+            let notify_files = unmapped?;
             if let Some(notify_files_out) = notify_files_out.as_mut() {
                 notify_files_out.extend(notify_files);
             }
@@ -752,78 +757,82 @@ impl AddrSpaceWrapper {
 
         let mut prev_grant_end = src_span.base;
 
-        //while let Some(grant_base) = next(src_opt.as_mut().map(|s| &mut **s), dst, remaining_src_span) {
-        for grant_base in to_remap {
-            if prev_grant_end < grant_base {
-                let hole_page_count = grant_base.offset_from(prev_grant_end);
-                let hole_span = PageSpan::new(
-                    dst_base.next_by(prev_grant_end.offset_from(src_span.base)),
-                    hole_page_count,
-                );
-                dst.grants.insert(Grant::zeroed(
-                    hole_span,
-                    page_flags(new_flags),
-                    &mut dst.table.utable,
-                    &mut dst_flusher,
-                    false,
-                )?);
-            }
+        ferric_iommu::dma::moved::move_pieces(
+            to_remap,
+            |grant_base| {
+                if prev_grant_end < grant_base {
+                    let hole_page_count = grant_base.offset_from(prev_grant_end);
+                    let hole_span = PageSpan::new(
+                        dst_base.next_by(prev_grant_end.offset_from(src_span.base)),
+                        hole_page_count,
+                    );
+                    dst.grants.insert(Grant::zeroed(
+                        hole_span,
+                        page_flags(new_flags),
+                        &mut dst.table.utable,
+                        &mut dst_flusher,
+                        false,
+                    )?);
+                }
 
-            let src_grants = src_opt
-                .as_mut()
-                .map_or(&mut dst.grants, |(g, _, _)| &mut *g);
-            let grant = src_grants
-                .remove_containing(grant_base)
-                .expect("grant cannot disappear");
-            let grant_span = PageSpan::new(grant.base, grant.info.page_count());
-            let (before, middle, after) = grant
-                .extract(remaining_src_span.intersection(grant_span))
-                .expect("called intersect(), must succeed");
-
-            if let Some(before) = before {
-                src_grants.insert(before);
-            }
-            if let Some(after) = after {
-                src_grants.insert(after);
-            }
-
-            let dst_grant_base = dst_base.next_by(middle.base.offset_from(src_span.base));
-            let middle_span = middle.span();
-
-            let mut middle = middle;
-            let moved = match src_opt.as_mut() {
-                Some((_, other_mapper, other_flusher)) => middle.transfer(
-                    dst_grant_base,
-                    page_flags(new_flags),
-                    other_mapper,
-                    Some(&mut dst.table.utable),
-                    other_flusher,
-                    &mut dst_flusher,
-                ),
-                None => middle.transfer(
-                    dst_grant_base,
-                    page_flags(new_flags),
-                    &mut dst.table.utable,
-                    None,
-                    &mut dst_flusher,
-                    &mut NopFlusher,
-                ),
-            };
-            if let Err(err) = moved {
-                // `transfer` left the pages mapped in the source: give the grant back to it.
-                src_opt
+                let src_grants = src_opt
                     .as_mut()
-                    .map_or(&mut dst.grants, |(g, _, _)| &mut *g)
-                    .insert(middle);
-                return Err(err);
-            }
-            dst.grants.insert(middle);
+                    .map_or(&mut dst.grants, |(g, _, _)| &mut *g);
+                let grant = src_grants
+                    .remove_containing(grant_base)
+                    .expect("grant cannot disappear");
+                let grant_span = PageSpan::new(grant.base, grant.info.page_count());
+                let (before, middle, after) = grant
+                    .extract(remaining_src_span.intersection(grant_span))
+                    .expect("called intersect(), must succeed");
 
-            prev_grant_end = middle_span.base.next_by(middle_span.count);
-            let pages_advanced = prev_grant_end.offset_from(remaining_src_span.base);
-            remaining_src_span =
-                PageSpan::new(prev_grant_end, remaining_src_span.count - pages_advanced);
-        }
+                if let Some(before) = before {
+                    src_grants.insert(before);
+                }
+                if let Some(after) = after {
+                    src_grants.insert(after);
+                }
+
+                let dst_grant_base = dst_base.next_by(middle.base.offset_from(src_span.base));
+                let middle_span = middle.span();
+
+                let mut middle = middle;
+                let moved = match src_opt.as_mut() {
+                    Some((_, other_mapper, other_flusher)) => middle.transfer(
+                        dst_grant_base,
+                        page_flags(new_flags),
+                        other_mapper,
+                        Some(&mut dst.table.utable),
+                        other_flusher,
+                        &mut dst_flusher,
+                    ),
+                    None => middle.transfer(
+                        dst_grant_base,
+                        page_flags(new_flags),
+                        &mut dst.table.utable,
+                        None,
+                        &mut dst_flusher,
+                        &mut NopFlusher,
+                    ),
+                };
+                if let Err(err) = moved {
+                    // `transfer` left the pages mapped in the source: give the grant back to it.
+                    src_opt
+                        .as_mut()
+                        .map_or(&mut dst.grants, |(g, _, _)| &mut *g)
+                        .insert(middle);
+                    return Err(err);
+                }
+                dst.grants.insert(middle);
+
+                prev_grant_end = middle_span.base.next_by(middle_span.count);
+                let pages_advanced = prev_grant_end.offset_from(remaining_src_span.base);
+                remaining_src_span =
+                    PageSpan::new(prev_grant_end, remaining_src_span.count - pages_advanced);
+                Ok(middle_span)
+            },
+            released,
+        )?;
 
         if prev_grant_end < src_span.base.next_by(new_page_count) {
             let last_hole_span = PageSpan::new(
