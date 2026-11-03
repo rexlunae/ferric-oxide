@@ -965,6 +965,10 @@ Closing the ring cancels the worker for good, as a signal that never clears:
 the wait the running chain is in ends, as does any it starts later, and the
 queued chains complete with `ECANCELED`.
 
+[Batched asynchronous system calls](ferric-async-syscalls.md) designs the
+next extension (planned): more opcodes, kernel service points that take
+entries without `Enter`, and an `async` Rust runtime.
+
 Registered-buffer grants as SQE buffers, polled (`SqPoll`) and `UMWAIT`
 notification, and rings served natively by user schemes come later (see the design in
 `io/rings-design.md` in the project files). Their flags and modes already
