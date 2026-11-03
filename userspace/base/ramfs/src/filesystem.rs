@@ -4,8 +4,10 @@ use std::os::unix::io::AsRawFd;
 use std::{fs, iter, time};
 
 use ferric_abi::id::{
-    chmod_permitted, chown_permitted, mode_after_chmod, mode_after_chown, owner_after, Caller,
+    chmod_permitted, chown_permitted, mode_after_chmod, mode_after_chown, owner_after,
+    times_access, Caller, TimesAccess,
 };
+use ferric_abi::time::TimeChange;
 use indexmap::IndexMap;
 use libredox::Fd;
 use redox_path::RedoxReference;
@@ -52,7 +54,38 @@ impl File {
         Ok(())
     }
 
-    fn ownership(&self) -> Ownership {
+    /// Ferric Oxide: `futimens` by `caller` (see [`Times::after_futimens`]).
+    ///
+    /// # Errors
+    /// `EPERM` or `EACCES` when `caller` may not make the change.
+    pub fn set_times_by(
+        &mut self,
+        caller: Caller,
+        accessed: TimeChange,
+        modified: TimeChange,
+        now: TimeSpec,
+    ) -> Result<()> {
+        let times =
+            self.times()
+                .after_futimens(caller, self.ownership(), accessed, modified, now)?;
+        Times {
+            atime: self.atime,
+            mtime: self.mtime,
+            ctime: self.ctime,
+        } = times;
+        Ok(())
+    }
+
+    fn times(&self) -> Times {
+        Times {
+            atime: self.atime,
+            mtime: self.mtime,
+            ctime: self.ctime,
+        }
+    }
+
+    /// The file's owner, group and mode.
+    pub fn ownership(&self) -> Ownership {
         Ownership {
             mode: self.mode,
             uid: self.uid,
@@ -321,17 +354,97 @@ impl Ownership {
         })
     }
 
+    /// The permission bits (`0o4` read, `0o2` write, `0o1` execute or search) a caller with
+    /// effective IDs `uid` and `gid` has: all of them for root, else those of the owner, the
+    /// group or others, whichever class the caller is in first.
+    pub fn permissions(self, uid: u32, gid: u32) -> u8 {
+        if uid == 0 {
+            return 0o7;
+        }
+        let perm = self.mode & MODE_PERM;
+        let class = if uid == self.uid {
+            perm >> 6
+        } else if gid == self.gid {
+            perm >> 3
+        } else {
+            perm
+        };
+        (class & 0o7) as u8
+    }
+
     fn is_regular(self) -> bool {
         self.mode & MODE_TYPE == MODE_FILE
+    }
+}
+
+/// Ferric Oxide: a file's access, modification and change times, which `futimens` sets
+/// under the POSIX rule in `ferric_abi::id`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Times {
+    /// The last access time.
+    pub atime: TimeSpec,
+    /// The last modification time.
+    pub mtime: TimeSpec,
+    /// The last status change time.
+    pub ctime: TimeSpec,
+}
+
+impl Times {
+    /// After `futimens` by `caller` on a file with `ownership`: the access and modification
+    /// times set as `accessed` and `modified` ask, [`TimeChange::Now`] meaning `now`, and the
+    /// change time `now`. Two [`TimeChange::Omit`]s change nothing.
+    ///
+    /// # Errors
+    /// Under `ferric_abi::id::times_access`: `EPERM` when only the owner or root may make
+    /// the change, and `EACCES` when `caller` asks for the current time for both without
+    /// owning the file or being able to write it.
+    pub fn after_futimens(
+        self,
+        caller: Caller,
+        ownership: Ownership,
+        accessed: TimeChange,
+        modified: TimeChange,
+        now: TimeSpec,
+    ) -> Result<Self> {
+        match times_access(caller, ownership.uid, accessed, modified) {
+            TimesAccess::Permitted => {}
+            TimesAccess::NeedsWrite => {
+                if ownership.permissions(caller.uid, caller.gid) & 0o2 == 0 {
+                    return Err(Error::new(EACCES));
+                }
+            }
+            TimesAccess::NotOwner => return Err(Error::new(EPERM)),
+        }
+        if (accessed, modified) == (TimeChange::Omit, TimeChange::Omit) {
+            return Ok(self);
+        }
+        let time = |change, current| match change {
+            TimeChange::Now => now,
+            TimeChange::Omit => current,
+            TimeChange::At {
+                seconds,
+                nanoseconds,
+            } => TimeSpec {
+                tv_sec: seconds,
+                // Below one second, so it fits.
+                tv_nsec: nanoseconds as i32,
+            },
+        };
+        Ok(Self {
+            atime: time(accessed, self.atime),
+            mtime: time(modified, self.mtime),
+            ctime: now,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use ferric_abi::id::{Caller, UNCHANGED};
-    use syscall::{EPERM, MODE_DIR, MODE_FILE};
+    use ferric_abi::time::TimeChange;
+    use syscall::{TimeSpec, EACCES, EPERM, MODE_DIR, MODE_FILE};
 
-    use super::Ownership;
+    use super::{Ownership, Times};
 
     const ROOT: Caller = Caller { uid: 0, gid: 0 };
     const USER: Caller = Caller {
@@ -395,5 +508,138 @@ mod tests {
             other_group.chmod_by(USER, 0o2755).unwrap().mode,
             MODE_FILE | 0o0755
         );
+    }
+
+    const BEFORE: TimeSpec = TimeSpec {
+        tv_sec: 10,
+        tv_nsec: 1,
+    };
+    const UNTOUCHED: Times = Times {
+        atime: BEFORE,
+        mtime: BEFORE,
+        ctime: BEFORE,
+    };
+    const NOW: TimeSpec = TimeSpec {
+        tv_sec: 99,
+        tv_nsec: 9,
+    };
+    const THEN: TimeChange = TimeChange::At {
+        seconds: 1_000_000,
+        nanoseconds: 500,
+    };
+    const THEN_SPEC: TimeSpec = TimeSpec {
+        tv_sec: 1_000_000,
+        tv_nsec: 500,
+    };
+
+    fn touch(
+        caller: Caller,
+        ownership: Ownership,
+        accessed: TimeChange,
+        modified: TimeChange,
+    ) -> syscall::Result<Times> {
+        UNTOUCHED.after_futimens(caller, ownership, accessed, modified, NOW)
+    }
+
+    /// #375: someone else's file keeps its times unless the caller only touches it and may
+    /// write it.
+    #[test]
+    fn another_users_file_may_only_be_touched_when_writable() {
+        let now = TimeChange::Now;
+        let writable = file(MODE_FILE | 0o666, 0, 0);
+        for (accessed, modified) in [
+            (THEN, THEN),
+            (THEN, TimeChange::Omit),
+            (now, TimeChange::Omit),
+        ] {
+            let err = touch(USER, writable, accessed, modified).unwrap_err();
+            assert_eq!(err.errno, EPERM, "{accessed:?} {modified:?}");
+        }
+        let read_only = file(MODE_FILE | 0o644, 0, 0);
+        assert_eq!(touch(USER, read_only, now, now).unwrap_err().errno, EACCES);
+
+        let touched = touch(USER, writable, now, now).unwrap();
+        assert_eq!(
+            touched,
+            Times {
+                atime: NOW,
+                mtime: NOW,
+                ctime: NOW
+            }
+        );
+    }
+
+    /// The group's write bit counts for a caller in the file's group, and only it.
+    #[test]
+    fn touching_follows_the_callers_class() {
+        let now = TimeChange::Now;
+        let group_writable = file(MODE_FILE | 0o664, 0, USER.gid);
+        touch(USER, group_writable, now, now).unwrap();
+        let others_writable_only = file(MODE_FILE | 0o646, 0, USER.gid);
+        let err = touch(USER, others_writable_only, now, now).unwrap_err();
+        assert_eq!(err.errno, EACCES);
+    }
+
+    /// The `UTIME_OMIT` and `UTIME_NOW` sentinels are honoured, not stored as times.
+    #[test]
+    fn the_owner_sets_omits_and_nows() {
+        let mine = file(MODE_FILE | 0o400, USER.uid, USER.gid);
+        let set = touch(USER, mine, THEN, TimeChange::Omit).unwrap();
+        assert_eq!(
+            set,
+            Times {
+                atime: THEN_SPEC,
+                mtime: BEFORE,
+                ctime: NOW
+            }
+        );
+
+        let later = TimeSpec {
+            tv_sec: 100,
+            tv_nsec: 0,
+        };
+        let set = set
+            .after_futimens(USER, mine, TimeChange::Omit, TimeChange::Now, later)
+            .unwrap();
+        assert_eq!(
+            set,
+            Times {
+                atime: THEN_SPEC,
+                mtime: later,
+                ctime: later
+            }
+        );
+    }
+
+    /// Two omits change nothing, not even the change time, and need no permission.
+    #[test]
+    fn omitting_both_changes_nothing() {
+        let theirs = file(MODE_FILE | 0o600, 0, 0);
+        let omit = TimeChange::Omit;
+        assert_eq!(touch(USER, theirs, omit, omit).unwrap(), UNTOUCHED);
+    }
+
+    #[test]
+    fn root_may_set_any_files_times() {
+        let theirs = file(MODE_FILE, 1000, 1000);
+        assert_eq!(
+            touch(ROOT, theirs, THEN, THEN).unwrap(),
+            Times {
+                atime: THEN_SPEC,
+                mtime: THEN_SPEC,
+                ctime: NOW
+            }
+        );
+    }
+
+    #[test]
+    fn permissions_come_from_the_callers_class() {
+        let ownership = file(MODE_FILE | 0o741, 1000, 50);
+        assert_eq!(ownership.permissions(0, 0), 0o7);
+        assert_eq!(ownership.permissions(1000, 0), 0o7);
+        assert_eq!(ownership.permissions(1001, 50), 0o4);
+        assert_eq!(ownership.permissions(1001, 51), 0o1);
+        // The owner's class wins even when it grants less than the group's.
+        assert_eq!(file(MODE_FILE | 0o070, 1000, 50).permissions(1000, 50), 0);
     }
 }

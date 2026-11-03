@@ -274,7 +274,7 @@ impl SchemeSync for Ext4Scheme {
         let change = |time: TimeSpec| TimeChange::from_timespec(time.tv_sec, time.tv_nsec.into());
         let (accessed, modified) = change(accessed)
             .and_then(|a| Ok((a, change(modified)?)))
-            .map_err(|e| errno(&e))?;
+            .map_err(|e| errno(&Error::from(e)))?;
         self.fs
             .set_times(id, accessed, modified, ctx.uid, ctx.gid)
             .map_err(|e| errno(&e))

@@ -48,9 +48,9 @@ port-I/O capabilities remain Phase 4 work. The
 [`ferric-ioport-test`](./ferric-testing.md#port-io-authorization) regression
 checks these request-time rules without executing port-I/O instructions.
 
-### Owner, group and mode changes
+### Owner, group, mode and time changes
 
-A scheme decides who may change one of its files' owner, group or mode.
+A scheme decides who may change one of its files' owner, group, mode or times.
 `ramfs` and `ext4d` share one definition of the POSIX rules, with
 `_POSIX_CHOWN_RESTRICTED`, in `ferric_abi::id`:
 
@@ -60,7 +60,16 @@ A scheme decides who may change one of its files' owner, group or mode.
   effective group;
 - an unprivileged change of owner or group clears a regular file's set-user-ID
   and set-group-ID bits, and an unprivileged `chmod` cannot make a regular file
-  set-group-ID for a group the caller is not in.
+  set-group-ID for a group the caller is not in;
+- `futimens` (`ferric_abi::id::times_access`) lets root or the owner set any
+  times, lets anyone else set both to the current time (`UTIME_NOW` for both,
+  or a null `times`) only with write permission (`EACCES` otherwise), and
+  refuses everything else with `EPERM`; two `UTIME_OMIT`s change nothing and
+  are not checked. `ferric_abi::time::TimeChange` reads the `UTIME_NOW` and
+  `UTIME_OMIT` sentinels, so neither is stored as a time.
+
+`ramfs` also refuses `ftruncate` through a descriptor not opened for writing
+(`EBADF`), since the kernel does not check the descriptor's access mode.
 
 The kernel checks `fchown` first: a caller other than root may name only its own
 effective IDs, or `-1` to keep one (`crates/kernel/src/scheme/chown.rs`). Schemes
@@ -73,7 +82,7 @@ caller's effective IDs with `fchown` and the other direct scheme calls, but a
 its pid, and its caller IDs read as root. A scheme that checks permissions on
 one asks procmgr for the pid's credentials through its
 `proc-creds-capability` handle (`scheme_utils::proc_credentials`), as `ramfs`
-does for `fchmod`. The
+does for `fchmod` and `futimens`. The
 [`ferric-owner-test`](./ferric-testing.md#ramfs-ownership-changes) regression
 checks `ramfs` as root and as user 1000.
 

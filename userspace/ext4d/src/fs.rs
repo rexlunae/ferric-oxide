@@ -36,8 +36,10 @@ use std::rc::Rc;
 
 use ext4_view::{Ext4, Ext4Read, File, FileType, Metadata};
 #[cfg(feature = "write")]
-use ferric_abi::id::{Caller, UNCHANGED, chmod_permitted, chown_permitted, mode_after_chmod};
-use ferric_abi::time::{UTIME_NOW, UTIME_OMIT};
+use ferric_abi::id::{
+    Caller, TimesAccess, UNCHANGED, chmod_permitted, chown_permitted, mode_after_chmod,
+    times_access,
+};
 
 use crate::Error;
 use crate::superblock::{self, Geometry};
@@ -236,42 +238,7 @@ impl Kind {
     }
 }
 
-/// What a `futimens` call asks for one of a file's times.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimeChange {
-    /// Set it to the current time (`UTIME_NOW`).
-    Now,
-    /// Leave it as it is (`UTIME_OMIT`).
-    Omit,
-    /// Set it to this time.
-    At {
-        /// Seconds since 1970-01-01 00:00:00 UTC; negative before it.
-        seconds: i64,
-        /// Nanoseconds, below 1 000 000 000.
-        nanoseconds: u32,
-    },
-}
-
-impl TimeChange {
-    /// Reads a `futimens` time: `tv_nsec` is [`UTIME_NOW`], [`UTIME_OMIT`] or the
-    /// nanoseconds of `tv_sec`.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidTime`] when `nanoseconds` is none of those.
-    pub fn from_timespec(seconds: i64, nanoseconds: i64) -> Result<Self, Error> {
-        match nanoseconds {
-            UTIME_NOW => Ok(Self::Now),
-            UTIME_OMIT => Ok(Self::Omit),
-            0..1_000_000_000 => Ok(Self::At {
-                seconds,
-                // In range, so it fits.
-                nanoseconds: nanoseconds as u32,
-            }),
-            _ => Err(Error::InvalidTime),
-        }
-    }
-}
+pub use ferric_abi::time::TimeChange;
 
 /// One directory entry, for `getdents`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1131,11 +1098,10 @@ impl Fs {
                 return Ok(());
             }
             let metadata = &handle.metadata;
-            if uid != 0 && metadata.uid() != uid {
-                if (accessed, modified) != (TimeChange::Now, TimeChange::Now) {
-                    return Err(Error::NotOwner);
-                }
-                require_access(metadata, uid, gid, 0o2)?;
+            match times_access(Caller { uid, gid }, metadata.uid(), accessed, modified) {
+                TimesAccess::Permitted => {}
+                TimesAccess::NeedsWrite => require_access(metadata, uid, gid, 0o2)?,
+                TimesAccess::NotOwner => return Err(Error::NotOwner),
             }
             let now = Timestamp::now();
             let time = |change| match change {
@@ -1561,26 +1527,6 @@ mod tests {
         assert_eq!(normalize("/a/b", "/x/./y"), "/x/y");
         assert_eq!(normalize("/", "../../.."), "/");
         assert_eq!(normalize("/a", "..//b/"), "/b");
-    }
-
-    #[test]
-    fn futimens_times_are_read() {
-        let read = |seconds, nanoseconds| TimeChange::from_timespec(seconds, nanoseconds).ok();
-        assert_eq!(read(5, UTIME_NOW), Some(TimeChange::Now));
-        assert_eq!(read(5, UTIME_OMIT), Some(TimeChange::Omit));
-        assert_eq!(
-            read(-5, 999_999_999),
-            Some(TimeChange::At {
-                seconds: -5,
-                nanoseconds: 999_999_999
-            })
-        );
-        for bad in [-1, 1_000_000_000, UTIME_NOW + 1, i64::MIN] {
-            assert!(matches!(
-                TimeChange::from_timespec(0, bad),
-                Err(Error::InvalidTime)
-            ));
-        }
     }
 
     #[test]

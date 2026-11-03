@@ -4,6 +4,7 @@ use std::str;
 
 use event::{EventFlags, RawEventQueue};
 use ferric_abi::id::Caller;
+use ferric_abi::time::TimeChange;
 use indexmap::IndexMap;
 use libredox::protocol::FsCall;
 use libredox::{flag, Fd};
@@ -96,22 +97,51 @@ pub enum RingState {
     },
 }
 
+/// Ferric Oxide: whether an inode handle was opened for writing, which `ftruncate` needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    /// Opened `O_RDONLY`, or not opened by path at all.
+    ReadOnly,
+    /// Opened `O_WRONLY` or `O_RDWR`.
+    Writable,
+}
+
+impl Access {
+    /// The access the `O_ACCMODE` bits of open `flags` ask for.
+    fn from_flags(flags: usize) -> Self {
+        match flags & O_ACCMODE {
+            O_WRONLY | O_RDWR => Self::Writable,
+            _ => Self::ReadOnly,
+        }
+    }
+}
+
 pub enum Handle {
-    Inode(usize),
+    Inode(usize, Access),
     Ring(RingState),
 }
 
 impl Handle {
     fn try_as_inode(&self) -> Result<Inode> {
-        match self {
-            &Self::Inode(inode) => Ok(Inode(inode)),
+        self.as_inode().map(Inode)
+    }
+
+    fn as_inode(&self) -> Result<usize> {
+        match *self {
+            Self::Inode(inode, _) => Ok(inode),
             _ => Err(Error::new(EBADFD)),
         }
     }
 
-    fn as_inode(&self) -> Result<usize> {
-        match self {
-            &Self::Inode(inode) => Ok(inode),
+    /// The inode of a handle opened for writing.
+    ///
+    /// # Errors
+    /// `EBADF` for a handle not opened for writing (POSIX `ftruncate`), `EBADFD` for one
+    /// that is not an inode.
+    fn as_writable_inode(&self) -> Result<usize> {
+        match *self {
+            Self::Inode(inode, Access::Writable) => Ok(inode),
+            Self::Inode(_, Access::ReadOnly) => Err(Error::new(EBADF)),
             _ => Err(Error::new(EBADFD)),
         }
     }
@@ -410,7 +440,9 @@ impl<'a> Scheme<'a> {
 
 impl SchemeSync for Scheme<'_> {
     fn scheme_root(&mut self) -> Result<usize> {
-        Ok(self.handles.insert(Handle::Inode(Filesystem::ROOT_INODE)))
+        Ok(self
+            .handles
+            .insert(Handle::Inode(Filesystem::ROOT_INODE, Access::ReadOnly)))
     }
 
     fn openat(
@@ -524,7 +556,9 @@ impl SchemeSync for Scheme<'_> {
             self.open_existing(path, flags | fcntl_flags as usize, ctx.uid, ctx.gid)?
                 .0
         };
-        let new_id = self.handles.insert(Handle::Inode(inode));
+        let new_id = self
+            .handles
+            .insert(Handle::Inode(inode, Access::from_flags(flags)));
         Ok(OpenResult::ThisScheme {
             number: new_id,
             flags: NewFdFlags::POSITIONED,
@@ -579,7 +613,7 @@ impl SchemeSync for Scheme<'_> {
         _ctx: &CallerCtx, // Only pid and id are correct here, uid/gid are not used
     ) -> Result<usize> {
         match self.handles.get_mut(id)? {
-            Handle::Inode(_) => {
+            Handle::Inode(..) => {
                 let Some(verb) = FsCall::try_from_raw(metadata[0] as usize) else {
                     return Err(Error::new(EINVAL));
                 };
@@ -725,7 +759,7 @@ impl SchemeSync for Scheme<'_> {
                 Ok((shm.ptr as usize) + offset)
             }
             // TODO
-            Handle::Inode(_) | Handle::Ring(_) => Err(Error::new(ENOSYS)),
+            Handle::Inode(..) | Handle::Ring(_) => Err(Error::new(ENOSYS)),
         }
     }
 
@@ -1211,7 +1245,8 @@ impl SchemeSync for Scheme<'_> {
         Ok(())
     }
     fn ftruncate(&mut self, fd: usize, size: u64, _ctx: &CallerCtx) -> Result<()> {
-        let inode = self.handles.get(fd)?.as_inode()?;
+        // Ferric Oxide: the kernel does not check the descriptor's access mode.
+        let inode = self.handles.get(fd)?.as_writable_inode()?;
         let file = self
             .filesystem
             .files
@@ -1238,21 +1273,24 @@ impl SchemeSync for Scheme<'_> {
         }
         Ok(())
     }
-    fn futimens(&mut self, fd: usize, times: &[TimeSpec], _ctx: &CallerCtx) -> Result<()> {
-        let inode = self.handles.get(fd)?.as_inode()?;
-        let file = self
-            .filesystem
-            .files
-            .get_mut(&inode)
-            .ok_or(Error::new(EBADFD))?;
-
-        let new_atime = *times.get(0).ok_or(Error::new(EINVAL))?;
-        let new_mtime = *times.get(1).ok_or(Error::new(EINVAL))?;
-
-        file.atime = new_atime;
-        file.mtime = new_mtime;
-
-        Ok(())
+    fn futimens(&mut self, fd: usize, times: &[TimeSpec], ctx: &CallerCtx) -> Result<()> {
+        // Ferric Oxide: relibc sends both times, with UTIME_NOW for a null pointer.
+        let &[accessed, modified] = times else {
+            return Err(Error::new(EINVAL));
+        };
+        let change = |time: TimeSpec| {
+            TimeChange::from_timespec(time.tv_sec, time.tv_nsec.into())
+                .map_err(|_| Error::new(EINVAL))
+        };
+        let (accessed, modified) = (change(accessed)?, change(modified)?);
+        // futimens arrives as a StdFsCall, whose ctx carries no IDs.
+        let caller = self.std_fs_caller(ctx)?;
+        self.inode_file_mut(fd)?.set_times_by(
+            caller,
+            accessed,
+            modified,
+            filesystem::current_time(),
+        )
     }
 
     fn relpathat(
@@ -1396,7 +1434,9 @@ impl SchemeSync for Scheme<'_> {
             }
         }
 
-        Ok(self.handles.insert(Handle::Inode(new_inode_number)))
+        Ok(self
+            .handles
+            .insert(Handle::Inode(new_inode_number, Access::ReadOnly)))
     }
 
     fn std_fs_call(
@@ -1448,7 +1488,7 @@ impl SchemeSync for Scheme<'_> {
         };
 
         match handle {
-            Handle::Inode(inode) => {
+            Handle::Inode(inode, _) => {
                 let Some(inode_info) = self.filesystem.files.get_mut(&inode) else {
                     return;
                 };
@@ -1468,18 +1508,7 @@ impl SchemeSync for Scheme<'_> {
     }
 }
 pub fn current_perm(file: &crate::filesystem::File, uid: u32, gid: u32) -> u8 {
-    let perm = file.mode & MODE_PERM;
-
-    if uid == 0 {
-        // root doesn't have to be checked
-        0o7
-    } else if uid == file.uid {
-        ((perm & 0o700) >> 6) as u8
-    } else if gid == file.gid {
-        ((perm & 0o70) >> 3) as u8
-    } else {
-        (perm & 0o7) as u8
-    }
+    file.ownership().permissions(uid, gid)
 }
 fn check_permissions(flags: usize, single_mode: u8) -> Result<()> {
     if flags & O_ACCMODE == O_RDONLY && single_mode & 0o4 == 0 {

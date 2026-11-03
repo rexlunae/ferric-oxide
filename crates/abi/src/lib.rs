@@ -4,7 +4,7 @@
 //! `redox_syscall` holds the system call ABI itself. This crate holds the values that ride
 //! inside calls whose meaning is fixed by POSIX rather than by the kernel: the `futimens`
 //! sentinels in [`time`] and the `fchown` one in [`id`], with the POSIX rules for who may
-//! change a file's owner, group and mode. It also holds the files through
+//! change a file's owner, group, mode and times. It also holds the files through
 //! which a host's `redoxer` hands a command to the guest's `redoxerd` and reads its result,
 //! in [`redoxerd`], and the keys and format of the boot environment the bootloader hands the
 //! kernel, in [`boot_env`]. It is `no_std` and has no dependencies, so relibc, the kernel,
@@ -20,7 +20,8 @@
 
 pub mod id {
     //! The owner and group sentinel of `fchown`, `chown` and `fchownat` (POSIX
-    //! `<unistd.h>`), and the rules for who may change a file's owner, group and mode.
+    //! `<unistd.h>`), and the rules for who may change a file's owner, group, mode and
+    //! times.
     //!
     //! relibc passes the `uid_t` and `gid_t` arguments to the `fchown` scheme call as
     //! `u32`s, so POSIX's `(uid_t)-1` and `(gid_t)-1`, "leave this one as it is", arrive as
@@ -28,7 +29,8 @@ pub mod id {
     //!
     //! [`chown_permitted`], [`chmod_permitted`], [`mode_after_chown`] and
     //! [`mode_after_chmod`] follow the POSIX.1-2017 `chown` and `chmod` pages with
-    //! `_POSIX_CHOWN_RESTRICTED` in effect, which a scheme applies after the kernel has
+    //! `_POSIX_CHOWN_RESTRICTED` in effect, and [`times_access`] its `futimens` page; a
+    //! scheme applies them after the kernel has
     //! passed the call on. A [`Caller`] carries the effective IDs only: a scheme is not told
     //! a process's supplementary groups, so "one of the caller's groups" is its effective
     //! group here, which refuses what a supplementary group would have allowed and never the
@@ -42,6 +44,8 @@ pub mod id {
     //! assert_eq!(requested(UNCHANGED), None);
     //! assert_eq!(requested(1000), Some(1000));
     //! ```
+
+    use crate::time::TimeChange;
 
     /// An owner or group argument asking for it to be left as it is: `-1` as a `u32`.
     pub const UNCHANGED: u32 = u32::MAX;
@@ -127,6 +131,53 @@ pub mod id {
     /// file's owner.
     pub const fn chmod_permitted(caller: Caller, owner_uid: u32) -> bool {
         caller.is_privileged() || caller.uid == owner_uid
+    }
+
+    /// What `futimens` needs of its caller for the times it asks for.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TimesAccess {
+        /// The change is permitted.
+        Permitted,
+        /// The change is permitted only if the caller may write the file; `EACCES`
+        /// otherwise.
+        NeedsWrite,
+        /// The change is refused: `EPERM`.
+        NotOwner,
+    }
+
+    /// What `caller` needs to set a file's access and modification times as `accessed` and
+    /// `modified` ask, when `owner_uid` owns the file (POSIX.1-2017 `futimens`).
+    ///
+    /// Two [`TimeChange::Omit`]s change nothing and are checked for nothing. Root and the
+    /// file's owner may make any change. Anyone else may set both times to the current time
+    /// ([`TimeChange::Now`] for both, which is also what a null `times` is sent as) if it may
+    /// write the file, and may not make any other change.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferric_abi::id::{Caller, TimesAccess, times_access};
+    /// use ferric_abi::time::TimeChange;
+    ///
+    /// let user = Caller { uid: 1000, gid: 100 };
+    /// let now = TimeChange::Now;
+    /// let then = TimeChange::At { seconds: 0, nanoseconds: 0 };
+    /// assert_eq!(times_access(user, 0, now, now), TimesAccess::NeedsWrite);
+    /// assert_eq!(times_access(user, 0, then, now), TimesAccess::NotOwner);
+    /// assert_eq!(times_access(user, 1000, then, now), TimesAccess::Permitted);
+    /// ```
+    pub const fn times_access(
+        caller: Caller,
+        owner_uid: u32,
+        accessed: TimeChange,
+        modified: TimeChange,
+    ) -> TimesAccess {
+        match (accessed, modified) {
+            (TimeChange::Omit, TimeChange::Omit) => TimesAccess::Permitted,
+            _ if caller.is_privileged() || caller.uid == owner_uid => TimesAccess::Permitted,
+            (TimeChange::Now, TimeChange::Now) => TimesAccess::NeedsWrite,
+            _ => TimesAccess::NotOwner,
+        }
     }
 
     /// The set-user-ID mode bit (`S_ISUID`).
@@ -228,6 +279,64 @@ pub mod id {
         }
 
         #[test]
+        fn omitting_both_times_needs_nothing() {
+            let omit = TimeChange::Omit;
+            for owner in [0, 1000, 1001] {
+                assert_eq!(
+                    times_access(USER, owner, omit, omit),
+                    TimesAccess::Permitted
+                );
+            }
+        }
+
+        #[test]
+        fn root_and_the_owner_may_set_any_times() {
+            let then = TimeChange::At {
+                seconds: 86_400,
+                nanoseconds: 5,
+            };
+            let changes = [TimeChange::Now, TimeChange::Omit, then];
+            for accessed in changes {
+                for modified in changes {
+                    assert_eq!(
+                        times_access(ROOT, 1000, accessed, modified),
+                        TimesAccess::Permitted
+                    );
+                    assert_eq!(
+                        times_access(USER, 1000, accessed, modified),
+                        TimesAccess::Permitted
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn anyone_else_may_only_touch_both_times_with_write_permission() {
+            let (now, omit) = (TimeChange::Now, TimeChange::Omit);
+            let then = TimeChange::At {
+                seconds: 0,
+                nanoseconds: 0,
+            };
+            assert_eq!(times_access(USER, 0, now, now), TimesAccess::NeedsWrite);
+            for (accessed, modified) in [
+                (then, then),
+                (then, now),
+                (now, then),
+                (then, omit),
+                (omit, then),
+                // POSIX names only "both UTIME_NOW" as the write-permission case.
+                (now, omit),
+                (omit, now),
+            ] {
+                assert_eq!(
+                    times_access(USER, 0, accessed, modified),
+                    TimesAccess::NotOwner,
+                    "{accessed:?} {modified:?}"
+                );
+            }
+        }
+
+        #[test]
         fn only_root_or_the_owner_may_change_a_mode() {
             assert!(chmod_permitted(ROOT, 1000));
             assert!(chmod_permitted(USER, 1000));
@@ -280,7 +389,8 @@ pub mod id {
 }
 
 pub mod time {
-    //! The `tv_nsec` sentinels of `futimens` and `utimensat` (POSIX `<sys/stat.h>`).
+    //! The `tv_nsec` sentinels of `futimens` and `utimensat` (POSIX `<sys/stat.h>`), and
+    //! [`TimeChange`], a `futimens` time read with them.
     //!
     //! relibc passes each time as a `timespec` in the `futimens` scheme call, with these in
     //! `tv_nsec` instead of a number of nanoseconds; a null `times` pointer is sent as two
@@ -309,6 +419,72 @@ pub mod time {
         nanoseconds == UTIME_NOW || nanoseconds == UTIME_OMIT
     }
 
+    /// What a `futimens` call asks for one of a file's times.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TimeChange {
+        /// Set it to the current time ([`UTIME_NOW`]).
+        Now,
+        /// Leave it as it is ([`UTIME_OMIT`]).
+        Omit,
+        /// Set it to this time.
+        At {
+            /// Seconds since 1970-01-01 00:00:00 UTC; negative before it.
+            seconds: i64,
+            /// Nanoseconds, below 1 000 000 000.
+            nanoseconds: u32,
+        },
+    }
+
+    impl TimeChange {
+        /// Reads a `futimens` `timespec`: `nanoseconds` is [`UTIME_NOW`], [`UTIME_OMIT`] or
+        /// the nanoseconds past `seconds`.
+        ///
+        /// # Errors
+        ///
+        /// [`InvalidTime`] when `nanoseconds` is none of those.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use ferric_abi::time::{TimeChange, UTIME_OMIT};
+        ///
+        /// assert_eq!(TimeChange::from_timespec(5, UTIME_OMIT), Ok(TimeChange::Omit));
+        /// assert!(TimeChange::from_timespec(5, -1).is_err());
+        /// ```
+        pub const fn from_timespec(seconds: i64, nanoseconds: i64) -> Result<Self, InvalidTime> {
+            match nanoseconds {
+                UTIME_NOW => Ok(Self::Now),
+                UTIME_OMIT => Ok(Self::Omit),
+                // In range, so the cast is exact.
+                0..1_000_000_000 => Ok(Self::At {
+                    seconds,
+                    nanoseconds: nanoseconds as u32,
+                }),
+                _ => Err(InvalidTime { nanoseconds }),
+            }
+        }
+    }
+
+    /// A `futimens` `tv_nsec` that is neither a number of nanoseconds into a second nor
+    /// one of the sentinels: POSIX's `EINVAL`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct InvalidTime {
+        /// The `tv_nsec` that was sent.
+        pub nanoseconds: i64,
+    }
+
+    impl core::fmt::Display for InvalidTime {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(
+                f,
+                "{} is neither nanoseconds below one second nor UTIME_NOW or UTIME_OMIT",
+                self.nanoseconds
+            )
+        }
+    }
+
+    impl core::error::Error for InvalidTime {}
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -321,6 +497,35 @@ pub mod time {
             assert_eq!(UTIME_OMIT, 0x3FFF_FFFE);
             for real in [0, 1, 999_999_999] {
                 assert!(!is_sentinel(real));
+            }
+        }
+
+        #[test]
+        fn futimens_times_are_read() {
+            assert_eq!(TimeChange::from_timespec(5, UTIME_NOW), Ok(TimeChange::Now));
+            assert_eq!(
+                TimeChange::from_timespec(5, UTIME_OMIT),
+                Ok(TimeChange::Omit)
+            );
+            assert_eq!(
+                TimeChange::from_timespec(-5, 999_999_999),
+                Ok(TimeChange::At {
+                    seconds: -5,
+                    nanoseconds: 999_999_999
+                })
+            );
+            assert_eq!(
+                TimeChange::from_timespec(7, 0),
+                Ok(TimeChange::At {
+                    seconds: 7,
+                    nanoseconds: 0
+                })
+            );
+            for bad in [-1, 1_000_000_000, UTIME_NOW + 1, i64::MIN, i64::MAX] {
+                assert_eq!(
+                    TimeChange::from_timespec(0, bad),
+                    Err(InvalidTime { nanoseconds: bad })
+                );
             }
         }
     }

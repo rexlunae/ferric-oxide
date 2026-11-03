@@ -1,5 +1,6 @@
-# Ferric Oxide: checks that a ramfs file's owner, group and mode change only under the
-# POSIX rules (#246). Uses the logging ramfs, which every image runs. Only for test images.
+# Ferric Oxide: checks that a ramfs file's owner, group and mode (#246), and its times and
+# size (#375), change only under the POSIX rules. Uses the logging ramfs, which every image
+# runs. Only for test images.
 [source]
 path = "recipes/tests/ferric-owner-test/files"
 
