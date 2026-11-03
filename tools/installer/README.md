@@ -18,15 +18,31 @@ It is recommended to compile with `cargo`, in release mode:
 cargo build --release
 ```
 
-By default, you will be prompted to supply configuration options. You can
-use the scripted mode by supplying a configuration file:
+The installer writes an image (or a disk) from a filesystem configuration:
 ```bash
-cargo run --release -- config/desktop.toml
+cargo run --release -- --config config/desktop.toml disk.img
 ```
 An example configuration can be found in [config/desktop.toml](./config/desktop.toml).
-Unsuplied configuration will use the default. You can use the `general.prompt`
-setting to prompt when configuration is not set. Multiple configurations can
-be specified, they will be built in order.
+Unsupplied configuration will use the default. You can use the `general.prompt`
+setting to prompt when configuration is not set.
+
+### Command line
+
+`redox_installer --help` lists every option. The command line is parsed with
+[clap](https://crates.io/crates/clap), so an option's value may follow it as a
+separate argument or after `=`, and options with a short form also take it
+attached: `--config file.toml`, `--config=file.toml`, `-c file.toml` and
+`-cfile.toml` are the same. The short forms are `-c` (`--config`), `-b`
+(`--cookbook`), `-o` (`--output-config`) and `-l` (`--list-packages`). A
+repeated option takes its last value. Unknown options, a missing or malformed
+value (such as `--size` that is not a number), more than one disk path, and
+`--fox-*` options without the option they depend on (`--fox`, or
+`--fox-packages` for `--fox-locked` and `--fox-level`) are rejected with a
+usage error before anything is read or written.
+
+Without a disk path, and without `--list-packages`, `--filesystem-size` or
+`--output-config`, the installer prints its help to standard error and exits
+with status 1.
 
 ## Image size
 
