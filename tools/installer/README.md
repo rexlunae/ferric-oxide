@@ -18,11 +18,14 @@ It is recommended to compile with `cargo`, in release mode:
 cargo build --release
 ```
 
-The installer writes an image (or a disk) from a filesystem configuration:
+The installer writes an image (or a disk) from a filesystem configuration,
+taking the configured packages from a cookbook checkout whose `repo/<target>/`
+holds the built packages (from the repository root):
 ```bash
-cargo run --release -- --config config/desktop.toml disk.img
+cargo run --release -p redox_installer -- --config config/desktop.toml --cookbook . disk.img
 ```
-An example configuration can be found in [config/desktop.toml](./config/desktop.toml).
+Without `--cookbook`, a configuration that lists packages fails to install.
+The image configurations are in the repository's `config/` directory; [config/desktop.toml](./config/desktop.toml) here is a generated, flattened example.
 Unsupplied configuration will use the default. You can use the `general.prompt`
 setting to prompt when configuration is not set.
 
