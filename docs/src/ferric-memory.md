@@ -243,6 +243,35 @@ reply-slot state machine is included in host/Miri helper tests for both
 reply/park orders, stale replies, duplicates and failed dispatch cleanup;
 those tests do not emulate a user-copy fault or a hardware context switch.
 
+### Out of memory in a page fault
+
+A fault on a user address, raised by user mode or by a kernel copy to or from
+user memory (usercopy), first tries to map the page: demand paging, copy on
+write, or a borrowed mapping. That can fail for lack of memory, when no
+physical frame is free or a page reference count would overflow
+(`PfError::Oom`). The handler used to panic there (`todo!("oom")`,
+[#372](https://github.com/rexlunae/ferric-oxide/issues/372)); it now fails
+the faulting operation instead, through the same paths as a refused access:
+
+- A usercopy fault makes the copy fail, and the system call returns `EFAULT`.
+  `futex`, which corrects the page tables itself, still returns `ENOMEM`.
+- A user-mode fault is unhandled. On every architecture the fault path
+  delivers it as an exception to the faulting thread, which `redox-rt` turns
+  into a signal (`SIGSEGV` for a page fault on x86_64, whose default action
+  ends the process); a thread with no
+  exception handler, or one that faults again while handling the exception
+  (for example because its handler also needs a page), is ended by the kernel
+  with the exception as its status.
+
+The kernel logs a warning naming the address, and with `kernel.trace_mm` the
+`mm.page_fault` record has the `out of memory` outcome. No process is exempt:
+a service the system needs, such as `redoxfs`, fails as it would on any other
+fatal fault, and the kernel keeps running. Choosing a victim to free memory
+(an OOM killer), a distinct signal such as `SIGBUS`, or protecting essential
+services are not implemented. The decision is in
+`crates/kernel/src/memory/fault_outcome.rs` and is host-tested by
+`crates/kernel/tests`; no boot test exhausts memory yet.
+
 ## KPTI and PCID
 
 `kernel.cpu.kpti` defaults to `auto`. It enables kernel page-table isolation
