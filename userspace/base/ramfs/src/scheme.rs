@@ -5,6 +5,7 @@ use std::str;
 use event::{EventFlags, RawEventQueue};
 use ferric_abi::id::Caller;
 use ferric_abi::new_fd::APPENDS;
+use ferric_abi::time::TimeChange;
 use indexmap::IndexMap;
 use libredox::protocol::FsCall;
 use libredox::{flag, Fd};
@@ -97,22 +98,68 @@ pub enum RingState {
     },
 }
 
+/// Ferric Oxide: the access mode (`O_ACCMODE` bits) a descriptor was opened with. The
+/// kernel checks none of it (#375, #400): `read` and `write` pass the descriptor's flags
+/// in, and inode handles keep their own for `ftruncate`, which does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Access(usize);
+
+impl Access {
+    /// The access of a handle not opened by path for writing: the root and passed-in
+    /// descriptors.
+    const READ_ONLY: Self = Self(O_RDONLY);
+
+    /// The access the `O_ACCMODE` bits of open or fcntl `flags` give.
+    fn from_flags(flags: usize) -> Self {
+        Self(flags & O_ACCMODE)
+    }
+
+    /// Whether this access allows transfers in `direction`.
+    fn allows(self, direction: Direction) -> bool {
+        match direction {
+            Direction::Read => matches!(self.0, O_RDONLY | O_RDWR),
+            Direction::Write => matches!(self.0, O_WRONLY | O_RDWR),
+        }
+    }
+
+    /// Checks that this access allows transfers in `direction`.
+    ///
+    /// # Errors
+    /// `EBADF`, as POSIX `read`, `write` and `ftruncate` return, when it does not.
+    fn check(self, direction: Direction) -> Result<()> {
+        if self.allows(direction) {
+            Ok(())
+        } else {
+            Err(Error::new(EBADF))
+        }
+    }
+}
+
 pub enum Handle {
-    Inode(usize),
+    Inode(usize, Access),
     Ring(RingState),
 }
 
 impl Handle {
     fn try_as_inode(&self) -> Result<Inode> {
-        match self {
-            &Self::Inode(inode) => Ok(Inode(inode)),
+        self.as_inode().map(Inode)
+    }
+
+    fn as_inode(&self) -> Result<usize> {
+        match *self {
+            Self::Inode(inode, _) => Ok(inode),
             _ => Err(Error::new(EBADFD)),
         }
     }
 
-    fn as_inode(&self) -> Result<usize> {
-        match self {
-            &Self::Inode(inode) => Ok(inode),
+    /// The inode of a handle opened for writing.
+    ///
+    /// # Errors
+    /// `EBADF` for a handle not opened for writing (POSIX `ftruncate`), `EBADFD` for one
+    /// that is not an inode.
+    fn as_writable_inode(&self) -> Result<usize> {
+        match *self {
+            Self::Inode(inode, access) => access.check(Direction::Write).map(|()| inode),
             _ => Err(Error::new(EBADFD)),
         }
     }
@@ -311,7 +358,7 @@ impl<'a> Scheme<'a> {
         let current_perm = current_perm(file, uid, gid);
         check_permissions(flags, current_perm)?;
 
-        let opened_as_write = flags & O_ACCMODE == O_WRONLY || flags & O_ACCMODE == O_RDWR;
+        let opened_as_write = Access::from_flags(flags).allows(Direction::Write);
 
         if flags & O_TRUNC == O_TRUNC && opened_as_write {
             match file.data {
@@ -411,7 +458,9 @@ impl<'a> Scheme<'a> {
 
 impl SchemeSync for Scheme<'_> {
     fn scheme_root(&mut self) -> Result<usize> {
-        Ok(self.handles.insert(Handle::Inode(Filesystem::ROOT_INODE)))
+        Ok(self
+            .handles
+            .insert(Handle::Inode(Filesystem::ROOT_INODE, Access::READ_ONLY)))
     }
 
     fn openat(
@@ -525,7 +574,9 @@ impl SchemeSync for Scheme<'_> {
             self.open_existing(path, flags | fcntl_flags as usize, ctx.uid, ctx.gid)?
                 .0
         };
-        let new_id = self.handles.insert(Handle::Inode(inode));
+        let new_id = self
+            .handles
+            .insert(Handle::Inode(inode, Access::from_flags(flags)));
         // Ferric Oxide: `O_APPEND` writes go to the end, so the kernel may move the cursor to
         // `fsize` after them (#244).
         Ok(OpenResult::ThisScheme {
@@ -582,7 +633,7 @@ impl SchemeSync for Scheme<'_> {
         _ctx: &CallerCtx, // Only pid and id are correct here, uid/gid are not used
     ) -> Result<usize> {
         match self.handles.get_mut(id)? {
-            Handle::Inode(_) => {
+            Handle::Inode(..) => {
                 let Some(verb) = FsCall::try_from_raw(metadata[0] as usize) else {
                     return Err(Error::new(EINVAL));
                 };
@@ -728,7 +779,7 @@ impl SchemeSync for Scheme<'_> {
                 Ok((shm.ptr as usize) + offset)
             }
             // TODO
-            Handle::Inode(_) | Handle::Ring(_) => Err(Error::new(ENOSYS)),
+            Handle::Inode(..) | Handle::Ring(_) => Err(Error::new(ENOSYS)),
         }
     }
 
@@ -1235,7 +1286,8 @@ impl SchemeSync for Scheme<'_> {
         Ok(())
     }
     fn ftruncate(&mut self, fd: usize, size: u64, _ctx: &CallerCtx) -> Result<()> {
-        let inode = self.handles.get(fd)?.as_inode()?;
+        // Ferric Oxide: the kernel does not check the descriptor's access mode.
+        let inode = self.handles.get(fd)?.as_writable_inode()?;
         let file = self
             .filesystem
             .files
@@ -1262,21 +1314,24 @@ impl SchemeSync for Scheme<'_> {
         }
         Ok(())
     }
-    fn futimens(&mut self, fd: usize, times: &[TimeSpec], _ctx: &CallerCtx) -> Result<()> {
-        let inode = self.handles.get(fd)?.as_inode()?;
-        let file = self
-            .filesystem
-            .files
-            .get_mut(&inode)
-            .ok_or(Error::new(EBADFD))?;
-
-        let new_atime = *times.get(0).ok_or(Error::new(EINVAL))?;
-        let new_mtime = *times.get(1).ok_or(Error::new(EINVAL))?;
-
-        file.atime = new_atime;
-        file.mtime = new_mtime;
-
-        Ok(())
+    fn futimens(&mut self, fd: usize, times: &[TimeSpec], ctx: &CallerCtx) -> Result<()> {
+        // Ferric Oxide: relibc sends both times, with UTIME_NOW for a null pointer.
+        let &[accessed, modified] = times else {
+            return Err(Error::new(EINVAL));
+        };
+        let change = |time: TimeSpec| {
+            TimeChange::from_timespec(time.tv_sec, time.tv_nsec.into())
+                .map_err(|_| Error::new(EINVAL))
+        };
+        let (accessed, modified) = (change(accessed)?, change(modified)?);
+        // futimens arrives as a StdFsCall, whose ctx carries no IDs.
+        let caller = self.std_fs_caller(ctx)?;
+        self.inode_file_mut(fd)?.set_times_by(
+            caller,
+            accessed,
+            modified,
+            filesystem::current_time(),
+        )
     }
 
     fn relpathat(
@@ -1420,7 +1475,9 @@ impl SchemeSync for Scheme<'_> {
             }
         }
 
-        Ok(self.handles.insert(Handle::Inode(new_inode_number)))
+        Ok(self
+            .handles
+            .insert(Handle::Inode(new_inode_number, Access::READ_ONLY)))
     }
 
     fn std_fs_call(
@@ -1472,7 +1529,7 @@ impl SchemeSync for Scheme<'_> {
         };
 
         match handle {
-            Handle::Inode(inode) => {
+            Handle::Inode(inode, _) => {
                 let Some(inode_info) = self.filesystem.files.get_mut(&inode) else {
                     return;
                 };
@@ -1492,18 +1549,7 @@ impl SchemeSync for Scheme<'_> {
     }
 }
 pub fn current_perm(file: &crate::filesystem::File, uid: u32, gid: u32) -> u8 {
-    let perm = file.mode & MODE_PERM;
-
-    if uid == 0 {
-        // root doesn't have to be checked
-        0o7
-    } else if uid == file.uid {
-        ((perm & 0o700) >> 6) as u8
-    } else if gid == file.gid {
-        ((perm & 0o70) >> 3) as u8
-    } else {
-        (perm & 0o7) as u8
-    }
+    file.ownership().permissions(uid, gid)
 }
 fn check_permissions(flags: usize, single_mode: u8) -> Result<()> {
     if flags & O_ACCMODE == O_RDONLY && single_mode & 0o4 == 0 {
@@ -1529,16 +1575,7 @@ enum Direction {
 /// # Errors
 /// `EBADF`, as POSIX `read` and `write` return, when its `O_ACCMODE` bits do not allow it.
 fn check_open_for(fcntl_flags: u32, direction: Direction) -> Result<()> {
-    let mode = fcntl_flags as usize & O_ACCMODE;
-    let allowed = match direction {
-        Direction::Read => matches!(mode, O_RDONLY | O_RDWR),
-        Direction::Write => matches!(mode, O_WRONLY | O_RDWR),
-    };
-    if allowed {
-        Ok(())
-    } else {
-        Err(Error::new(EBADF))
-    }
+    Access::from_flags(fcntl_flags as usize).check(direction)
 }
 
 #[cfg(test)]
@@ -1546,7 +1583,9 @@ mod tests {
     use syscall::flag::{O_APPEND, O_NONBLOCK};
     use syscall::EBADF;
 
-    use super::{check_open_for, Direction, TryFrom, O_RDONLY, O_RDWR, O_WRONLY};
+    use super::{
+        check_open_for, Access, Direction, TryFrom, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+    };
 
     fn flags(flags: usize) -> u32 {
         u32::try_from(flags).expect("open flags fit in the fcntl flags")
@@ -1573,5 +1612,20 @@ mod tests {
         check_open_for(flags(O_WRONLY | O_APPEND), Direction::Write).unwrap();
         check_open_for(flags(O_RDWR), Direction::Read).unwrap();
         check_open_for(flags(O_RDWR), Direction::Write).unwrap();
+    }
+
+    /// #375: an inode handle keeps its open access for `ftruncate`, which the kernel passes
+    /// no flags for; the root and passed-in handles are read-only.
+    #[test]
+    fn a_handle_truncates_only_if_opened_for_writing() {
+        let read_only = Access::from_flags(O_RDONLY | O_CREAT | O_TRUNC);
+        assert_eq!(read_only, Access::READ_ONLY);
+        assert_eq!(read_only.check(Direction::Write).unwrap_err().errno, EBADF);
+        Access::READ_ONLY.check(Direction::Read).unwrap();
+        for writable in [O_WRONLY, O_RDWR | O_CREAT] {
+            Access::from_flags(writable)
+                .check(Direction::Write)
+                .unwrap();
+        }
     }
 }

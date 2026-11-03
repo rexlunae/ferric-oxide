@@ -80,6 +80,12 @@ pub enum Error {
     Write(#[from] crate::write::WriteError),
 }
 
+impl From<ferric_abi::time::InvalidTime> for Error {
+    fn from(_: ferric_abi::time::InvalidTime) -> Self {
+        Self::InvalidTime
+    }
+}
+
 impl Error {
     /// The errno a scheme call returns for this error.
     pub fn errno(&self) -> i32 {
@@ -186,6 +192,8 @@ mod tests {
     fn times_errors_map_to_their_errno() {
         assert_eq!(Error::NotOwner.errno(), EPERM);
         assert_eq!(Error::InvalidTime.errno(), EINVAL);
+        let bad = ferric_abi::time::InvalidTime { nanoseconds: -1 };
+        assert_eq!(Error::from(bad).errno(), EINVAL);
     }
 
     #[cfg(feature = "write")]

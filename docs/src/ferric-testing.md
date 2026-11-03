@@ -1568,10 +1568,11 @@ alone does not exercise the credential check.
 ## ramfs ownership changes
 
 `ferric-owner-test` runs in the smoke image and checks `ramfs`'s `fchown` and
-`fchmod` (#246), and its `write` access check (#400), on `/scheme/logging`,
-the instance every image runs. As root it creates a file root owns that anyone
-may open for writing, and one user 1000 owns with mode `6755`, then runs itself
-as user 1000:
+`fchmod` (#246), its `write` access check (#400), and its `futimens` and
+`ftruncate` (#375), on `/scheme/logging`, the instance every image runs. As
+root it creates a file root owns that anyone may open for writing, one root
+owns that only root may write, and one user 1000 owns with mode `6755`, then
+runs itself as user 1000:
 
 - `owner-refused`: on root's file, `fchown` to its own user or group and
   `fchmod` are refused, and root then finds the file unchanged;
@@ -1581,16 +1582,30 @@ as user 1000:
 - `owner-write`: `write` through a descriptor it opened read-only is refused
   (`EBADF`), even on its own file, and allowed through one it opened
   write-only on root's writable file; root then finds its own file empty and
-  root's holding the bytes written (#400).
+  root's starting with the bytes written (#400);
+- `owner-times-refused`: `futimens` with explicit times on root's files is
+  refused (`EPERM`), and so is setting both to the current time on the file it
+  may not write (`EACCES`); root then finds that file's times unchanged;
+- `owner-times-allowed`: it may set both times of root's writable file to the
+  current time, and its own file's access time while `UTIME_OMIT` keeps the
+  modification time; root then finds exactly those times, the current ones
+  within the realtime clock readings it took before and after the child;
+- `owner-truncate`: `ftruncate` through a descriptor opened read-only is
+  refused (`EBADF` or `EINVAL`), even on its own file, and allowed through one
+  opened for writing, which extends root's file past the bytes `owner-write`
+  wrote; root then finds the sizes it expects and the extension zeroed.
 
-`fchown` reaches `ramfs` as the kernel's direct call and `fchmod` as a
-`StdFsCall`, so the first two steps cover both ways `ramfs` learns the caller's IDs.
+`fchown` reaches `ramfs` as the kernel's direct call, and `fchmod`, `futimens`
+and `ftruncate` as a `StdFsCall`, so the steps cover both ways `ramfs` learns
+the caller's IDs. The test takes the `UTIME_*` sentinels from
+`ferric_abi::time`: the `libc` crate's values for Redox differ from relibc's.
 Without `/scheme/logging` it prints a skip. The rules themselves have host
-tests in `crates/abi` (`ferric_abi::id`) and `userspace/base/ramfs`, which the
-base-workspace job in `host-tools.yml` runs; procmgr's reply is decoded by
-`ferric-proc-creds` (`crates/proc-creds`), whose tests the root workspace runs.
-`host-tools.yml` also checks the test's formatting, target Clippy and Rustdoc;
-the image workflow requires all three steps.
+tests in `crates/abi` (`ferric_abi::id` and `ferric_abi::time`) and
+`userspace/base/ramfs`, which the base-workspace job in `host-tools.yml` runs;
+procmgr's reply is decoded by `ferric-proc-creds` (`crates/proc-creds`), whose
+tests the root workspace runs. `host-tools.yml` also checks the test's
+formatting, target Clippy and Rustdoc; the image workflow requires all six
+steps.
 
 ## O_APPEND cursors
 

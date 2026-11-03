@@ -3,9 +3,14 @@
 version = 4
 
 [[package]]
+name = "ferric-abi"
+version = "0.1.0"
+
+[[package]]
 name = "ferric-owner-test"
 version = "0.1.0"
 dependencies = [
+ "ferric-abi",
  "libc",
 ]
 
