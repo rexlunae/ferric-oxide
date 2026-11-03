@@ -2083,6 +2083,29 @@ impl<'a, D: Disk> Transaction<'a, D> {
 
         Ok(buf.len())
     }
+
+    /// Ferric Oxide: writes the bytes at `buf` to the end of `node` (`O_APPEND`), and
+    /// returns the offset they were written at, the node's size before the write.
+    ///
+    /// The size is read in the same transaction as the write, so concurrent appends served
+    /// by this file system never overlap. The node's size afterwards (what `fsize`
+    /// reports, and where the kernel puts an appending description's cursor) is the
+    /// returned offset plus `buf.len()`.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::read_tree`] and [`Self::write_node`].
+    pub fn append_node(
+        &mut self,
+        node_ptr: TreePtr<Node>,
+        buf: &[u8],
+        mtime: u64,
+        mtime_nsec: u32,
+    ) -> Result<u64> {
+        let offset = self.read_tree(node_ptr)?.data().size();
+        self.write_node(node_ptr, offset, buf, mtime, mtime_nsec)?;
+        Ok(offset)
+    }
 }
 
 /// Ferric Oxide: rejects a name too long for a directory entry with `EINVAL`.

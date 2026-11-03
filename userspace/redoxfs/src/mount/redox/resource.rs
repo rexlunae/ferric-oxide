@@ -636,23 +636,20 @@ impl<D: Disk> Resource<D> for FileResource {
         if self.flags & O_ACCMODE != O_RDWR && self.flags & O_ACCMODE != O_WRONLY {
             return Err(Error::new(EBADF));
         }
-        let effective_offset = if self.flags & O_APPEND == O_APPEND {
-            let node = tx.read_tree(self.node_ptr)?;
-            node.data().size()
-        } else {
-            offset
-        };
         if let Some(fmap_info) = fmaps.get_mut(&self.node_ptr.id()) {
             fmap_info.version += 1;
         }
         let mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        let count = tx.write_node(
-            self.node_ptr,
-            effective_offset,
-            buf,
-            mtime.as_secs(),
-            mtime.subsec_nanos(),
-        )?;
+        let (secs, nsecs) = (mtime.as_secs(), mtime.subsec_nanos());
+        // Ferric Oxide: an append ignores `offset`; the kernel moves the description's
+        // cursor to the size `fsize` reports afterwards.
+        let (effective_offset, count) = if self.flags & O_APPEND == O_APPEND {
+            let start = tx.append_node(self.node_ptr, buf, secs, nsecs)?;
+            (start, buf.len())
+        } else {
+            let count = tx.write_node(self.node_ptr, offset, buf, secs, nsecs)?;
+            (offset, count)
+        };
         // Ferric Oxide: live mappings see the write, so a range reused while mapped holds the
         // file's bytes when `fmap` marks it current.
         if let Some(fmap_info) = fmaps.get_mut(&self.node_ptr.id()) {

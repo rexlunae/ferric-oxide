@@ -1090,3 +1090,53 @@ fn split_htree_with_multiple_levels_using_duplicates() {
         .unwrap();
     });
 }
+
+/// Ferric Oxide: the contents of `node` up to its size.
+fn node_contents(fs: &mut FileSystem<DiskSparse>, node: TreePtr<Node>) -> Vec<u8> {
+    fs.tx(|tx| {
+        let size = tx.read_tree(node)?.data().size();
+        let mut buf = vec![0; usize::try_from(size).unwrap()];
+        let n = tx.read_node(node, 0, &mut buf, 0, 0)?;
+        buf.truncate(n);
+        Ok(buf)
+    })
+    .unwrap()
+}
+
+/// Ferric Oxide (#244): an append from cursor 0 on a non-empty file writes at the old end,
+/// and the size afterwards, which the kernel makes the description's cursor, is the end of
+/// the appended bytes. Reading from there returns nothing.
+#[test]
+fn append_writes_at_the_end_and_the_size_is_the_new_cursor() {
+    with_redoxfs(|mut fs| {
+        let root = TreePtr::root();
+        let file = fs
+            .tx(|tx| tx.create_node(root, "log", Node::MODE_FILE, 0, 0))
+            .unwrap()
+            .ptr();
+        let first = b"0123456789abcdef";
+        fs.tx(|tx| tx.write_node(file, 0, first, 0, 0)).unwrap();
+
+        // The kernel passes the description's cursor, 0, but an append ignores it.
+        let start = fs.tx(|tx| tx.append_node(file, b"more", 0, 0)).unwrap();
+        assert_eq!(start, 16);
+        let size = fs.tx(|tx| tx.read_tree(file)).unwrap().data().size();
+        assert_eq!(size, 20);
+        assert_eq!(node_contents(&mut fs, file), b"0123456789abcdefmore");
+        let mut rest = [0; 8];
+        assert_eq!(
+            fs.tx(|tx| tx.read_node(file, size, &mut rest, 0, 0))
+                .unwrap(),
+            0
+        );
+
+        // A second append, larger than inline data, starts at the new end.
+        let big = vec![0x5a; 3 * BLOCK_SIZE as usize];
+        let start = fs.tx(|tx| tx.append_node(file, &big, 0, 0)).unwrap();
+        assert_eq!(start, 20);
+        let contents = node_contents(&mut fs, file);
+        assert_eq!(contents.len(), 20 + big.len());
+        assert_eq!(&contents[..20], b"0123456789abcdefmore");
+        assert_eq!(&contents[20..], &big[..]);
+    });
+}
