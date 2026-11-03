@@ -39,7 +39,7 @@ use super::{
     tcb::{Master, Tcb},
 };
 
-pub use super::load_error::{DlError, ObjectIoOperation};
+pub use super::load_error::{DlError, LoadError, ObjectIoOperation};
 use super::mmap_file::MmapFile;
 
 pub type Result<T> = core::result::Result<T, DlError>;
@@ -752,12 +752,15 @@ impl Linker {
             // Ensure TLS is aligned to 16 bytes for SSE
             self.tls_size.next_multiple_of(16),
         )
-        .map_err(|err| {
+        .map_err(|source| {
+            let error = DlError::Load {
+                path: path.to_string(),
+                source,
+            };
             if debug {
-                eprintln!("[ld.so]: failed to load '{}': {}", name, err)
+                eprintln!("[ld.so]: failed to load '{name}': {error}");
             }
-
-            DlError::Malformed
+            error
         })?;
 
         if debug {

@@ -733,8 +733,13 @@ assumed to share this cause.
 ld.so's fatal message is followed by a second `[ld.so]:` line with the reason
 for the failing attempt: the path, original errno and exact operation (`open`,
 `fstat`, the `pread` of the object's headers, or `mmap`, including the requested
-mapping length), or the search paths
-a library is in none of. Thus an `ENOMEM` while loading a library does not by
+mapping length), the search paths
+a library is in none of, or why an opened object could not be loaded (invalid
+ELF headers, a missing `PT_LOAD` or `PT_DYNAMIC` segment, an invalid dynamic
+segment or section with the `object` crate's error, a segment outside the file
+or the mapping, or the `mmap` of its segments with the requested length and
+errno). `dlerror` returns a distinct message for each of these load failures
+instead of one generic "malformed" message. Thus an `ENOMEM` while loading a library does not by
 itself establish physical memory exhaustion or even that `open` failed. The next
 occurrence names the file and error without `LD_DEBUG`. Context is carried
 by the typed load error, with its original errno, so a later malformed object
@@ -743,7 +748,9 @@ or TLS failure cannot reuse an earlier search diagnostic. The host check
 mapping ownership, error, fatal-message formatter and errno modules. It checks
 candidate order,
 successful fallback, missing and inaccessible libraries reaching the fatal
-output, isolation from a later parse/TLS failure, stable `dlerror` messages,
+output, isolation from a later parse/TLS failure, stable `dlerror` messages
+(one per load failure kind), load failures naming the object and keeping their
+`object::Error` or errno source,
 and descriptor cleanup after failed stat, header-read and map operations. File
 descriptors are owned immediately after open, including on error paths; a
 successful mapping retains its descriptor until after unmap. It also checks that

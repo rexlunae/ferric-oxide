@@ -4,7 +4,7 @@
 //! A later parse, relocation or TLS failure therefore cannot report an earlier I/O failure.
 
 use alloc::{string::String, vec::Vec};
-use core::fmt;
+use core::{ffi::CStr, fmt, ops::Range};
 
 use crate::error::Errno;
 
@@ -32,6 +32,103 @@ pub(super) struct ObjectIoError {
     pub(super) source: Errno,
 }
 
+/// Why an object's bytes could not be turned into a loaded image.
+///
+/// Returned by `DSO::new` and carried by [`DlError::Load`] with the object's path.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum LoadError {
+    /// The ELF file and program headers could not be parsed.
+    Parse(object::Error),
+    /// The object has no `PT_LOAD` segment, so there is nothing to map.
+    NoLoadSegment,
+    /// Mapping anonymous memory for the object's segments failed.
+    Map {
+        /// Requested mapping length in bytes.
+        size: usize,
+        /// Original platform error.
+        source: Errno,
+    },
+    /// A `PT_LOAD` segment's file range lies outside the object's bytes.
+    SegmentOutsideFile {
+        /// Byte range in the file named by the segment.
+        range: Range<usize>,
+    },
+    /// A `PT_LOAD` segment's contents do not fit in the object's mapping.
+    SegmentOutsideMapping {
+        /// Byte range in the mapping the segment would be copied to.
+        range: Range<usize>,
+    },
+    /// The `PT_DYNAMIC` segment's offset or size is invalid.
+    DynamicSegment(object::Error),
+    /// The object has no `PT_DYNAMIC` segment.
+    NoDynamicSegment,
+    /// An entry of the dynamic section is invalid or refers to invalid data.
+    DynamicSection(object::Error),
+}
+
+impl LoadError {
+    /// Returns the stable, null-terminated message used by `dlerror`.
+    pub const fn repr(&self) -> &'static CStr {
+        match self {
+            Self::Parse(_) => {
+                c"The DSO's ELF headers are invalid. Set `LD_DEBUG=all` for more information."
+            }
+            Self::NoLoadSegment => c"The DSO has no loadable segment.",
+            Self::Map { .. } => {
+                c"Failed to map memory for the DSO. Set `LD_DEBUG=all` for more information."
+            }
+            Self::SegmentOutsideFile { .. } => {
+                c"A DSO segment extends past the end of its file. Set `LD_DEBUG=all` for more information."
+            }
+            Self::SegmentOutsideMapping { .. } => {
+                c"A DSO segment does not fit in its mapping. Set `LD_DEBUG=all` for more information."
+            }
+            Self::DynamicSegment(_) => {
+                c"The DSO's dynamic segment is invalid. Set `LD_DEBUG=all` for more information."
+            }
+            Self::NoDynamicSegment => c"The DSO has no dynamic segment.",
+            Self::DynamicSection(_) => {
+                c"The DSO's dynamic section is invalid. Set `LD_DEBUG=all` for more information."
+            }
+        }
+    }
+}
+
+impl fmt::Display for LoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parse(_) => f.write_str("invalid ELF headers"),
+            Self::NoLoadSegment => f.write_str("no PT_LOAD segment"),
+            Self::Map { size, .. } => write!(f, "mapping {size} bytes failed"),
+            Self::SegmentOutsideFile { range } => {
+                write!(f, "segment file range {range:#x?} is outside the file")
+            }
+            Self::SegmentOutsideMapping { range } => {
+                write!(f, "segment range {range:#x?} is outside the mapping")
+            }
+            Self::DynamicSegment(_) => f.write_str("invalid PT_DYNAMIC segment"),
+            Self::NoDynamicSegment => f.write_str("no PT_DYNAMIC segment"),
+            Self::DynamicSection(_) => f.write_str("invalid dynamic section"),
+        }
+    }
+}
+
+impl core::error::Error for LoadError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Parse(source) | Self::DynamicSegment(source) | Self::DynamicSection(source) => {
+                Some(source)
+            }
+            Self::Map { source, .. } => Some(source),
+            Self::NoLoadSegment
+            | Self::NoDynamicSegment
+            | Self::SegmentOutsideFile { .. }
+            | Self::SegmentOutsideMapping { .. } => None,
+        }
+    }
+}
+
 /// A failure to load or use a dynamic shared object.
 #[derive(Debug)]
 pub enum DlError {
@@ -55,7 +152,14 @@ pub enum DlError {
         /// Original platform error.
         source: Errno,
     },
-    /// The DSO is malformed, or its TLS setup failed.
+    /// The selected object was opened but could not be loaded.
+    Load {
+        /// Selected object's path.
+        path: String,
+        /// Why loading failed.
+        source: LoadError,
+    },
+    /// The DSO's TLS setup failed.
     Malformed,
     /// Invalid DSO handle.
     InvalidHandle,
@@ -70,8 +174,9 @@ impl DlError {
     }
 
     /// Returns the stable, null-terminated message used by `dlerror`.
-    pub const fn repr(&self) -> &'static core::ffi::CStr {
+    pub const fn repr(&self) -> &'static CStr {
         match self {
+            Self::Load { source, .. } => source.repr(),
             Self::NotFound | Self::Search { .. } | Self::Open { .. } => {
                 c"Failed to locate the requested DSO. Set `LD_DEBUG=all` for more information."
             }
@@ -97,7 +202,10 @@ impl fmt::Display for FatalDiagnostic<'_> {
             "[ld.so]: failed to link '{}': {:?}",
             self.path, self.error
         )?;
-        if matches!(self.error, DlError::Search { .. } | DlError::Open { .. }) {
+        if matches!(
+            self.error,
+            DlError::Search { .. } | DlError::Open { .. } | DlError::Load { .. }
+        ) {
             writeln!(f, "[ld.so]: {}", self.error)?;
         }
         f.write_str("[ld.so]: enable debug output with `LD_DEBUG=all` for more information")
@@ -126,6 +234,16 @@ impl fmt::Display for DlError {
                     }
                 }?;
                 write!(f, ": {source} (errno {})", source.0)
+            }
+            Self::Load { path, source } => {
+                write!(f, "loading '{path}' failed: {source}")?;
+                if let Some(cause) = core::error::Error::source(source) {
+                    write!(f, ": {cause}")?;
+                }
+                if let LoadError::Map { source: errno, .. } = source {
+                    write!(f, " (errno {})", errno.0)?;
+                }
+                Ok(())
             }
             _ => f.write_str(self.repr().to_str().expect("loader messages are ASCII")),
         }
@@ -220,5 +338,89 @@ mod tests {
             assert!(fatal.contains(expected), "{fatal}");
             assert!(fatal.contains("(errno 12)"));
         }
+    }
+
+    fn parse_error() -> object::Error {
+        use object::read::elf::FileHeader as _;
+        object::elf::FileHeader64::<object::NativeEndian>::parse(&[0u8; 4][..])
+            .err()
+            .expect("four bytes are not an ELF header")
+    }
+
+    #[test]
+    fn load_failures_name_the_object_and_cause() {
+        let parse = DlError::Load {
+            path: "/lib/bad.so".into(),
+            source: LoadError::Parse(parse_error()),
+        };
+        let message = format!("{parse}");
+        assert!(
+            message.starts_with("loading '/lib/bad.so' failed: invalid ELF headers: "),
+            "{message}"
+        );
+        assert!(message.ends_with(&format!("{}", parse_error())));
+        let fatal = format!("{}", parse.fatal("/bin/ion"));
+        assert!(fatal.starts_with("[ld.so]: failed to link '/bin/ion': Load"));
+        assert!(
+            fatal.contains(&format!("\n[ld.so]: {message}\n")),
+            "{fatal}"
+        );
+        assert_eq!(parse.repr(), LoadError::Parse(parse_error()).repr());
+        assert_ne!(parse.repr(), DlError::Malformed.repr());
+
+        let mapped = DlError::Load {
+            path: "/lib/big.so".into(),
+            source: LoadError::Map {
+                size: 0x2000,
+                source: Errno(12),
+            },
+        };
+        let message = format!("{mapped}");
+        assert!(message.starts_with("loading '/lib/big.so' failed: mapping 8192 bytes failed: "));
+        assert!(message.ends_with(" (errno 12)"), "{message}");
+        assert_eq!(message.matches("errno").count(), 1);
+    }
+
+    #[test]
+    fn load_errors_keep_their_sources() {
+        use core::error::Error as _;
+        let errors = [
+            LoadError::Parse(parse_error()),
+            LoadError::NoLoadSegment,
+            LoadError::Map {
+                size: 1,
+                source: Errno(12),
+            },
+            LoadError::SegmentOutsideFile { range: 0x10..0x20 },
+            LoadError::SegmentOutsideMapping { range: 0x30..0x40 },
+            LoadError::DynamicSegment(parse_error()),
+            LoadError::NoDynamicSegment,
+            LoadError::DynamicSection(parse_error()),
+        ];
+        let has_source = [true, false, true, false, false, true, false, true];
+        for (error, has_source) in errors.iter().zip(has_source) {
+            assert_eq!(error.source().is_some(), has_source, "{error:?}");
+        }
+        let repr: Vec<_> = errors.iter().map(LoadError::repr).collect();
+        for (i, message) in repr.iter().enumerate() {
+            assert!(message.to_str().is_ok());
+            assert!(
+                !repr[..i].contains(message),
+                "dlerror cannot tell {:?} apart",
+                errors[i]
+            );
+        }
+        let source = errors[2].source().expect("mapping keeps its errno");
+        assert_eq!(source.downcast_ref::<Errno>(), Some(&Errno(12)));
+        assert_eq!(
+            format!("{}", errors[3]),
+            "segment file range 0x10..0x20 is outside the file"
+        );
+        assert_eq!(
+            format!("{}", errors[4]),
+            "segment range 0x30..0x40 is outside the mapping"
+        );
+        assert_eq!(format!("{}", errors[1]), "no PT_LOAD segment");
+        assert_eq!(format!("{}", errors[6]), "no PT_DYNAMIC segment");
     }
 }
