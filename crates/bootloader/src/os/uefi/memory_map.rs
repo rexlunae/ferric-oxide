@@ -125,6 +125,13 @@ impl MemoryMapIter {
             }
         }
 
+        // Hand the kernel the map the firmware accepted, so memory a firmware
+        // event took before a retry is never reported as free. `area_add`
+        // writes a static table and calls no boot service.
+        for entry in self.by_ref() {
+            area_add(entry);
+        }
+
         // Runtime services must be called with interrupts disabled
         super::arch::disable_interrupts();
 
@@ -257,16 +264,8 @@ impl Iterator for MemoryMapIter {
     }
 }
 
-pub unsafe fn memory_map() -> MemoryMapIter {
-    let mut iter = MemoryMapIter::new();
-
-    // Using next to avoid consuming iterator
-    while let Some(entry) = iter.next() {
-        area_add(entry);
-    }
-
-    // Rewind iterator
-    iter.i = 0;
-
-    iter
+/// Read the UEFI memory map. Its entries reach the kernel's memory areas when
+/// [`MemoryMapIter::exit_boot_services`] succeeds.
+pub fn memory_map() -> MemoryMapIter {
+    MemoryMapIter::new()
 }

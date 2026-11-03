@@ -72,6 +72,12 @@ ported by hand when it is wanted. relibc's `openlibm` and
 1. UEFI starts the bootloader in `crates/bootloader/`. It obtains firmware
    memory/hardware information, finds the RedoxFS boot partition, and loads the
    kernel and initfs. Live images can load the filesystem into memory.
+   Just before it enters the kernel it reads the UEFI memory map and calls
+   `ExitBootServices`. If a firmware event changed the map in between, the
+   firmware rejects the stale map key; the loader then reads the map again
+   and retries (up to eight attempts, calling no other boot service), as the
+   UEFI specification requires. The kernel's memory areas come from the map
+   the firmware accepted.
 2. The loader establishes the initial mappings and enters the kernel. With
    kernel-image KASLR selected, it first applies the retained ELF relocations
    and loads the kernel at a randomized virtual address.
