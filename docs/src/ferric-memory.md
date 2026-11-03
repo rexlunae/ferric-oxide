@@ -184,12 +184,31 @@ covers, decided from the object's first 4 KiB (`crates/relibc/src/ld_so/`,
 as debug information and the full symbol table, usually follow and stay
 unmapped; an object whose headers are not in its first 4 KiB is mapped whole.
 This matters because a scheme fills a file mapping when it is made: RedoxFS
-reads the whole range and keeps the buffer after the last unmap
-([#373](https://github.com/rexlunae/ferric-oxide/issues/373)). With
+reads the whole mapped range into a buffer of its own and holds it while the
+file is in use (see [RedoxFS mapping buffers](#redoxfs-mapping-buffers)). With
 `build.debug = true`, `cosmic-comp` is a 392 MiB file of which loading uses
 26 MiB, and mapping it and the libcosmic example whole ran a 2 GiB guest out of
 memory, which panics the kernel
 ([#372](https://github.com/rexlunae/ferric-oxide/issues/372)).
+
+## RedoxFS mapping buffers
+
+RedoxFS backs each mapped file with one buffer of its own
+(`userspace/redoxfs/src/fmap.rs`). It reads a range into the buffer when the
+range is first mapped, counts the mappings of every page range, and writes a
+range back, clamped to the file's size, when the kernel unmaps a shared writable
+mapping of it. Stores through a private mapping are never written back. Writes
+through the file update the buffered copy, so later mappings see them.
+
+The buffer and its accounting are freed once the file is no longer in use: no
+open description of it remains and every mapping is gone, whichever happens
+last. A file that stays open keeps its buffer between mappings, so mapping it
+again does not read it again. Before this, RedoxFS kept every buffer until it
+exited, and a removal spanning several ranges left all but the first counted, a
+`range-tree` 0.1.0 bug fixed in 0.1.1
+([#373](https://github.com/rexlunae/ferric-oxide/issues/373)). Host tests in
+`userspace/redoxfs/src/fmap/tests.rs` cover release, write-back, multiple
+mappers and partial unmaps.
 
 ## Mapping ranges stay inside user space
 

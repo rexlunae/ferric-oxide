@@ -1,22 +1,17 @@
-use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use alloc::collections::BTreeMap;
-use libredox::call::MmapArgs;
-use range_tree::RangeTree;
 
 use syscall::data::{Stat, TimeSpec};
 use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{Error, Result, EBADF, EINVAL, EISDIR, ENOTDIR, EPERM};
 use syscall::flag::{
-    MapFlags, F_GETFL, F_SETFL, MAP_SHARED, MODE_PERM, O_ACCMODE, O_APPEND, O_RDONLY, O_RDWR,
-    O_WRONLY, PROT_READ, PROT_WRITE,
+    MapFlags, F_GETFL, F_SETFL, MODE_PERM, O_ACCMODE, O_APPEND, O_RDONLY, O_RDWR, O_WRONLY,
+    PROT_READ, PROT_WRITE,
 };
-use syscall::{EBADFD, ENOENT, PAGE_SIZE};
+use syscall::{EBADFD, ENOENT};
 
+use crate::fmap::{release_unused, Unmapped};
+pub use crate::fmap::{FileMmapInfo, Fmaps};
 use crate::{Disk, Node, Transaction, TreePtr, BLOCK_SIZE};
-
-pub type Fmaps = BTreeMap<u32, FileMmapInfo>;
 
 pub trait Resource<D: Disk> {
     fn parent_ptr_opt(&self) -> Option<TreePtr<Node>>;
@@ -348,188 +343,12 @@ impl<D: Disk> Resource<D> for DirResource {
     }
 }
 
-#[derive(Debug)]
-pub struct Fmap {
-    rc: usize,
-    flags: MapFlags,
-    last_page_tail: u16,
-    version: u64,
-    /// Ferric Oxide: how many of the `rc` mappings are shared and writable. Only those can
-    /// change the buffer (the kernel maps private ones copy-on-write), so only while there
-    /// are any is the range written back to the file, and the page cache leaves it alone.
-    writable: usize,
-}
-
-/// Ferric Oxide: whether a mapping with `flags` writes into RedoxFS's buffer. A private
-/// mapping does not: the kernel copies a page on its first store.
-fn writes_back(flags: MapFlags) -> bool {
-    flags.contains(PROT_WRITE) && flags.contains(MAP_SHARED)
-}
-
-impl Fmap {
-    pub unsafe fn new<D: Disk>(
-        node_ptr: TreePtr<Node>,
-        flags: MapFlags,
-        unaligned_size: usize,
-        offset: u64,
-        base: *mut u8,
-        tx: &mut Transaction<D>,
-    ) -> Result<Self> {
-        // Memory provided to fmap must be page aligned and sized
-        let aligned_size = unaligned_size.next_multiple_of(syscall::PAGE_SIZE);
-
-        let address = base.add(offset as usize);
-        //println!("ADDR {:p} {:p}", base, address);
-
-        // Read buffer from disk
-        let atime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-
-        let buf = slice::from_raw_parts_mut(address, unaligned_size);
-
-        let count = match tx.read_node(node_ptr, offset, buf, atime.as_secs(), atime.subsec_nanos())
-        {
-            Ok(ok) => ok,
-            Err(err) => {
-                let _ = libredox::call::munmap(address.cast(), aligned_size);
-                return Err(err);
-            }
-        };
-
-        // Make sure remaining data is zeroed
-        buf[count..].fill(0_u8);
-
-        Ok(Self {
-            rc: 1,
-            flags,
-            last_page_tail: (unaligned_size % PAGE_SIZE) as u16,
-            version: 0,
-            writable: usize::from(writes_back(flags)),
-        })
-    }
-
-    pub unsafe fn sync<D: Disk>(
-        &mut self,
-        node_ptr: TreePtr<Node>,
-        base: *mut u8,
-        offset: u64,
-        size: usize,
-        tx: &mut Transaction<D>,
-    ) -> Result<()> {
-        // Ferric Oxide: only shared writable mappings change the buffer; writing it back for
-        // a private one could only put back bytes older than later writes.
-        if self.writable > 0 {
-            let mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-            tx.write_node(
-                node_ptr,
-                offset,
-                unsafe { core::slice::from_raw_parts(base.add(offset as usize), size) },
-                mtime.as_secs(),
-                mtime.subsec_nanos(),
-            )?;
-        }
-        Ok(())
-    }
-}
-
 pub struct FileResource {
     path: String,
     parent_ptr_opt: Option<TreePtr<Node>>,
     node_ptr: TreePtr<Node>,
     flags: usize,
     uid: u32,
-}
-
-#[derive(Debug)]
-pub struct FileMmapInfo {
-    base: *mut u8,
-    size: usize,
-    pub ranges: RangeTree<Fmap>,
-    pub open_fds: usize,
-    pub version: u64,
-}
-
-impl FileMmapInfo {
-    pub fn new() -> Self {
-        Self {
-            base: core::ptr::null_mut(),
-            size: 0,
-            ranges: RangeTree::new(),
-            open_fds: 0,
-            version: 0,
-        }
-    }
-
-    /// Ferric Oxide: marks every cached range out of date, so the next `fmap` of it reads the
-    /// file again and reads stop using the cache. Called when an idle node is opened: its id
-    /// may now name a different file, as RedoxFS reuses the blocks of deleted nodes.
-    pub fn invalidate(&mut self) {
-        self.version = self.version.wrapping_add(1);
-    }
-
-    /// Ferric Oxide: copies `bytes`, just written to the file at `offset`, into the ranges
-    /// still mapped, which are the pages processes see, so a live shared mapping and the
-    /// file stay the same. Bytes outside the write are left alone, stores through the
-    /// mapping included. Unmapped ranges are not updated: the write made them out of date,
-    /// and the next `fmap` reads them again.
-    fn write_through(&mut self, offset: u64, bytes: &[u8]) {
-        let Some(end) = offset.checked_add(bytes.len() as u64) else {
-            return;
-        };
-        for (range, fmap) in self.ranges.conflicts(offset..end) {
-            if fmap.rc == 0 {
-                continue;
-            }
-            let start = range.start.max(offset);
-            let stop = range.end.min(end);
-            if start >= stop {
-                continue;
-            }
-            let from = &bytes[(start - offset) as usize..(stop - offset) as usize];
-            // SAFETY: every range lies inside the buffer at `base`, which `fmap` sized to
-            // cover it, and `from` is `stop - start` bytes inside that range; `bytes` is the
-            // caller's buffer, not the mapping, so the two do not overlap.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    from.as_ptr(),
-                    self.base.add(start as usize),
-                    from.len(),
-                );
-            }
-        }
-    }
-
-    pub fn in_use(&self) -> bool {
-        self.open_fds > 0 || self.ranges.iter().any(|(_, fmap)| fmap.rc > 0)
-    }
-
-    /// Ferric Oxide: the references to mapped ranges, of any kind; the page cache holds the
-    /// file's cached writes while there are any, so the mapped pages see every write.
-    pub fn mappings(&self) -> usize {
-        self.ranges.iter().map(|(_, fmap)| fmap.rc).sum()
-    }
-
-    /// Ferric Oxide: the references to mapped ranges that `Fmap::sync` writes back to the
-    /// file, those of shared writable mappings; the page cache leaves the file alone while
-    /// there are any.
-    pub fn writable_mappings(&self) -> usize {
-        self.ranges.iter().map(|(_, fmap)| fmap.writable).sum()
-    }
-
-    pub fn stale(&self) -> bool {
-        // TODO: should this be any?
-        // TODO: stale by duration/memory pressure
-        self.ranges
-            .iter()
-            .all(|(_, fmap)| fmap.version != self.version)
-    }
-}
-
-impl Drop for FileMmapInfo {
-    fn drop(&mut self) {
-        if self.in_use() {
-            log::error!("FileMmapInfo dropped while in use");
-        }
-    }
 }
 
 impl FileResource {
@@ -577,42 +396,11 @@ impl<D: Disk> Resource<D> for FileResource {
         if self.flags & O_ACCMODE != O_RDWR && self.flags & O_ACCMODE != O_RDONLY {
             return Err(Error::new(EBADF));
         }
-        if let Some(fmap_info) = fmaps.get_mut(&self.node_ptr.id()) {
-            if !fmap_info.base.is_null() {
-                // Ferric Oxide: the mapped buffer is page-sized and zeroed past
-                // EOF, so a cached read must stop at the file size. Without this
-                // a read near the end returned the zeroed tail, and files that
-                // were mapped (dynamically linked programs, shared libraries)
-                // read back longer than they are.
-                let file_size = tx.read_tree(self.node_ptr)?.data().size();
-                if offset >= file_size {
-                    return Ok(0);
-                }
-                let buf_len = (file_size - offset).min(buf.len() as u64) as usize;
-                let buf = &mut buf[..buf_len];
-                let requested_end = offset + buf.len() as u64;
-                let mut next_offset = offset;
-                let mut cacheable = true;
-
-                for (range, fmap) in fmap_info.ranges.conflicts(offset..requested_end) {
-                    if range.start > next_offset || fmap.version != fmap_info.version {
-                        // there's a hole
-                        cacheable = false;
-                        break;
-                    }
-                    next_offset = next_offset.max(range.end);
-                }
-
-                if cacheable && next_offset >= requested_end {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            fmap_info.base.add(offset as usize),
-                            buf.as_mut_ptr(),
-                            buf.len(),
-                        );
-                    }
-                    return Ok(buf.len());
-                }
+        // Ferric Oxide: reads covered by current mapped ranges come from the mapped buffer,
+        // so they see stores through a shared mapping before its funmap writes them back.
+        if let Some(fmap_info) = fmaps.get(&self.node_ptr.id()) {
+            if let Some(count) = fmap_info.read_cached(self.node_ptr, buf, offset, tx)? {
+                return Ok(count);
             }
         }
 
@@ -643,7 +431,7 @@ impl<D: Disk> Resource<D> for FileResource {
             offset
         };
         if let Some(fmap_info) = fmaps.get_mut(&self.node_ptr.id()) {
-            fmap_info.version += 1;
+            fmap_info.begin_write();
         }
         let mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let count = tx.write_node(
@@ -674,7 +462,6 @@ impl<D: Disk> Resource<D> for FileResource {
         offset: u64,
         tx: &mut Transaction<D>,
     ) -> Result<usize> {
-        //dbg!(&self.fmaps);
         let accmode = self.flags & O_ACCMODE;
         if flags.contains(PROT_READ) && !(accmode == O_RDWR || accmode == O_RDONLY) {
             return Err(Error::new(EBADF));
@@ -682,8 +469,6 @@ impl<D: Disk> Resource<D> for FileResource {
         if flags.contains(PROT_WRITE) && !(accmode == O_RDWR || accmode == O_WRONLY) {
             return Err(Error::new(EBADF));
         }
-
-        let aligned_size = unaligned_size.next_multiple_of(PAGE_SIZE);
 
         // TODO: PROT_EXEC? It is however unenforcable without restricting anonymous mmap, since a
         // program can always map anonymous RW-, read from a file, then remap as R-E. But it might
@@ -695,83 +480,26 @@ impl<D: Disk> Resource<D> for FileResource {
             .get_mut(&self.node_ptr.id())
             .ok_or(Error::new(EBADFD))?;
 
-        if !fmap_info.in_use() {
+        let opening = !fmap_info.in_use();
+        if opening {
             // Notify filesystem of open
             tx.on_open_node(self.node_ptr)?;
         }
 
-        let new_size = (offset as usize + aligned_size).next_multiple_of(PAGE_SIZE);
-        if new_size > fmap_info.size {
-            fmap_info.base = if fmap_info.base.is_null() {
-                unsafe {
-                    libredox::call::mmap(MmapArgs {
-                        length: new_size,
-                        // PRIVATE/SHARED doesn't matter once the pages are passed in the fmap
-                        // handler.
-                        prot: libredox::flag::PROT_READ | libredox::flag::PROT_WRITE,
-                        flags: libredox::flag::MAP_PRIVATE,
-
-                        offset: 0,
-                        fd: !0,
-                        addr: core::ptr::null_mut(),
-                    })? as *mut u8
+        match fmap_info.map(self.node_ptr, flags, unaligned_size, offset, tx) {
+            Ok(address) => Ok(address as usize),
+            Err(err) => {
+                if opening {
+                    if let Err(close_err) = tx.on_close_node(self.node_ptr) {
+                        log::error!(
+                            "failed to close node {} after a failed fmap: {close_err}",
+                            self.node_ptr.id()
+                        );
+                    }
                 }
-            } else {
-                unsafe {
-                    syscall::syscall5(
-                        syscall::SYS_MREMAP,
-                        fmap_info.base as usize,
-                        fmap_info.size,
-                        0,
-                        new_size,
-                        syscall::MremapFlags::empty().bits() | (PROT_READ | PROT_WRITE).bits(),
-                    )? as *mut u8
-                }
-            };
-            fmap_info.size = new_size;
-        }
-
-        let affected_fmaps = fmap_info
-            .ranges
-            .remove_and_unused(offset..offset + aligned_size as u64);
-
-        for (range, v_opt) in affected_fmaps {
-            //dbg!(&range);
-            let range_size = range.end - range.start;
-            // Ferric Oxide: an unmapped range kept from an older version of the file (written
-            // since, or a deleted file whose node id was reused) is read again, not handed out
-            // with the old contents.
-            let v_opt = v_opt.filter(|fmap| fmap.rc > 0 || fmap.version == fmap_info.version);
-            if let Some(mut fmap) = v_opt {
-                fmap.rc += 1;
-                fmap.writable += usize::from(writes_back(flags));
-                fmap.flags |= flags;
-                fmap.version = fmap_info.version;
-                //FIXME: Use result?
-                let _ = fmap_info.ranges.insert(range.start, range_size, fmap);
-            } else {
-                let mut map = unsafe {
-                    Fmap::new(
-                        self.node_ptr,
-                        flags,
-                        range_size as usize,
-                        range.start,
-                        fmap_info.base,
-                        tx,
-                    )?
-                };
-                // Ferric Oxide: just read, so current. Reads of the file come from the mapped
-                // buffer only while its ranges are current, and must, or a store through a
-                // shared mapping would not be seen by read() until the funmap writes it back.
-                map.version = fmap_info.version;
-                //FIXME: Use result?
-                //TODO: Save aligned size for unmap
-                let _ = fmap_info.ranges.insert(range.start, range_size, map);
+                Err(err)
             }
         }
-        //dbg!(&self.fmaps);
-
-        Ok(fmap_info.base as usize + offset as usize)
     }
 
     fn funmap(
@@ -782,85 +510,25 @@ impl<D: Disk> Resource<D> for FileResource {
         writes_back: bool,
         tx: &mut Transaction<D>,
     ) -> Result<()> {
-        let fmap_info = fmaps
-            .get_mut(&self.node_ptr.id())
-            .ok_or(Error::new(EBADFD))?;
+        let node_id = self.node_ptr.id();
+        let fmap_info = fmaps.get_mut(&node_id).ok_or(Error::new(EBADFD))?;
 
-        //dbg!(&self.fmaps);
-        //dbg!(self.fmaps.conflicts(offset..offset + size as u64).collect::<Vec<_>>());
-        #[allow(unused_mut)]
-        let mut affected_fmaps = fmap_info.ranges.remove(offset..offset + size as u64);
-
-        let mut unmapped = false;
-        let mut ignored = false;
-        for (range, mut fmap) in affected_fmaps {
-            // Ferric Oxide: a process can make the kernel send funmap for a
-            // range that is no longer mapped (found by ferric-syscall-fuzz).
-            // Ignore it rather than panicking the daemon, and don't sync: the
-            // retained buffer may be older than later writes to the file.
-            let Some(rc) = fmap.rc.checked_sub(1) else {
-                log::warn!(
-                    "funmap of unmapped range {}..{} ignored",
-                    range.start,
-                    range.end
-                );
-                //FIXME: Use result?
-                let _ = fmap_info
-                    .ranges
-                    .insert(range.start, range.end - range.start, fmap);
-                ignored = true;
-                continue;
-            };
-            fmap.rc = rc;
-            unmapped = true;
-
-            //log::info!("SYNCING {}..{}", range.start, range.end);
-            unsafe {
-                fmap.sync(
-                    self.node_ptr,
-                    fmap_info.base,
-                    range.start,
-                    (range.end - range.start) as usize,
-                    tx,
-                )?;
-            }
-            // Ferric Oxide: after the sync, which writes back the stores of the mapping
-            // going away.
-            if writes_back {
-                fmap.writable = fmap.writable.saturating_sub(1);
-            }
-
-            //FIXME: Use result?
-            let _ = fmap_info
-                .ranges
-                .insert(range.start, range.end - range.start, fmap);
-        }
-        //dbg!(&self.fmaps);
-
-        // Ferric Oxide: a funmap that only hit already-unmapped ranges must not
-        // close the node a second time.
-        if ignored && !unmapped {
-            return Ok(());
+        let Unmapped {
+            dropped,
+            written_back,
+        } = fmap_info.unmap(self.node_ptr, offset, size, writes_back, tx)?;
+        if let Err(err) = &written_back {
+            log::error!("failed to write back fmap of node {node_id}: {err}");
         }
 
-        // Allow release of node if not in use anymore
-        if !fmap_info.in_use() {
+        // Ferric Oxide: a funmap that dropped no mapping must not close the node a second
+        // time. Once nothing uses the file, its buffer goes (#373).
+        if dropped && release_unused(fmaps, node_id) {
             // Notify filesystem of close
             tx.on_close_node(self.node_ptr)?;
-
-            // if this fmap version is outdated it's no use
-            if fmap_info.stale() {
-                let fmap = fmaps
-                    .remove(&self.node_ptr.id())
-                    .expect("fmap_info must exist");
-
-                if let Err(e) = unsafe { libredox::call::munmap(fmap.base as *mut _, fmap.size) } {
-                    log::error!("Munmap error {e}");
-                }
-            }
         }
 
-        Ok(())
+        written_back
     }
 
     fn fcntl(&mut self, cmd: usize, arg: usize) -> Result<usize> {
@@ -879,23 +547,9 @@ impl<D: Disk> Resource<D> for FileResource {
     }
 
     fn sync(&mut self, fmaps: &mut Fmaps, tx: &mut Transaction<D>) -> Result<()> {
-        if let Some(fmap_info) = fmaps.get_mut(&self.node_ptr.id()) {
-            // Ferric Oxide: only ranges still mapped. An unmapped one was written back by its
-            // funmap, and the file may have been written since; writing its old bytes again
-            // would undo that write.
-            for (range, fmap) in fmap_info.ranges.iter_mut().filter(|(_, fmap)| fmap.rc > 0) {
-                unsafe {
-                    fmap.sync(
-                        self.node_ptr,
-                        fmap_info.base,
-                        range.start,
-                        (range.end - range.start) as usize,
-                        tx,
-                    )?;
-                }
-            }
+        if let Some(fmap_info) = fmaps.get(&self.node_ptr.id()) {
+            fmap_info.sync(self.node_ptr, tx)?;
         }
-
         Ok(())
     }
 
@@ -947,83 +601,5 @@ impl<D: Disk> Resource<D> for FileResource {
         _tx: &mut Transaction<D>,
     ) -> Result<DirentBuf<&'buf mut [u8]>> {
         Err(Error::new(ENOTDIR))
-    }
-}
-
-impl Drop for FileResource {
-    fn drop(&mut self) {
-        /*
-        if !self.fmaps.is_empty() {
-            eprintln!(
-                "redoxfs: file {} still has {} fmaps!",
-                self.path,
-                self.fmaps.len()
-            );
-        }
-        */
-    }
-}
-
-impl range_tree::Value for Fmap {
-    type K = u64;
-
-    // Ferric Oxide: ranges of different versions are not merged, or a range read before a
-    // write would take the newer version of its neighbour and be served as current.
-    fn try_merge_forward(self, other: &Self) -> core::result::Result<Self, Self> {
-        if self.rc == other.rc
-            && self.flags == other.flags
-            && self.version == other.version
-            && self.last_page_tail == 0
-        {
-            Ok(self)
-        } else {
-            Err(self)
-        }
-    }
-    fn try_merge_backwards(self, other: &Self) -> core::result::Result<Self, Self> {
-        if self.rc == other.rc
-            && self.flags == other.flags
-            && self.version == other.version
-            && other.last_page_tail == 0
-        {
-            Ok(self)
-        } else {
-            Err(self)
-        }
-    }
-    #[allow(unused_variables)]
-    fn split(
-        self,
-        prev_range: Option<core::ops::Range<Self::K>>,
-        range: core::ops::Range<Self::K>,
-        next_range: Option<core::ops::Range<Self::K>>,
-    ) -> (Option<Self>, Self, Option<Self>) {
-        (
-            prev_range.map(|_range| Fmap {
-                rc: self.rc,
-                flags: self.flags,
-                last_page_tail: 0,
-                version: self.version,
-                writable: self.writable,
-            }),
-            Fmap {
-                rc: self.rc,
-                flags: self.flags,
-                last_page_tail: if next_range.is_none() {
-                    self.last_page_tail
-                } else {
-                    0
-                },
-                version: self.version,
-                writable: self.writable,
-            },
-            next_range.map(|_range| Fmap {
-                rc: self.rc,
-                flags: self.flags,
-                last_page_tail: self.last_page_tail,
-                version: self.version,
-                writable: self.writable,
-            }),
-        )
     }
 }
