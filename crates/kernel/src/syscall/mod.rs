@@ -31,6 +31,9 @@ use crate::{
     sync::CleanLockToken,
 };
 
+/// Cursor updates after writes on positioned descriptions
+pub mod cursor;
+
 /// Debug
 pub mod debug;
 

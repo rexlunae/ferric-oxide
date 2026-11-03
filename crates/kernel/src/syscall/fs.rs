@@ -18,7 +18,10 @@ use crate::{
     syscall::{data::Stat, error::*, flag::*},
 };
 
-use super::usercopy::{UserSlice, UserSliceRo, UserSliceRw, UserSliceWo};
+use super::{
+    cursor::CursorUpdate,
+    usercopy::{UserSlice, UserSliceRo, UserSliceRw, UserSliceWo},
+};
 
 pub fn file_op_generic<T>(
     fd: FileHandle,
@@ -854,28 +857,36 @@ pub fn sys_write(fd: FileHandle, buf: UserSliceRo, token: &mut CleanLockToken) -
     write_description(file_description(fd, token)?, buf, token)
 }
 /// [`sys_write`] on a description.
+///
+/// A positioned description's cursor advances by the bytes written, except after an
+/// `O_APPEND` write, which the scheme puts at the end of the file: the cursor then moves to
+/// the size the scheme reports after the write ([`CursorUpdate`]). If the scheme cannot
+/// report a size, the write has still happened and its count is returned, and the cursor
+/// advances by that count.
 pub fn write_description(
     description: Arc<LockedFileDescription>,
     buf: UserSliceRo,
     token: &mut CleanLockToken,
 ) -> Result<usize> {
     let result = description_op(Arc::clone(&description), token, |scheme, _, desc, token| {
-        let offset = if desc.internal_flags.contains(InternalFlags::POSITIONED) {
-            desc.offset
-        } else {
-            u64::MAX
+        let positioned = desc.internal_flags.contains(InternalFlags::POSITIONED);
+        let update = CursorUpdate::for_write(positioned, desc.flags);
+        let offset = if positioned { desc.offset } else { u64::MAX };
+        let written = scheme.kwriteoff(desc.number, buf, offset, desc.flags, desc.flags, token)?;
+        // An append went to the end of the file, not to `offset`; the reply does not say
+        // where that was, so the cursor follows the size the scheme reports now.
+        let end = match update {
+            CursorUpdate::ToEnd => scheme.fsize(desc.number, token).ok(),
+            CursorUpdate::Advance | CursorUpdate::Unpositioned => None,
         };
-        Ok((
-            scheme.kwriteoff(desc.number, buf, offset, desc.flags, desc.flags, token)?,
-            desc,
-        ))
+        Ok((written, update, end))
     });
-    if let Ok((bytes_written, desc)) = &result
-        && desc.internal_flags.contains(InternalFlags::POSITIONED)
+    if let Ok((written, update, end)) = result
+        && update != CursorUpdate::Unpositioned
     {
-        let offset = &mut description.write(token.token()).offset;
-        *offset = offset.saturating_add(*bytes_written as u64)
+        let mut guard = description.write(token.token());
+        guard.offset = update.apply(guard.offset, written, end);
     }
     release_description(description, token);
-    result.map(|(bytes_written, _)| bytes_written)
+    result.map(|(written, _, _)| written)
 }
