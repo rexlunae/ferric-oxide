@@ -14,7 +14,7 @@ use syscall::Result;
 ///
 /// # Errors
 /// Returns procmgr's error (`ESRCH` for a process that is gone), or `EINVAL` when the
-/// reply is not a whole [`ProcMeta`].
+/// reply is not a whole [`ProcMeta`]. Off Redox, where there is no procmgr, `ENOSYS`.
 pub fn proc_credentials(cap_fd: usize, pid: usize) -> Result<ProcMeta> {
     Ok(ferric_proc_creds::proc_credentials(cap_fd, pid)?)
 }

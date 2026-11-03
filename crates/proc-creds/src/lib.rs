@@ -8,8 +8,11 @@
 //! [`CAPABILITY_PATH`]. Permission checks use the effective IDs ([`EffectiveIds`]).
 //!
 //! - [`decode`] reads procmgr's reply, a [`ProcMeta`]. It runs on the host too.
-//! - On Redox, `Capability` holds the handle and asks for a process's credentials;
-//!   `proc_credentials` does the same through a raw descriptor.
+//! - [`proc_credentials`] asks for a process's credentials through a raw descriptor. It
+//!   builds on every target, so host builds of the schemes that call it (`ramfs` and
+//!   `ipcd`, through `scheme-utils`) compile and test; off Redox, where there is no
+//!   procmgr, it fails with [`Error::Unsupported`].
+//! - On Redox, `Capability` holds the handle and asks through it.
 //!
 //! Requests the kernel itself forwards with the caller's IDs (`openat`, the `SYS_FCHOWN`
 //! path) need none of this: their `CallerCtx` is already right.
@@ -31,7 +34,7 @@
 #![forbid(unsafe_code)]
 
 pub use libredox::protocol::ProcMeta;
-use syscall::EINVAL;
+use syscall::{EINVAL, ENOSYS};
 use thiserror::Error;
 
 /// The procmgr handle a scheme opens, while it still has a namespace, to ask for
@@ -60,15 +63,23 @@ pub enum Error {
         /// The reply's length.
         len: usize,
     },
+    /// Not on Redox: there is no procmgr to ask.
+    #[error("cannot ask for the credentials of process {pid}: procmgr exists only on Redox")]
+    Unsupported {
+        /// The process asked about.
+        pid: usize,
+    },
 }
 
 impl Error {
     /// The errno a scheme answers with: the underlying call's for [`Error::Open`] and
-    /// [`Error::Lookup`], `EINVAL` for [`Error::ShortReply`].
+    /// [`Error::Lookup`], `EINVAL` for [`Error::ShortReply`] and `ENOSYS` for
+    /// [`Error::Unsupported`].
     pub fn errno(&self) -> i32 {
         match self {
             Self::Open(source) | Self::Lookup { source, .. } => source.errno(),
             Self::ShortReply { .. } => EINVAL,
+            Self::Unsupported { .. } => ENOSYS,
         }
     }
 }
@@ -115,13 +126,24 @@ pub fn decode(bytes: &[u8]) -> Result<ProcMeta, Error> {
 /// # Errors
 ///
 /// [`Error::Lookup`] with procmgr's error, or [`Error::ShortReply`] when the reply is not a
-/// whole [`ProcMeta`].
+/// whole [`ProcMeta`]. Off Redox, always [`Error::Unsupported`].
 #[cfg(target_os = "redox")]
 pub fn proc_credentials(cap_fd: usize, pid: usize) -> Result<ProcMeta, Error> {
     let mut buffer = [0u8; size_of::<ProcMeta>()];
     let len = libredox::call::get_proc_credentials(cap_fd, pid, &mut buffer)
         .map_err(|source| Error::Lookup { pid, source })?;
     decode(buffer.get(..len).ok_or(Error::ShortReply { len })?)
+}
+
+/// The credentials procmgr reports for `pid`: off Redox there is no procmgr, so this
+/// fails.
+///
+/// # Errors
+///
+/// Always [`Error::Unsupported`].
+#[cfg(not(target_os = "redox"))]
+pub fn proc_credentials(_cap_fd: usize, pid: usize) -> Result<ProcMeta, Error> {
+    Err(Error::Unsupported { pid })
 }
 
 /// An open [`CAPABILITY_PATH`] handle.
@@ -224,5 +246,13 @@ mod tests {
         assert_eq!(lookup.errno(), ESRCH);
         let open = Error::Open(libredox::error::Error::new(ENOENT));
         assert_eq!(syscall::Error::from(open).errno, ENOENT);
+    }
+
+    #[cfg(not(target_os = "redox"))]
+    #[test]
+    fn off_redox_there_is_no_procmgr_to_ask() {
+        let err = proc_credentials(3, 9).unwrap_err();
+        assert!(matches!(err, Error::Unsupported { pid: 9 }));
+        assert_eq!(syscall::Error::from(err).errno, ENOSYS);
     }
 }
