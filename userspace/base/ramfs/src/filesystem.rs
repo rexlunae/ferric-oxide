@@ -86,6 +86,15 @@ impl File {
         }
     }
 
+    /// Ferric Oxide: writes `buf` at the end of the file (`O_APPEND`). The kernel then moves
+    /// the description's cursor to the size `fsize` reports, the end of `buf`.
+    ///
+    /// # Errors
+    /// Those of [`Self::write`].
+    pub fn append(&mut self, buf: &[u8]) -> Result<usize> {
+        self.write(self.data.size(), buf)
+    }
+
     pub fn write(&mut self, offset: usize, buf: &[u8]) -> Result<usize> {
         match self.data {
             FileData::File(ref mut bytes) => {
@@ -328,10 +337,12 @@ impl Ownership {
 
 #[cfg(test)]
 mod tests {
-    use ferric_abi::id::{Caller, UNCHANGED};
-    use syscall::{EPERM, MODE_DIR, MODE_FILE};
+    use std::mem::ManuallyDrop;
 
-    use super::Ownership;
+    use ferric_abi::id::{Caller, UNCHANGED};
+    use syscall::{TimeSpec, EPERM, MODE_DIR, MODE_FILE};
+
+    use super::{File, FileData, Inode, Ownership};
 
     const ROOT: Caller = Caller { uid: 0, gid: 0 };
     const USER: Caller = Caller {
@@ -395,5 +406,44 @@ mod tests {
             other_group.chmod_by(USER, 0o2755).unwrap().mode,
             MODE_FILE | 0o0755
         );
+    }
+
+    /// Never dropped: dropping a `FileData` may close a socket `Fd`, which needs the
+    /// libredox runtime and does not link on the host.
+    fn regular(bytes: &[u8]) -> ManuallyDrop<File> {
+        ManuallyDrop::new(File {
+            mode: MODE_FILE | 0o644,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            parent: Inode(1),
+            open_handles: 1,
+            atime: TimeSpec::default(),
+            ctime: TimeSpec::default(),
+            mtime: TimeSpec::default(),
+            data: FileData::File(bytes.to_vec()),
+        })
+    }
+
+    fn contents(file: &File) -> &[u8] {
+        match &file.data {
+            FileData::File(bytes) => bytes,
+            other => panic!("not a regular file: {:?}", other),
+        }
+    }
+
+    /// #244: an append goes to the end whatever the description's cursor, and the size
+    /// afterwards (what `fsize` reports, and where the kernel puts the cursor) is its end.
+    #[test]
+    fn appends_write_at_the_end_and_the_size_follows() {
+        let mut file = regular(b"0123456789abcdef");
+        assert_eq!(file.append(b"more").unwrap(), 4);
+        assert_eq!(file.data.size(), 20);
+        assert_eq!(contents(&file), b"0123456789abcdefmore");
+        let mut rest = [0; 4];
+        assert_eq!(file.read(20, &mut rest).unwrap(), 0);
+        // A positioned write still uses its offset.
+        assert_eq!(file.write(4, b"WXYZ").unwrap(), 4);
+        assert_eq!(contents(&file), b"0123WXYZ89abcdefmore");
     }
 }

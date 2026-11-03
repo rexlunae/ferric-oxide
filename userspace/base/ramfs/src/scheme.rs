@@ -19,11 +19,11 @@ use scheme_utils::{proc_credentials, FpathWriter, HandleMap};
 use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{
     EACCES, EBADF, EBADFD, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOMEM, ENOSYS, ENOTDIR, ENOTEMPTY,
-    EOPNOTSUPP, EOVERFLOW, EPERM, ERANGE,
+    EOPNOTSUPP, EOVERFLOW, EPERM, ERANGE, ESPIPE,
 };
 use syscall::flag::{
-    StdFsCallKind, O_ACCMODE, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, O_STAT, O_TRUNC,
-    O_WRONLY,
+    StdFsCallKind, O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, O_STAT,
+    O_TRUNC, O_WRONLY,
 };
 use syscall::schemev2::NewFdFlags;
 use syscall::{
@@ -771,7 +771,7 @@ impl SchemeSync for Scheme<'_> {
         fd: usize,
         buf: &[u8],
         offset: u64,
-        _fcntl_flags: u32,
+        fcntl_flags: u32,
         _ctx: &CallerCtx,
     ) -> Result<usize> {
         let Ok(offset) = usize::try_from(offset) else {
@@ -784,7 +784,27 @@ impl SchemeSync for Scheme<'_> {
             .get_mut(&inode)
             .ok_or(Error::new(EBADFD))?;
 
-        file.write(offset, buf)
+        // Ferric Oxide (#244): an append ignores the cursor the kernel passes.
+        if fcntl_flags as usize & O_APPEND != 0 {
+            file.append(buf)
+        } else {
+            file.write(offset, buf)
+        }
+    }
+
+    /// Ferric Oxide: the size of a regular file or directory, for `lseek(SEEK_END)` and
+    /// for the kernel to move an appending description's cursor to the end (#244).
+    fn fsize(&mut self, fd: usize, _ctx: &CallerCtx) -> Result<u64> {
+        let inode = self.handles.get(fd)?.as_inode()?;
+        let file = self
+            .filesystem
+            .files
+            .get(&inode)
+            .ok_or(Error::new(EBADFD))?;
+        if matches!(file.data, FileData::Socket(_)) {
+            return Err(Error::new(ESPIPE));
+        }
+        u64::try_from(file.data.size()).map_err(|_| Error::new(EOVERFLOW))
     }
 
     fn getdents<'buf>(
