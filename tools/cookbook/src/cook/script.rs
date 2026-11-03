@@ -500,12 +500,46 @@ function cookbook_python {
 "#;
 
 pub(crate) static BUILD_POSTSCRIPT: &str = r#"
+# Runs "${GNU_TARGET}-strip" with the given options on every ELF file and static
+# archive under a directory. The options must be ones both GNU strip and
+# llvm-strip accept. Other files (scripts, linker scripts, pkg-config and data
+# files) are left alone, so they are not handed to strip at all. A strip failure
+# on an object is reported and fails the build once the whole directory has been
+# processed. host: recipes on macOS produce Mach-O files and have no
+# "${GNU_TARGET}-strip", so their packages are not stripped.
+function COOKBOOK_STRIP_OBJECTS {
+    case "${TARGET}" in
+        *-apple-darwin) return 0 ;;
+    esac
+    local dir="$1"
+    shift
+    local file magic failed=0
+    while IFS= read -r -d '' file
+    do
+        magic="$(od -An -tx1 -N8 -- "${file}")"
+        magic="${magic//[[:space:]]/}"
+        case "${magic}" in
+            # ELF ("\x7fELF") or a regular ar archive ("!<arch>\n")
+            7f454c46*|213c617263683e0a) ;;
+            *) continue ;;
+        esac
+        if "${GNU_TARGET}-strip" "$@" -- "${file}"
+        then
+            echo "stripped ${file}"
+        else
+            echo "error: ${GNU_TARGET}-strip $* failed on ${file}" >&2
+            failed=1
+        fi
+    done < <(find "${dir}" -type f -print0)
+    return "${failed}"
+}
+
 # Strip binaries
 for dir in "${COOKBOOK_STAGE}/bin" "${COOKBOOK_STAGE}/usr/bin" "${COOKBOOK_STAGE}/libexec" "${COOKBOOK_STAGE}/usr/libexec"
 do
     if [ -d "${dir}" ] && [ -z "${COOKBOOK_NOSTRIP}" ]
     then
-        find "${dir}" -type f -exec "${GNU_TARGET}-strip" -v {} ';'
+        COOKBOOK_STRIP_OBJECTS "${dir}" --strip-all
     fi
 done
 
@@ -517,7 +551,7 @@ do
         find "${dir}" -type f -name '*.la' -exec rm -fv {} ';'
         if [ -z "${COOKBOOK_NOSTRIP}" ]
         then
-            find "${dir}" -type f -exec "${GNU_TARGET}-strip" --strip-debug -v {} ';'
+            COOKBOOK_STRIP_OBJECTS "${dir}" --strip-debug
         fi
     fi
 done
@@ -561,8 +595,10 @@ killall sccache
 
 #[cfg(test)]
 mod tests {
-    use super::{BUILD_PRESCRIPT, SHARED_PRESCRIPT};
-    use std::process::Command;
+    use super::{BUILD_POSTSCRIPT, BUILD_PRESCRIPT, SHARED_PRESCRIPT};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
 
     /// Runs the build prescript with `env` and returns the Cargo flags and release-profile
     /// overrides it leaves for `cookbook_cargo`.
@@ -702,5 +738,300 @@ mod tests {
             Some(v3.display().to_string())
         );
         assert_eq!(host_openssl3_prefix(&[&v4, &missing]), None);
+    }
+
+    const STRIP_TARGET: &str = "x86_64-unknown-redox";
+
+    /// Installs `tool` as `${GNU_TARGET}-strip` in a fresh `bin` directory under `root`.
+    fn strip_bin_dir(root: &Path, tool: &Path) -> PathBuf {
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(tool, bin.join(format!("{STRIP_TARGET}-strip"))).unwrap();
+        bin
+    }
+
+    /// Runs the build postscript on `stage` with `strip_bin` first in `PATH`.
+    fn run_postscript(stage: &Path, strip_bin: &Path) -> Output {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![strip_bin.to_owned()];
+        paths.extend(std::env::split_paths(&path));
+        Command::new("bash")
+            .arg("-e")
+            .arg("-c")
+            .arg(BUILD_POSTSCRIPT)
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("TARGET", STRIP_TARGET)
+            .env("GNU_TARGET", STRIP_TARGET)
+            .env("COOKBOOK_STAGE", stage)
+            .env("COOKBOOK_NAME", "strip-test")
+            .env_remove("COOKBOOK_NOSTRIP")
+            .output()
+            .unwrap()
+    }
+
+    fn write_executable(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Stage with an executable, shared library, static archive and object, plus
+    /// files that are not objects. Only the magic numbers matter to the fake strip.
+    fn fake_stage(root: &Path) -> PathBuf {
+        let stage = root.join("stage");
+        let bin = stage.join("usr/bin");
+        let lib = stage.join("usr/lib");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(bin.join("prog"), b"\x7fELF\x02\x01\x01\0").unwrap();
+        write_executable(&bin.join("script"), "#!/bin/sh\n");
+        std::fs::write(lib.join("libt.so"), b"\x7fELF\x02\x01\x01\0").unwrap();
+        std::fs::write(lib.join("libt.a"), b"!<arch>\n").unwrap();
+        std::fs::write(lib.join("libc.so"), b"INPUT(-lt)\n").unwrap();
+        std::fs::write(lib.join("thin.a"), b"!<thin>\n").unwrap();
+        std::fs::create_dir_all(lib.join("pkgconfig")).unwrap();
+        std::fs::write(lib.join("pkgconfig/t.pc"), b"Name: t\n").unwrap();
+        stage
+    }
+
+    /// A strip that, like llvm-strip, rejects `-v`, logs its options and file, and
+    /// fails on any file whose name contains `broken`.
+    fn fake_strip(root: &Path) -> (PathBuf, PathBuf) {
+        let log = root.join("strip.log");
+        let tool = root.join("fake-strip");
+        write_executable(
+            &tool,
+            &format!(
+                "#!/bin/sh\n\
+                 for arg; do [ \"$arg\" = -v ] && {{ echo \"unknown argument '-v'\" >&2; exit 1; }}; done\n\
+                 echo \"$*\" >> '{}'\n\
+                 case \"$3\" in *broken*) exit 1 ;; esac\n",
+                log.display()
+            ),
+        );
+        (strip_bin_dir(root, &tool), log)
+    }
+
+    #[test]
+    fn postscript_strips_only_objects_with_portable_options() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = fake_stage(root.path());
+        let (bin, log) = fake_strip(root.path());
+
+        let output = run_postscript(&stage, &bin);
+        assert!(output.status.success(), "{output:?}");
+
+        let mut calls: Vec<String> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| line.replace(&stage.display().to_string(), ""))
+            .collect();
+        calls.sort();
+        assert_eq!(
+            calls,
+            [
+                "--strip-all -- /usr/bin/prog",
+                "--strip-debug -- /usr/lib/libt.a",
+                "--strip-debug -- /usr/lib/libt.so",
+            ]
+        );
+    }
+
+    #[test]
+    fn postscript_fails_when_strip_fails_on_an_object() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = fake_stage(root.path());
+        std::fs::write(stage.join("usr/lib/libbroken.so"), b"\x7fELF").unwrap();
+        let (bin, log) = fake_strip(root.path());
+
+        let output = run_postscript(&stage, &bin);
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("libbroken.so"), "{stderr}");
+        // The rest of the directory is still processed before the build fails.
+        assert!(std::fs::read_to_string(log).unwrap().contains("libt.so"));
+    }
+
+    #[test]
+    fn postscript_leaves_mach_o_host_packages_unstripped() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = fake_stage(root.path());
+
+        let output = Command::new("bash")
+            .arg("-e")
+            .arg("-c")
+            .arg(BUILD_POSTSCRIPT)
+            .env("TARGET", "aarch64-apple-darwin")
+            .env("GNU_TARGET", "aarch64-apple-darwin")
+            .env("COOKBOOK_STAGE", &stage)
+            .env("COOKBOOK_NAME", "strip-test")
+            .env_remove("COOKBOOK_NOSTRIP")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    /// Returns the first of `names` that is an executable file in `PATH` or the Rust
+    /// toolchain's `llvm-tools` directory.
+    fn find_tool(names: &[&str]) -> Option<PathBuf> {
+        let mut dirs: Vec<PathBuf> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+        if let Ok(output) = Command::new("rustc").arg("--print").arg("sysroot").output() {
+            let sysroot = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if let Ok(entries) = std::fs::read_dir(Path::new(&sysroot).join("lib/rustlib")) {
+                dirs.extend(entries.flatten().map(|entry| entry.path().join("bin")));
+            }
+        }
+        names
+            .iter()
+            .flat_map(|name| dirs.iter().map(move |dir| dir.join(name)))
+            .find(|path| path.is_file())
+    }
+
+    /// Finds llvm-strip, including Debian's versioned `llvm-strip-<N>` names.
+    fn find_llvm_strip() -> Option<PathBuf> {
+        let versioned: Vec<String> = (14..=30).rev().map(|v| format!("llvm-strip-{v}")).collect();
+        let mut names = vec!["llvm-strip"];
+        names.extend(versioned.iter().map(String::as_str));
+        find_tool(&names)
+    }
+
+    /// Finds a GNU binutils strip.
+    fn find_gnu_strip() -> Option<PathBuf> {
+        let strip = find_tool(&["x86_64-linux-gnu-strip", "strip"])?;
+        let version = Command::new(&strip).arg("--version").output().ok()?;
+        String::from_utf8_lossy(&version.stdout)
+            .contains("GNU strip")
+            .then_some(strip)
+    }
+
+    fn run_checked(command: &mut Command) {
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{command:?}: {output:?}");
+    }
+
+    fn section_names(path: &Path) -> String {
+        let output = Command::new("readelf")
+            .arg("-SW")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    /// Builds a real executable, shared library, object and static archive with
+    /// debug info, strips them through the postscript with `strip`, and checks the
+    /// results.
+    fn strip_real_objects(strip: &Path) {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("t.c");
+        std::fs::write(
+            &src,
+            "int lib_fn(int x) { return x * 2; }\nint main(void) { return lib_fn(1) - 2; }\n",
+        )
+        .unwrap();
+        let stage = root.path().join("stage");
+        let bin = stage.join("usr/bin");
+        let lib = stage.join("usr/lib");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&lib).unwrap();
+        run_checked(
+            Command::new("cc")
+                .args(["-g", "-o"])
+                .arg(bin.join("prog"))
+                .arg(&src),
+        );
+        run_checked(
+            Command::new("cc")
+                .args(["-g", "-fPIC", "-shared", "-o"])
+                .arg(lib.join("libt.so"))
+                .arg(&src),
+        );
+        run_checked(
+            Command::new("cc")
+                .args(["-g", "-c", "-o"])
+                .arg(lib.join("t.o"))
+                .arg(&src),
+        );
+        run_checked(
+            Command::new("ar")
+                .arg("rcs")
+                .arg(lib.join("libt.a"))
+                .arg(lib.join("t.o")),
+        );
+        write_executable(&bin.join("script"), "#!/bin/sh\necho hi\n");
+        std::fs::write(lib.join("libc.so"), "INPUT(-lt)\n").unwrap();
+        assert!(section_names(&lib.join("libt.so")).contains(".debug_info"));
+
+        let output = run_postscript(&stage, &strip_bin_dir(root.path(), strip));
+        assert!(output.status.success(), "{output:?}");
+
+        let prog = section_names(&bin.join("prog"));
+        assert!(
+            !prog.contains(".symtab") && !prog.contains(".debug"),
+            "{prog}"
+        );
+        for object in ["libt.so", "t.o"] {
+            let sections = section_names(&lib.join(object));
+            assert!(!sections.contains(".debug"), "{object}: {sections}");
+            assert!(sections.contains(".symtab"), "{object}: {sections}");
+        }
+        let members = root.path().join("members");
+        std::fs::create_dir_all(&members).unwrap();
+        run_checked(
+            Command::new("ar")
+                .arg("x")
+                .arg(lib.join("libt.a"))
+                .current_dir(&members),
+        );
+        let member = section_names(&members.join("t.o"));
+        assert!(
+            !member.contains(".debug") && member.contains(".symtab"),
+            "{member}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(bin.join("script")).unwrap(),
+            "#!/bin/sh\necho hi\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(lib.join("libc.so")).unwrap(),
+            "INPUT(-lt)\n"
+        );
+
+        // A truncated ELF file is a real strip failure and fails the build.
+        std::fs::write(
+            lib.join("libbroken.so"),
+            &std::fs::read(lib.join("libt.so")).unwrap()[..64],
+        )
+        .unwrap();
+        let output = run_postscript(&stage, &root.path().join("bin"));
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("libbroken.so"),
+            "{output:?}"
+        );
+    }
+
+    fn host_has_elf_tools() -> bool {
+        cfg!(target_os = "linux")
+            && ["cc", "ar", "readelf"]
+                .iter()
+                .all(|tool| find_tool(&[tool]).is_some())
+    }
+
+    #[test]
+    fn postscript_strips_real_objects_with_llvm_strip() {
+        match find_llvm_strip() {
+            Some(strip) if host_has_elf_tools() => strip_real_objects(&strip),
+            _ => eprintln!("skipped: llvm-strip, cc, ar or readelf not found on this Linux host"),
+        }
+    }
+
+    #[test]
+    fn postscript_strips_real_objects_with_gnu_strip() {
+        match find_gnu_strip() {
+            Some(strip) if host_has_elf_tools() => strip_real_objects(&strip),
+            _ => eprintln!("skipped: GNU strip, cc, ar or readelf not found on this Linux host"),
+        }
     }
 }
