@@ -289,6 +289,9 @@ pub mod new_fd {
     //! reply with any other bit set unless it is defined here, so a scheme sets these only
     //! for a Ferric kernel; one that never sets them gets the behaviour it had before.
     //!
+    //! This is an ABI extension: a kernel without these bits (upstream Redox, or Ferric
+    //! before #244) fails the open with `EINVAL` when a scheme sets one.
+    //!
     //! # Examples
     //!
     //! A scheme builds the byte with `NewFdFlags::from_bits_retain`:

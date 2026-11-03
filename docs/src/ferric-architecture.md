@@ -141,8 +141,11 @@ description in between leaves the cursor at that later end, and two threads
 appending through one description may leave it at the earlier of their ends.
 An empty write leaves the cursor where it was. A scheme without `fsize` (or one that fails) gets the old advance by the
 count. RedoxFS, ramfs and ext4d set `APPENDS`. The bit is an addition to
-`redox_syscall`'s `NewFdFlags`: the kernel accepted no bit but `POSITIONED`
-before, so only schemes for a Ferric kernel may set it.
+`redox_syscall`'s `NewFdFlags`, so it extends the scheme ABI. Kernels without
+it (upstream Redox, and Ferric before #244) accept no bit but `POSITIONED` and
+refuse an open reply carrying it with `EINVAL`. RedoxFS, ramfs and ext4d built
+from this tree therefore need a kernel from the same tree, which an image always
+has. Schemes that do not set it keep the old behaviour.
 
 Descriptors also act as capabilities for the new buffer and DMA interfaces:
 a registered-buffer region controls its grants, a grant gives bounded access
