@@ -289,7 +289,7 @@ regressions. Record image/configuration details and every skipped check.
 | `scripts/ferric-ci/check-kernel-relocs.sh` | Builds and compares relocation replay against a kernel linked at the shifted address |
 | `scripts/ferric-ci/check-kernel-ibt.sh <kernel.all>` | Checks `endbr64` at linked interrupt declarations and selected entry points in an IBT-built kernel; direct-call helpers are excluded |
 | `scripts/ferric-ci/check-kernel-shstk.sh <kernel.all>` | Checks shadow-stack enable, context-switch and syscall alternatives, WRSS, and the #CP handler with IBT on/off |
-| `scripts/ferric-ci/check-trace-overhead.sh --out LOG... --in LOG...` | Compares `ferric-trace-bench` results from paired boots without and with `kernel.trace` (the Nth of each list is a pair) against the tracing overhead budget, on the median of the pairs' differences |
+| `scripts/ferric-ci/check-trace-overhead.sh --out LOG... --in LOG...` | Compares `ferric-trace-bench` results from paired boots without and with `kernel.trace` (the Nth of each list is a pair) against the tracing overhead budget, on the median of the pairs' differences and its sign-test 95% bounds; exits 0 (pass), 1 (fail: the lower bound is over the budget), 2 (usage) or 3 (inconclusive: runner noise exceeds the budget) |
 | `scripts/ferric-ci/print-test-fails.sh LOG TITLE` | Prints each `FERRIC_TEST_FAIL` line of a console log with the 40 lines before it, in a log group, for steps that keep only a boot's last lines |
 
 The kernel workflow installs its declared nightly toolchain, `rust-src`,
@@ -497,10 +497,16 @@ differences, never medians taken over two separate sets of boots: each run's
 compiled-out boot against its compiled-in-but-off boot, and each traced boot's
 `on` rounds against its own interleaved `pairoff` rounds, with the budget on
 the median of those differences, so runner load that drifts during the job
-cancels within each pair and a stall in one boot is outvoted (issue #280). The
-notice lists every pair's difference, so a failure shows whether most pairs
-agree. `scripts/ferric-ci/test-check-trace-overhead.sh` (host-tools CI) runs
-the gate on fixture logs built from a recorded noisy job. It discards each
+cancels within each pair and a stall in one boot is outvoted (issue #280). It
+fails only when the sign test's 95% lower bound on that median is over the
+budget too. A median over the budget whose lower bound is not is inconclusive
+(issue #340): the job boots five more pairs and judges again, up to 30 pairs,
+and then passes with a warning that runner noise exceeded the budget. The
+notice lists the bounds and every pair's difference, so a result shows whether
+most pairs agree. `scripts/ferric-ci/test-check-trace-overhead.sh`
+(host-tools CI) runs the gate on fixture logs built from a recorded noisy job
+and from the paired differences quoted in issue #340.
+`scripts/ferric-ci/boot-trace-bench.sh` boots the pairs. It discards each
 boot's output, so when a boot fails it runs `print-test-fails.sh` on the boot's
 console log, and a test that failed early in the boot can be read from the job
 log.
@@ -614,7 +620,8 @@ Read the lines in pairs as well as one at a time:
 For a comparison between two kernels, configurations or commits, boot each image
 several times on the same idle host, alternating which boots first, and compare
 the medians of the paired differences, as `scripts/ferric-ci/check-trace-overhead.sh`
-does for the tracing budget. Run-to-run noise under QEMU/KVM is several percent
+does for the tracing budget, with confidence bounds that show whether the
+noise allows a conclusion. Run-to-run noise under QEMU/KVM is several percent
 (see [Kernel tracing](ferric-tracing.md#overhead-budget)), so a single boot shows
 an order of magnitude, not a small change. To see where the time of an operation
 goes, take a capture while the benchmark runs on a kernel with `kernel.trace` and

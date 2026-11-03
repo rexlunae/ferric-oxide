@@ -403,7 +403,9 @@ metric. With `--a` and `--b`, it compares the groups the way
 `scripts/ferric-ci/check-trace-overhead.sh` does. The Nth runs of A and B are a
 pair, ideally two boots run back to back that see about the same host load.
 `report` computes each pair's percentage difference and reports the median of
-those differences, so one unlucky pair cannot decide the result. A metric that
+those differences, so one unlucky pair cannot decide the result. (The CI
+script also puts sign-test confidence bounds on the median and reports a
+result inside the noise as inconclusive; `report` prints the median only.) A metric that
 is missing from any run is listed as incomplete rather than judged on fewer
 runs.
 

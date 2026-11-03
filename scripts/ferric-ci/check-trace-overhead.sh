@@ -19,7 +19,25 @@
 #   difference of two medians over all boots does not.
 #   "on" vs "pairoff" pairs the two states of one boot, whose rounds alternate.
 # The median of the paired differences keeps one unlucky pair (a stall that
-# hit one boot of it) from deciding. The budgets:
+# hit one boot of it) from deciding. Each median comes with distribution-free
+# 95% confidence bounds from the sign test: with n pairs, the k-th smallest
+# and k-th largest differences, for the largest k with P(Binomial(n, 1/2) < k)
+# at most 5%, bound the true median paired difference from below and above
+# with at least 95% confidence each (for 10 pairs k is 2; for 20, 6). The sign
+# test assumes only that the pairs are independent, not that the differences
+# are normal or symmetric: a stall only ever slows one boot down. A judged
+# comparison has three outcomes:
+#   pass          the median is within the budget;
+#   fail          the lower bound is over the budget: a regression that the
+#                 runner's noise cannot explain;
+#   inconclusive  the median is over the budget but the lower bound is not:
+#                 the runner's noise (the spread of the pairs, shown as the
+#                 bounds) is larger than the budget, so the job cannot tell.
+#                 It is reported as a warning; image.yml boots more pairs and
+#                 runs the check again, and accepts the result with the warning
+#                 when the pairs run out.
+# Fewer than 5 pairs give no 95% bound, so over the budget they are always
+# inconclusive. The budgets:
 #   compiled in, all off ("off") at most OFF_BUDGET_PCT (default 1) percent
 #   slower than compiled out ("out"), on the "syscall" workload, a null system
 #   call;
@@ -27,7 +45,13 @@
 #   percent slower than all off in the rounds paired with it ("pairoff"), on
 #   the "io" workload, requests to RedoxFS.
 # Every result is reported, with each state's median over the boots for
-# reference. "off" and "out" run on two kernels built separately, so their
+# reference.
+#
+# Exit status: 0 when every judged comparison passes, 1 when one fails or
+# results are missing, 2 for a usage error, and 3 when none fails but one is
+# inconclusive.
+#
+# "off" and "out" run on two kernels built separately, so their
 # comparison also measures where the linker put the hot code. On the null
 # system call that is small and repeatable (+0.53% and +0.54% in two runs),
 # and the tracepoints are the largest share of the work, so a disabled
@@ -108,12 +132,60 @@ paired_pct() {
         | awk '{ printf "%.9f\n", ($1 / $2 - 1) * 100 }'
 }
 
-# True when the median paired difference PCT is more than BUDGET percent. It
-# compares the unrounded value: the percentages printed in the summary are
-# rounded to three places, and an increase just over a budget must not pass
-# once rounded.
+# The sign test's 95% lower and upper bounds on the median of the numbers on
+# standard input, one per line, unrounded and separated by a space; "none none"
+# when there are too few numbers for a 95% bound (fewer than 5). The bounds are
+# the k-th smallest and k-th largest numbers, for the largest k with
+# P(Binomial(n, 1/2) <= k - 1) <= 5%. The binomial terms are computed in log
+# space, so 2^n and the binomial coefficients cannot overflow for many pairs.
+bounds() {
+    sort -g | awk '{ v[NR] = $1 } END {
+        n = NR; k = 0; logp = -n * log(2); cdf = 0
+        for (i = 0; i < n; i++) {
+            cdf += exp(logp)
+            if (cdf > 0.05) break
+            k = i + 1
+            logp += log(n - i) - log(i + 1)
+        }
+        if (k == 0) print "none none"; else printf "%.9f %.9f\n", v[k], v[n + 1 - k]
+    }'
+}
+
+# True when PCT is more than BUDGET percent. It compares unrounded values: the
+# percentages printed in the summary are rounded to three places, and an
+# increase just over a budget must not pass once rounded. A PCT of "none" (no
+# bound) is never over.
 over_budget() {
-    awk -v pct="$1" -v b="$2" 'BEGIN { exit !(pct > b) }'
+    [ "$1" != none ] && awk -v pct="$1" -v b="$2" 'BEGIN { exit !(pct > b) }'
+}
+
+# A bound for the summary: "+1.234%", or "none" when there is no 95% bound.
+shown() {
+    if [ "$1" = none ]; then echo none; else awk -v v="$1" 'BEGIN { printf "%+.3f%%\n", v }'; fi
+}
+
+# Judges the paired differences DIFFS (one per line) against BUDGET percent and
+# sets `verdict` to pass, fail or inconclusive, `median_pct` to their unrounded
+# median and `low` and `high` to their 95% bounds (see `bounds`).
+judge() {
+    local diffs="$1" budget="$2" b
+    median_pct="$(median %.9f <<< "$diffs")"
+    b="$(bounds <<< "$diffs")"
+    low="${b% *}"
+    high="${b#* }"
+    if ! over_budget "$median_pct" "$budget"; then
+        verdict=pass
+    elif over_budget "$low" "$budget"; then
+        verdict=fail
+    else
+        verdict=inconclusive
+    fi
+}
+
+# The sentence that reports an inconclusive comparison NAME (median MEDIAN,
+# bounds LOW and HIGH, BUDGET percent).
+inconclusive_text() {
+    echo "$1: the median of $pairs pairs, $(shown "$2"), is over the $5% budget, but runner noise exceeds the budget: its 95% bounds are $(shown "$3") to $(shown "$4"), so the lower bound is not over the budget and the overhead cannot be judged on this runner (not failed; more pairs narrow the bounds)"
 }
 
 # The paired differences, rounded for the summary: "+0.123 -0.456 ...".
@@ -122,6 +194,7 @@ listed() {
 }
 
 status=0
+inconclusive=0
 for workload in io syscall; do
     complete=1
     for state in out off pairoff on; do
@@ -144,17 +217,35 @@ for workload in io syscall; do
     on_pairs="$(paired_pct "$on" "$pairoff")"
     off_pct="$(median <<< "$off_pairs")"
     on_pct="$(median <<< "$on_pairs")"
-    summary="$workload ($pairs pairs of boots' fastest rounds): off ${off_pct}% vs out (median of pairs; each pair $(listed "$off_pairs")), on ${on_pct}% vs pairoff (median of pairs; each boot $(listed "$on_pairs")); medians over boots: out $(median <<< "$out") ns, off $(median <<< "$off") ns, pairoff $(median <<< "$pairoff") ns, on $(median <<< "$on") ns"
+    off_bounds="$(bounds <<< "$off_pairs")"
+    on_bounds="$(bounds <<< "$on_pairs")"
+    summary="$workload ($pairs pairs of boots' fastest rounds): off ${off_pct}% vs out (median of pairs, 95% bounds $(shown "${off_bounds% *}") to $(shown "${off_bounds#* }"); each pair $(listed "$off_pairs")), on ${on_pct}% vs pairoff (median of pairs, 95% bounds $(shown "${on_bounds% *}") to $(shown "${on_bounds#* }"); each boot $(listed "$on_pairs")); medians over boots: out $(median <<< "$out") ns, off $(median <<< "$off") ns, pairoff $(median <<< "$pairoff") ns, on $(median <<< "$on") ns"
     echo "$summary"
     echo "::notice title=trace overhead ($workload)::$summary"
-    if [ "$workload" = syscall ] && over_budget "$(median %.9f <<< "$off_pairs")" "$off_budget"; then
-        echo "::error title=trace overhead::a system call with tracing compiled in but off is ${off_pct}% slower than compiled out, as the median of paired boots (budget ${off_budget}%): $summary"
-        status=1
-    fi
-    if [ "$workload" = io ] && over_budget "$(median %.9f <<< "$on_pairs")" "$on_budget"; then
-        echo "::error title=trace overhead::io with every event on is ${on_pct}% slower than all off in paired rounds (budget ${on_budget}%): $summary"
-        status=1
-    fi
+    case "$workload" in
+        syscall)
+            judge "$off_pairs" "$off_budget"
+            name="syscall off vs out"
+            failure="a system call with tracing compiled in but off is ${off_pct}% slower than compiled out, as the median of paired boots (budget ${off_budget}%)"
+            budget="$off_budget"
+            ;;
+        io)
+            judge "$on_pairs" "$on_budget"
+            name="io on vs pairoff"
+            failure="io with every event on is ${on_pct}% slower than all off in paired rounds (budget ${on_budget}%)"
+            budget="$on_budget"
+            ;;
+    esac
+    case "$verdict" in
+        fail)
+            echo "::error title=trace overhead::$failure, and its 95% lower bound, $(shown "$low"), is over the budget too: $summary"
+            status=1
+            ;;
+        inconclusive)
+            echo "::warning title=trace overhead inconclusive::$(inconclusive_text "$name" "$median_pct" "$low" "$high" "$budget"): $summary"
+            inconclusive=1
+            ;;
+    esac
 done
 # A full ring drops records, which is cheaper than writing them, so losses make "on" look
 # better than it is.
@@ -176,5 +267,8 @@ if [ "${#no_count[@]}" -gt 0 ]; then
     status=1
 elif [ "$lost" -gt 0 ]; then
     echo "::warning title=trace overhead::$lost records were dropped during the on rounds; the on figure is low"
+fi
+if [ "$status" -eq 0 ] && [ "$inconclusive" -eq 1 ]; then
+    status=3
 fi
 exit "$status"

@@ -151,15 +151,21 @@ off_from_out() {
 # +2.69% (each boot between +2.12% and +3.75%) is within the 5% budget. Its syscall "off"
 # rounds ran right after the io workload's toggling rounds, which "out" never follows
 # (fixed in ferric-trace-bench), so they were slow in most boots, and the paired median
-# (+4.78%) still fails: the gate must not hide them.
+# (+4.78%) is over the budget. But four of the ten pairs are faster with tracing compiled
+# in, so the sign test's 95% lower bound (-2.87%) is not over the budget: on this runner the
+# job cannot tell, and says so instead of passing or failing (exit 3).
 recorded | logs recorded
-expect recorded 1
-grep -qF "on 2.690% vs pairoff" "$work/output" || fail recorded "io on paired median"
-grep -qF "off 4.780% vs out" "$work/output" || fail recorded "syscall off paired median"
-! grep -q "io with every event on" "$work/output" || fail recorded "the io on budget failed"
+expect recorded 3
+grep -qF "on 2.690% vs pairoff (median of pairs, 95% bounds +2.301% to +3.441%" "$work/output" ||
+    fail recorded "io on paired median and bounds"
+grep -qF "off 4.780% vs out (median of pairs, 95% bounds -2.874% to +21.792%" "$work/output" ||
+    fail recorded "syscall off paired median and bounds"
+grep -qF "::warning title=trace overhead inconclusive::syscall off vs out: the median of 10 pairs, +4.780%, is over the 1% budget, but runner noise exceeds the budget: its 95% bounds are -2.874% to +21.792%" \
+    "$work/output" || fail recorded "inconclusive warning"
+! grep -q "::error" "$work/output" || fail recorded "an inconclusive result failed"
 grep -qF "::warning title=trace overhead::356168 records were dropped" "$work/output" ||
     fail recorded "lost records"
-echo "PASS: recorded job"
+echo "PASS: recorded job (inconclusive)"
 
 # 2. The recorded runner's boot-to-boot noise (the notrace boots' syscall times vary from
 # 141.4 to 170.5 ns, 20%) with a compiled-in-but-off kernel 0.5% slower: within budget.
@@ -183,7 +189,7 @@ echo "PASS: recorded noise with stalls and a load change"
 # 4. A real regression on the same noise fails, with the median and every pair.
 recorded | off_from_out 1.03 | logs regressed
 expect regressed 1
-grep -qF "compiled in but off is 3.000% slower than compiled out, as the median of paired boots (budget 1%)" \
+grep -qF "compiled in but off is 3.000% slower than compiled out, as the median of paired boots (budget 1%), and its 95% lower bound, +3.000%, is over the budget too" \
     "$work/output" || fail regressed "error message"
 grep -qF "each pair +3.00 +3.00" "$work/output" || fail regressed "per-pair list"
 echo "PASS: 3% regression"
@@ -217,3 +223,74 @@ recorded | off_from_out 1.0 | awk '!($1 == "trace" && $2 == 2 && $3 == "lost")' 
 expect no-lost 1
 grep -qF "no FERRIC_BENCH lost records= line in bench-trace-02.log" "$work/output" || fail no-lost "message"
 echo "PASS: unpaired and incomplete input"
+
+# Writes a table of N pairs whose syscall "off" rounds are OFF percent slower than their
+# pair's "out" round and whose io "on" rounds are ON percent slower than their boot's
+# "pairoff" round, one pair per line of standard input: "OFF ON". The other states are
+# constant.
+from_pairs() {
+    awk '{
+        n = NR
+        printf "notrace %d io out 23000\nnotrace %d syscall out 150\n", n, n
+        printf "trace %d io off 21000\ntrace %d io pairoff 21000\n", n, n
+        printf "trace %d io on %.4f\n", n, 21000 * (1 + $2 / 100)
+        printf "trace %d syscall off %.6f\n", n, 150 * (1 + $1 / 100)
+        printf "trace %d syscall pairoff 150\ntrace %d syscall on 180\ntrace %d lost - 0\n", n, n, n
+    }'
+}
+
+# 8. Issue #340: PR #374 (relibc only) in run 41384451285, syscall "off vs out" +2.391% with
+# these paired differences. The runner's spread (-6.43% to +7.77%) is far larger than the
+# 1% budget: inconclusive, not a failure. (The pairs are rounded to two places, so their
+# median is +2.390%.)
+pr374="-4.35 5.33 6.56 7.08 0.49 -2.24 -6.43 7.77 -2.77 4.29"
+printf '%s 2\n' $pr374 | from_pairs | logs pr374
+expect pr374 3
+grep -qF "off 2.390% vs out (median of pairs, 95% bounds -4.350% to +7.080%" "$work/output" ||
+    fail pr374 "median and bounds"
+grep -qF "::warning title=trace overhead inconclusive::syscall off vs out: the median of 10 pairs, +2.390%, is over the 1% budget" \
+    "$work/output" || fail pr374 "inconclusive warning"
+! grep -q "::error" "$work/output" || fail pr374 "an inconclusive result failed"
+echo "PASS: PR #374's noise is inconclusive"
+
+# 9. The same noise with a real 6% regression on top: every pair but the slowest outlier is
+# over the budget and the 95% lower bound is +1.65%, so it fails.
+for d in $pr374; do awk -v d="$d" 'BEGIN { printf "%.2f 2\n", d + 6 }'; done | from_pairs |
+    logs pr374-regressed
+expect pr374-regressed 1
+grep -qF "compiled in but off is 8.390% slower than compiled out, as the median of paired boots (budget 1%), and its 95% lower bound, +1.650%, is over the budget too" \
+    "$work/output" || fail pr374-regressed "error message"
+echo "PASS: a 6% regression on PR #374's noise fails"
+
+# 10. Issue #340: PR #381 in run 41513059373, syscall "off vs out" +1.688% with pairs from
+# -23.97% to +7.36% (the comment gives the median and range; the other pairs are made up
+# to match), and io "on vs pairoff" a stable +3.59% with pairs from +3.07% to +4.43%: the
+# syscall comparison is inconclusive, and io on passes.
+paste -d ' ' <(printf '%s\n' -23.97 -3.10 -1.20 0.40 1.50 1.876 2.90 4.10 5.50 7.36) \
+    <(printf '%s\n' 3.07 3.30 3.45 3.52 3.59 3.59 3.70 3.90 4.10 4.43) | from_pairs | logs pr381
+expect pr381 3
+grep -qF "off 1.688% vs out (median of pairs, 95% bounds -3.100% to +5.500%" "$work/output" ||
+    fail pr381 "syscall median and bounds"
+grep -qF "on 3.590% vs pairoff (median of pairs, 95% bounds +3.300% to +4.100%" "$work/output" ||
+    fail pr381 "io on median and bounds"
+! grep -q "io on vs pairoff" "$work/output" || fail pr381 "io on was not a pass"
+echo "PASS: PR #381's noise is inconclusive, its io on passes"
+
+# 11. More pairs narrow the bounds: twenty pairs (k = 6) of PR #374's noise, with a 2%
+# regression, fail where ten pairs of the same regression are inconclusive.
+for d in $pr374; do awk -v d="$d" 'BEGIN { printf "%.2f 2\n", d + 2 }'; done > "$work/pr374-2"
+from_pairs < "$work/pr374-2" | logs ten
+expect ten 3
+printf '%s 2\n' 1.2 1.4 1.5 1.6 1.8 2.0 2.2 2.4 2.6 3.0 | cat "$work/pr374-2" - | from_pairs | logs twenty
+expect twenty 1
+grep -qF "95% lower bound, +1.400%, is over the budget too" "$work/output" || fail twenty "k = 6 bound"
+echo "PASS: more pairs narrow the bounds"
+
+# 12. Fewer than five pairs give no 95% bound, so over the budget they are inconclusive
+# however large the difference; five identical pairs (k = 1) are enough to fail.
+printf '3 2\n3 2\n3 2\n3 2\n' | from_pairs | logs four
+expect four 3
+grep -qF "its 95% bounds are none to none" "$work/output" || fail four "no bound"
+printf '3 2\n3 2\n3 2\n3 2\n3 2\n' | from_pairs | logs five
+expect five 1
+echo "PASS: too few pairs for a bound"

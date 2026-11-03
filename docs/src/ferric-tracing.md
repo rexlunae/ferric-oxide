@@ -1959,7 +1959,8 @@ during the `on` rounds.
 The image workflow builds a second smoke image whose kernel differs only in
 leaving out `kernel.trace`. The `trace-overhead` job boots it and the traced
 image ten times each (a boot takes about 20 seconds), as ten runs of two
-back-to-back boots, one of each image, alternating which goes first.
+back-to-back boots, one of each image, alternating which goes first
+(`scripts/ferric-ci/boot-trace-bench.sh`).
 `scripts/ferric-ci/check-trace-overhead.sh` takes each boot's fastest round of
 each workload and state, and judges paired differences: `off` against `out`
 for the two boots of each run, and `on` against `pairoff` within each traced
@@ -1969,10 +1970,45 @@ variation between boots that comes from the runner: its load changes over the
 job (nested-KVM runners spread 3% to 20% between boots), and the two boots of
 a run see about the same load, so each pair's difference cancels it, where a
 difference of two medians over all boots does not. The median of the pairs
-keeps one stalled boot from deciding. The script's regression test,
-`scripts/ferric-ci/test-check-trace-overhead.sh`, replays the per-boot results
-of a recorded noisy job, with stalls and a change of load added, and a real
-regression on the same noise.
+keeps one stalled boot from deciding.
+
+Pairing does not remove all of the noise: on some runners the paired
+differences of `off` against `out` spread from -7% to +8%, or from -24% to
++7%, around a true difference well under the 1% budget (issue
+[#340](https://github.com/rexlunae/ferric-oxide/issues/340)), so the median of
+ten pairs lands over the budget by chance. Each median therefore comes with
+distribution-free 95% confidence bounds from the sign test: with *n* pairs,
+the *k*-th smallest and *k*-th largest differences, for the largest *k* with
+P(Binomial(*n*, 1/2) < *k*) at most 5% (*k* = 2 for 10 pairs, 6 for 20, 11 for
+30). The sign test only assumes that the pairs are independent; it does not
+assume the differences are normal or symmetric, which they are not, since a
+stall only ever slows a boot down. Each budgeted comparison has one of three
+outcomes:
+
+| Outcome | When | Effect |
+| --- | --- | --- |
+| pass | the median paired difference is within the budget | none |
+| fail | the 95% lower bound is over the budget, so the runner's noise cannot explain the regression | an error naming the median and the bound; the job fails |
+| inconclusive | the median is over the budget but the lower bound is not: the runner's noise is larger than the budget | a warning with the bounds; the job boots more pairs |
+
+The script exits 0, 1 or 3 for the three outcomes (2 for a usage error). On 3
+the job's check step boots five more pairs and judges all of them again, up
+to 30 pairs (`BENCH_BOOTS`, `BENCH_EXTRA_BOOTS` and `BENCH_MAX_BOOTS` in the
+job): more pairs narrow the bounds, so a real regression that ten pairs could
+not separate from the noise fails once its lower bound clears the budget. A
+comparison still inconclusive after 30 pairs passes the job with a warning
+that runner noise exceeded the budget. A change in tracing cost that is
+smaller than a runner's noise cannot be seen on that runner by any test; the
+warning says so instead of failing unrelated pull requests or passing in
+silence. Fewer than five pairs give no 95% bound, so with them a median over
+the budget is always inconclusive.
+
+The script's regression test, `scripts/ferric-ci/test-check-trace-overhead.sh`,
+replays the per-boot results of a recorded noisy job, with stalls and a change
+of load added, and a real regression on the same noise. It also replays the
+paired differences quoted in issue #340 (inconclusive), the same differences
+with a 6% regression added (fails), more pairs narrowing an inconclusive
+result into a failure, and too few pairs for a bound.
 
 Every boot's bench and trace result lines go into a few workflow annotations
 per image (GitHub keeps ten notices per step and 4 KiB of each). A boot that
@@ -1980,8 +2016,8 @@ fails, or lacks `FERRIC_TEST_PASS trace-bench`, fails the job, with an
 annotation that puts its test results and crash lines ahead of the serial
 tail, so a failing run can be read without its logs. `OFF_BUDGET_PCT` and
 `ON_BUDGET_PCT` set the budgets, which are checked against the unrounded
-median paired differences; the notice also lists each pair's difference and
-each state's median over the boots. The script fails, naming the logs, when a boot lacks a result or a
+median paired differences and bounds; the notice also lists the bounds, each
+pair's difference and each state's median over the boots. The script fails, naming the logs, when a boot lacks a result or a
 traced boot lacks its `lost records` line. It warns when records were dropped,
 since a dropped record costs less than a written one, and prints every result
 as a notice on the run.
