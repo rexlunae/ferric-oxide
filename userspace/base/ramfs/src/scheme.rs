@@ -4,6 +4,7 @@ use std::str;
 
 use event::{EventFlags, RawEventQueue};
 use ferric_abi::id::Caller;
+use ferric_abi::new_fd::APPENDS;
 use ferric_abi::time::TimeChange;
 use indexmap::IndexMap;
 use libredox::protocol::FsCall;
@@ -20,11 +21,11 @@ use scheme_utils::{proc_credentials, FpathWriter, HandleMap};
 use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{
     EACCES, EBADF, EBADFD, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOMEM, ENOSYS, ENOTDIR, ENOTEMPTY,
-    EOPNOTSUPP, EOVERFLOW, EPERM, ERANGE,
+    EOPNOTSUPP, EOVERFLOW, EPERM, ERANGE, ESPIPE,
 };
 use syscall::flag::{
-    StdFsCallKind, O_ACCMODE, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, O_STAT, O_TRUNC,
-    O_WRONLY,
+    StdFsCallKind, O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, O_STAT,
+    O_TRUNC, O_WRONLY,
 };
 use syscall::schemev2::NewFdFlags;
 use syscall::{
@@ -576,9 +577,11 @@ impl SchemeSync for Scheme<'_> {
         let new_id = self
             .handles
             .insert(Handle::Inode(inode, Access::from_flags(flags)));
+        // Ferric Oxide: `O_APPEND` writes go to the end, so the kernel may move the cursor to
+        // `fsize` after them (#244).
         Ok(OpenResult::ThisScheme {
             number: new_id,
-            flags: NewFdFlags::POSITIONED,
+            flags: NewFdFlags::POSITIONED | NewFdFlags::from_bits_retain(APPENDS),
         })
     }
 
@@ -836,7 +839,27 @@ impl SchemeSync for Scheme<'_> {
         // Ferric Oxide: the kernel does not check the descriptor's access mode (#400).
         check_open_for(fcntl_flags, Direction::Write)?;
 
-        file.write(offset, buf)
+        // Ferric Oxide (#244): an append ignores the cursor the kernel passes.
+        if fcntl_flags as usize & O_APPEND != 0 {
+            file.append(buf)
+        } else {
+            file.write(offset, buf)
+        }
+    }
+
+    /// Ferric Oxide: the size of a regular file or directory, for `lseek(SEEK_END)` and
+    /// for the kernel to move an appending description's cursor to the end (#244).
+    fn fsize(&mut self, fd: usize, _ctx: &CallerCtx) -> Result<u64> {
+        let inode = self.handles.get(fd)?.as_inode()?;
+        let file = self
+            .filesystem
+            .files
+            .get(&inode)
+            .ok_or(Error::new(EBADFD))?;
+        if matches!(file.data, FileData::Socket(_)) {
+            return Err(Error::new(ESPIPE));
+        }
+        u64::try_from(file.data.size()).map_err(|_| Error::new(EOVERFLOW))
     }
 
     fn getdents<'buf>(

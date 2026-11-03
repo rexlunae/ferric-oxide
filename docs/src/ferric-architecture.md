@@ -125,6 +125,28 @@ PCI discovery and drivers for storage, networking, USB, input and graphics.
 `pcid-spawner` starts matched drivers. DMA-domain transfer and interrupt
 message allocation are integrated into that interface.
 
+An open file description's cursor lives in the kernel, which passes it to the
+scheme as each `read` and `write` offset and advances it by the bytes moved.
+A non-empty write on an `O_APPEND` description is the exception
+([#244](https://github.com/rexlunae/ferric-oxide/issues/244)) when the scheme
+said at open that it appends: Ferric's `APPENDS` bit (`ferric_abi::new_fd`)
+beside `POSITIONED` in the open reply's flags. Such a scheme writes at the end
+of the file whatever offset it is given, so after the write the kernel asks it
+for the file's size (`fsize`, as `lseek(SEEK_END)` does) and moves the cursor
+there (`crates/kernel/src/syscall/cursor.rs`). Schemes without the bit, such as
+raw disks, write at the offset they are given and keep the advance by the
+count. The write reply has room only for the byte count, so the end of the
+write is read in a second request: an append or truncation by another
+description in between leaves the cursor at that later end, and two threads
+appending through one description may leave it at the earlier of their ends.
+An empty write leaves the cursor where it was. A scheme without `fsize` (or one that fails) gets the old advance by the
+count. RedoxFS, ramfs and ext4d set `APPENDS`. The bit is an addition to
+`redox_syscall`'s `NewFdFlags`, so it extends the scheme ABI. Kernels without
+it (upstream Redox, and Ferric before #244) accept no bit but `POSITIONED` and
+refuse an open reply carrying it with `EINVAL`. RedoxFS, ramfs and ext4d built
+from this tree therefore need a kernel from the same tree, which an image always
+has. Schemes that do not set it keep the old behaviour.
+
 Descriptors also act as capabilities for the new buffer and DMA interfaces:
 a registered-buffer region controls its grants, a grant gives bounded access
 to memory, and a DMA-domain descriptor allows operations subject to binding

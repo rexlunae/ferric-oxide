@@ -732,14 +732,20 @@ a ramp-up period (`ramp_time` is 0 by default).
 5. Removing write access with `mprotect` narrows device permissions too.
    Unmapping memory, process exit and domain closure retire translations
    with the required invalidations before frames can be released. A
-   translation whose installation could not confirm its invalidation may
-   still be reachable by the device, so the kernel keeps its IOVA block and
-   frame pins owned, by IOVA, without recording a mapping; only a domain
-   closure that blocks every device releases them, and exactly once. A
-   closure that cannot block them keeps them pinned. No test injects a failed
-   installation: the shared crate's unit test covers the retained entries and
-   the ordering of their release, and the kernel path is compiled for the
-   target but only runs when hardware fails an invalidation.
+   translation whose installation could not confirm its invalidation, or a
+   mapping whose strict unmap failed, may still be reachable by the device,
+   so the kernel keeps its IOVA block and frame pins owned without a mapping
+   record; only a domain closure that blocks every device releases them, and
+   exactly once. A closure that cannot block them keeps them pinned. The
+   physical range is reserved before frames are pinned, and
+   `ferric_iommu::dma::Retained::install` decides from the installation's
+   outcome whether its block and pins go to the new mapping, back to the
+   allocators (a table failure that `Domain::map` rolled back), or to the
+   retained set, so no failure path drops them unowned. Host fault-injection
+   tests in `crates/iommu/tests/translation_failures.rs` cover clean and
+   uncertain first installations, failed teardowns and one-time release on
+   blocked and unblocked closes; the kernel path itself only runs when
+   hardware fails an invalidation.
 6. Moving memory away with `mremap` or a proc transfer (`AddrSpace::r#move`)
    releases the source's translations one grant at a time, right after that
    grant has left the source (`ferric_iommu::dma::moved`). A move that fails
@@ -1551,11 +1557,12 @@ remains available to other mounts of the same daemon binary.
   refused (`EOPNOTSUPP`) before anything is written. Immutable and append-only
   files are refused (`EPERM`); inline-data, encrypted, verity and journaled-data
   files are not written yet (`EOPNOTSUPP`). Opening for writing needs write
-  permission (and read permission unless `O_WRONLY`). `O_APPEND` opens and
-  writes fail with `EOPNOTSUPP`, including a flag enabled after open through
-  `F_SETFL`: the current scheme response cannot return an append's actual
-  ending position to the kernel
-  ([#244](https://github.com/rexlunae/ferric-oxide/issues/244)). The inode's
+  permission (and read permission unless `O_WRONLY`). A write with
+  `O_APPEND` (set at open or later through `F_SETFL`; each write's flags
+  decide) goes to the end of the file whatever the cursor, and the kernel then
+  moves the cursor to the size `fsize` reports
+  ([#244](https://github.com/rexlunae/ferric-oxide/issues/244); see
+  [Architecture](ferric-architecture.md#schemes-descriptors-and-services)). The inode's
   size and flags use a generated `simple_endian` native/wire layout, with a byte
   fixture protecting unchanged fields. Every open file is opened again in
   `ext4-view` after a write, so reads see it.
@@ -1628,9 +1635,10 @@ FreeBSD (`s_creator_os` 3), and a crash before each write of an `fchmod`.
 and past the end inside the last block, checks the permission rules, that
 other open handles read the new bytes, that unwritten extents are refused with
 nothing written (the `write-data` fixture, which also has immutable and
-append-only files), that append opens and writes at an earlier cursor or EOF
-fail without changing any image bytes, size or timestamps, and that ordinary
-offset writes still work, and crashes a write before each of its nine writes.
+append-only files), that appends from an earlier cursor, from EOF and past
+it all write at the end (and are refused on read-only mounts), that
+`append_data` returns where it wrote, and that ordinary offset writes still
+work, and crashes a write before each of its nine writes.
 `tests/alloc.rs` runs on `alloc.ext4.gz` (`metadata_csum`) and
 `alloc-gdt.ext4.gz` (`gdt_csum`, 32-byte descriptors): writes past the end and
 into holes, extents that grow in place, a full root and a leaf under the root,

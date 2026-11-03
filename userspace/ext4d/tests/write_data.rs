@@ -384,38 +384,86 @@ fn a_crash_at_any_write_leaves_the_old_size_or_the_new_one() {
     }
 }
 
+/// Issue #244: an append from cursor 0 on a non-empty file writes at the end, and the
+/// size afterwards, which `fsize` reports and the kernel makes the description's cursor,
+/// is the end of the appended bytes, where the next read finds nothing.
 #[test]
-fn append_opens_and_writes_are_refused_without_changing_the_file() {
+fn appends_write_at_the_end_whatever_the_offset() {
     use syscall::flag::{O_APPEND, O_RDWR, O_WRONLY};
     let (mut fs, shared) = mount_writable(basic());
-    let untouched = shared.bytes();
-    for access in [O_WRONLY, O_RDWR] {
-        let mode = OpenMode::from_flags(access | O_APPEND);
-        assert!(mode.append);
-        let error = fs
-            .open(None, "/hello.txt", mode)
-            .expect_err("append is unsupported");
-        assert!(matches!(error, Error::AppendUnsupported));
-        assert_eq!(error.errno(), syscall::error::EOPNOTSUPP);
+    let appender = open(
+        &mut fs,
+        "/hello.txt",
+        OpenMode::from_flags(O_RDWR | O_APPEND),
+    );
+    assert_eq!(fs.attributes(appender).unwrap().size, 16);
+    // The kernel passes the description's cursor, 0; the append ignores it.
+    assert_eq!(
+        fs.write_with_flags(appender, 0, b"more", O_APPEND as u32)
+            .unwrap(),
+        4
+    );
+    let cursor = fs.attributes(appender).unwrap().size;
+    assert_eq!(cursor, 20);
+    assert_eq!(fs.read(appender, cursor, &mut [0; 8]).unwrap(), 0);
+    assert_eq!(read_all(&mut fs, appender), b"hello from ext4\nmore");
+
+    // O_APPEND enabled after open (F_SETFL) arrives with the write's flags, and an offset
+    // inside the file or past its end does not matter either.
+    let plain = open(&mut fs, "/hello.txt", OpenMode::from_flags(O_WRONLY));
+    for (offset, data) in [(5, &b"!"[..]), (1000, &b"?"[..])] {
+        assert_eq!(
+            fs.write_with_flags(plain, offset, data, O_APPEND as u32)
+                .unwrap(),
+            1
+        );
     }
-    let file = open(&mut fs, "/hello.txt", READ_WRITE);
-    let before = fs.attributes(file).unwrap();
-    assert_eq!(before.size, 16);
-    // Cover an append flag enabled after open. The old scheme implementation
-    // appended at EOF and returned 4, which advanced the kernel's cursor 0 -> 4.
-    for offset in [0, 5, before.size] {
-        let error = fs
-            .write_with_flags(file, offset, b"more", O_APPEND as u32)
-            .expect_err("cannot return a correct append cursor");
-        assert!(matches!(error, Error::AppendUnsupported));
-        assert_eq!(error.errno(), syscall::error::EOPNOTSUPP);
-        assert_eq!(fs.attributes(file).unwrap(), before);
-        assert_eq!(shared.bytes(), untouched);
-    }
-    // Explicit-offset writes still use the supplied position and return their count.
-    assert_eq!(fs.write_with_flags(file, 6, b"FROM", 0).unwrap(), 4);
-    assert_eq!(read_all(&mut fs, file), b"hello FROM ext4\n");
-    e2fsck("append-refused", shared.bytes());
+    assert_eq!(read_all(&mut fs, appender), b"hello from ext4\nmore!?");
+
+    // An append that allocates blocks starts at the old end too.
+    let big = vec![b'x'; 3 * 4096];
+    assert_eq!(
+        fs.write_with_flags(appender, 3, &big, O_APPEND as u32)
+            .unwrap(),
+        big.len()
+    );
+    let mut want = b"hello from ext4\nmore!?".to_vec();
+    want.extend_from_slice(&big);
+    assert_eq!(fs.attributes(appender).unwrap().size, want.len() as u64);
+    assert_eq!(read_all(&mut fs, appender), want);
+    // Without O_APPEND, the offset is used.
+    assert_eq!(fs.write_with_flags(appender, 6, b"FROM", 0).unwrap(), 4);
+    want[6..10].copy_from_slice(b"FROM");
+    let image = e2fsck("append", shared.bytes());
+    assert_eq!(contents(image, "/hello.txt"), want);
+}
+
+#[test]
+fn append_data_returns_the_offset_it_wrote_at() {
+    let image = basic();
+    let number =
+        lookup::inode_of(&Window::whole(image.clone()).unwrap(), "/hello.txt").expect("the path");
+    let mut window = Window::whole(image).unwrap();
+    let changed = Timestamp::now();
+    assert_eq!(
+        write::append_data(&mut window, number, b"more", changed).unwrap(),
+        16
+    );
+    assert_eq!(
+        write::append_data(&mut window, number, b"", changed).unwrap(),
+        20
+    );
+    assert_eq!(
+        write::append_data(&mut window, number, b"!", changed).unwrap(),
+        20
+    );
+    let image = e2fsck("append-data", window.into_inner());
+    assert_eq!(contents(image, "/hello.txt"), b"hello from ext4\nmore!");
+}
+
+#[test]
+fn appends_on_read_only_mounts_are_refused() {
+    use syscall::flag::{O_APPEND, O_WRONLY};
     let mut ro = Fs::new(Window::whole(basic()).unwrap()).unwrap();
     assert!(matches!(
         ro.open(

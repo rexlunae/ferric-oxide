@@ -449,7 +449,7 @@ See [the network queue test](ferric-io.md#kernel-bypass-network-queues) for manu
 | `ferric-pcache-test` | `kernel.pcache` with a file system scheme of its own: a miss filled through the queue, a hit with no scheme read, readahead after a sequential read, `EIO` from a failed fill and a retry, `EIO` (not a hang) from a done answer whose payload faults and the same answer arriving late ignored, leaving the retry alone, records put back after a queue read that faults, `EPERM` for a child process (attaching, or binding an unbound queue), a queue kept across `exec`, an invalidated page filled again and a stale fill not taken, an answer to a closed object's record ignored as stale (it neither fills nor fails the new object's fill of the same page) and no stale records after reopening it, and readers released with `EIO` when the queue closes, after which reads go to the scheme; prints a cached 4 KiB `pread` time beside the scheme's. Then on RedoxFS: a read-only description follows writes, truncations and an append through another one, a shared writable mapping keeps a file out of the cache exactly while it lasts (a private one changes neither the file nor its caching), and cached reads are benchmarked against RedoxFS's own in the same boot (`FERRIC_BENCH pcache-redoxfs-*`, paired A/B) |
 | `ferric-ring-test` | `kernel.ring` setup and refusals, `Nop`/`Read`/`Write`/`Fsize`/`Fstat`/`Fsync` through a ring, the fixed-file table, asynchronous chains with `min_complete` waits and close, a chain across RedoxFS, the pipe scheme and the null scheme in one `Enter`, broken and overlong chains, incomplete chains, CQ back-pressure, a corrupt SQ tail, `EVENT_READ` on completion, and ring versus system call timings. `--async-only` selects the asynchronous chain and close probes used by `trace-lifecycle` to check kernel-worker identity restoration |
 | `ferric-trace-test` | Boot-time and live tracepoint enable, decoding of every CPU's ring, system call enter/exit pairs and results, scheme request/response matching by SQE tag, timestamp order, mapping-operation results and target spaces (map/protect/unmap, peer context, refusals, validation and disable), the mapping journal (fixed replacement, kernel-placed and fixed `mremap`, a fork's clone and its teardown, and disable), queued futex wait/resume results and wake counts (32/64-bit timeout, wake-before-resume order, sustained empty-wake polling, mismatch and disable), ordered kernel context creation/start/exit for a child process, a thread and asynchronous ring workers (including restored PID 0), `procmgr`'s fork/exec/exit/wait records for a child with its exit status and the refusal of forged `emit` records, and read-only mapping of the rings with `commit` checks. When the kernel reports host-visible rings in `kernel.trace/host` (booted with `FERRIC_TRACE_HOST`, the harness's trace mode, and the kernel accepted it) its default run starts with `trace-host-read`, which checks that a read of CPU 0's ring returns records and that `commit` is accepted, and then runs the other steps except `trace-mmap`, `trace-mapping` and `trace-clock`, which map the rings and print `FERRIC_TEST_SKIP` because host rings cannot be mapped yet ([#378](https://github.com/rexlunae/ferric-oxide/issues/378)). The smoke script skips `trace-capture`, which captures through the mappings, when `ferric-trace-test host-rings` exits 0 (it prints nothing, and exits 0 only with host rings); `ferric-trace-test crash` runs the crash step either way |
-| `ferric-ext4-test` | Mounts the `ext4d` fixture image explicitly read-only (`fs.ext4`), lists the root, an empty and a hashed directory, reads files whole, at an offset and through a symbolic link, reads the link, checks `stat`, and checks that writing, creating, removing, renaming and `mkdir` fail with `EROFS`. `ext4-journal` mounts a volume that needs recovery: ext4d must replay its journal (`fs.ext4_journal_replay`), serve the journaled contents and leave the image clean. The step is skipped only when `ext4d --features` does not list `journal-replay`; once it does, a replay error fails the step. `ext4-image-unchanged` checks the read-only backing image byte for byte; `ext4-write` uses a separate default mount for write/truncate/create when the compiled writer is advertised, and `ext4-owner` checks there that a user 2000 child may `fchmod` and `futimens` only its own file |
+| `ferric-ext4-test` | Mounts the `ext4d` fixture image explicitly read-only (`fs.ext4`), lists the root, an empty and a hashed directory, reads files whole, at an offset and through a symbolic link, reads the link, checks `stat`, and checks that writing, creating, removing, renaming and `mkdir` fail with `EROFS`. `ext4-journal` mounts a volume that needs recovery: ext4d must replay its journal (`fs.ext4_journal_replay`), serve the journaled contents and leave the image clean. The step is skipped only when `ext4d --features` does not list `journal-replay`; once it does, a replay error fails the step. `ext4-image-unchanged` checks the read-only backing image byte for byte; `ext4-write` uses a separate default mount for write/truncate/create/`O_APPEND` when the compiled writer is advertised, and `ext4-owner` checks there that a user 2000 child may `fchmod` and `futimens` only its own file |
 | `ferric-fat-test` | Mounts the `fatd` FAT32 fixture image (`fs.fat`), then the exFAT one (`fs.exfat`, a skip without it), and on each lists the root, an empty directory and one over several clusters, reads files whole and at an offset by their long names, their 8.3 short names (FAT only) and in another case, checks sizes, kinds, modes and modification times from `stat`, and checks that writing, creating, removing, renaming and `mkdir` fail with `EROFS` |
 | `ferric-blocklayer-test` | Serves the `crates/blocklayer` fixture images with `ferric-blockd` (`fs.luks`, `fs.lvm`): an LV inside LUKS2 with 4096-byte sectors, LUKS2 inside an LV and a LUKS1 volume read back their patterns whole and across a sector boundary; opening for writing fails with `EROFS`, a UID 2000 process gets `EACCES`, and a wrong passphrase makes the daemon exit without serving. With `ferric-unlock` (`fs.unlock_at_boot`), `blocklayer-unlock-boot` reads back the volumes its `/etc/ferric/crypttab` had unlocked at boot: LVM on LUKS from a key file, and ext4 mounted by `ext4d` through `ferric-blockd` |
 | `ferric-trace-bench` | Times RedoxFS requests and null system calls with tracing compiled out, compiled in but off, and every event on, for the overhead budget |
@@ -1311,8 +1311,8 @@ and the full S9 teardown/failure matrix remain separate gates.
 The smoke suite mounts its `ext4-erofs` fixture with `ext4d --read-only`,
 including when `fs.ext4_write=true`. It checks `EROFS` and verifies that the
 backing image is unchanged after the daemon stops. The independent `ext4-write`
-step uses the daemon's default policy and checks writing, truncation and regular
-file creation when `ext4d --features` advertises `write`; only an absent compiled
+step uses the daemon's default policy and checks writing, truncation, regular
+file creation and `O_APPEND` (writes at the end and a cursor left there, #244) when `ext4d --features` advertises `write`; only an absent compiled
 capability skips that step. On the same mount, `ext4-owner` runs a child as user
 2000: `fchmod`, `futimens` with explicit times and `fchown` on a file root owns
 are refused with `EPERM`, and `futimens` to now without write access with
@@ -1606,6 +1606,27 @@ procmgr's reply is decoded by `ferric-proc-creds` (`crates/proc-creds`), whose
 tests the root workspace runs. `host-tools.yml` also checks the test's
 formatting, target Clippy and Rustdoc; the image workflow requires all six
 steps.
+
+## O_APPEND cursors
+
+`ferric-append-test` runs in the smoke image and checks that an `O_APPEND`
+write goes to the end of the file and leaves the description's cursor there
+([#244](https://github.com/rexlunae/ferric-oxide/issues/244)), on RedoxFS
+(`/tmp`) and on `ramfs` (`/scheme/logging`). Each step writes a 16-byte file,
+opens it for reading and appending with the cursor at 0, appends 4 bytes and
+checks that `lseek(SEEK_CUR)` is 20 and a read finds nothing; it then seeks to
+0, appends again and checks the cursor and the contents:
+
+- `append-redoxfs`: RedoxFS's root file system;
+- `append-ramfs`: the logging `ramfs` (skipped without `/scheme/logging`).
+
+The image workflow requires both steps, and `host-tools.yml` checks the test's
+formatting, target Clippy and Rustdoc. The ext4 `ext4-write` step makes the
+same checks on ext4d. Host tests cover the parts that build there: the kernel's
+cursor rule (`syscall::cursor` in `ferric-kernel-tests`), RedoxFS's
+`append_node` (`cargo test` in `userspace/redoxfs`), `ramfs`'s append
+(`cargo test -p ramfs` in `userspace/base`) and ext4d's `append_data` and
+`O_APPEND` writes (`tests/write_data.rs`, `--features write`).
 
 ## Documentation checks
 
