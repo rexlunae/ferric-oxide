@@ -263,11 +263,14 @@ the faulting operation instead, through the same paths as a refused access:
   (for example because its handler also needs a page), is ended by the kernel
   with the exception as its status.
 
-A failed fault leaves nothing behind. When a page table on the path cannot be
+A failed fault does not leak memory. When a page table on the path cannot be
 allocated, the handler unlinks the empty tables it added and frees them, along
 with a zeroed frame it allocated for the page, after the TLB shootdown. It
 also gives back a reference it took on a frame borrowed from another address
-space. Without that, each retried fault would hold more memory.
+space. Without that, each retried fault would hold more memory. One mapping
+can remain: a fault on a page borrowed from another address space may first
+map the missing source page there. That page belongs to the source's grant,
+which frees it, and a retried fault reuses it.
 
 The kernel logs a warning naming the address, and with `kernel.trace_mm` the
 `mm.page_fault` record has the `out of memory` outcome. No process is exempt:
