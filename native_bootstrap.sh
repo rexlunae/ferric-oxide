@@ -41,8 +41,9 @@ homebrew_packages=(
     nasm autoconf automake gettext bison flex texinfo cmake meson ninja pkg-config
     openssl@3 qemu
 )
-# Homebrew does not link these over macOS's older copies.
-homebrew_keg_only=(bison flex texinfo gettext)
+# Homebrew does not link these over macOS's older copies. openssl@3's command is
+# needed too: macOS's LibreSSL `openssl` cannot `rehash` (ca-certificates).
+homebrew_keg_only=(bison flex texinfo gettext openssl@3)
 
 run() {
     echo "+ $*" >&2

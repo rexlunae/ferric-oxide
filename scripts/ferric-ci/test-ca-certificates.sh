@@ -57,3 +57,34 @@ if bash "$script" "$work/broken.pem" "$work/broken" 2> /dev/null; then
     fail broken "a block that is not a certificate was accepted"
 fi
 echo "PASS: broken"
+
+# An openssl without rehash, as macOS's LibreSSL: refused up front, by name.
+mkdir -p "$work/bin"
+cat > "$work/bin/libressl" <<'FAKE'
+#!/usr/bin/env bash
+case "$1" in
+    version) echo "LibreSSL 3.3.6" ;;
+    rehash) echo "openssl:Error: 'rehash' is an invalid command." >&2; exit 1 ;;
+    *) exec openssl "$@" ;;
+esac
+FAKE
+chmod +x "$work/bin/libressl"
+if OPENSSL="$work/bin/libressl" bash "$script" "$work/bundle.pem" "$work/libre" 2> "$work/libre.err"; then
+    fail libressl "an openssl without rehash was accepted"
+fi
+grep -qF "LibreSSL 3.3.6" "$work/libre.err" && grep -qF "no rehash command" "$work/libre.err" ||
+    fail libressl "the error does not name the openssl and its missing rehash: $(cat "$work/libre.err")"
+[ -z "$(find "$work/libre" -name '*.pem' 2> /dev/null)" ] || fail libressl "certificates installed before the check"
+echo "PASS: libressl"
+
+# OPENSSL selects the command used throughout.
+cat > "$work/bin/counted" <<'FAKE'
+#!/usr/bin/env bash
+echo "$1" >> "${COUNT_FILE:?}"
+exec openssl "$@"
+FAKE
+chmod +x "$work/bin/counted"
+COUNT_FILE="$work/count" OPENSSL="$work/bin/counted" bash "$script" "$work/bundle.pem" "$work/chosen"
+grep -qxF rehash "$work/count" && [ "$(grep -cxF x509 "$work/count")" -eq 4 ] ||
+    fail openssl-var "OPENSSL was not used for every call: $(tr '\n' ' ' < "$work/count")"
+echo "PASS: openssl-var"

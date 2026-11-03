@@ -10,8 +10,10 @@
 #   CERTDIR/<hash>.<n>            `openssl rehash -compat` links to them, by
 #                                 current and pre-1.0 OpenSSL subject hash
 #
-# Needs `openssl` on the build host. Fails if the bundle holds no certificate
-# or a block that is not one.
+# Needs OpenSSL 1.1 or later on the build host, as `openssl` on PATH or named
+# by OPENSSL: LibreSSL, the `openssl` macOS ships, has no `rehash`, so on macOS
+# put Homebrew's keg-only openssl@3 first (native_bootstrap.sh does). Fails if
+# the bundle holds no certificate or a block that is not one.
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
@@ -21,8 +23,14 @@ fi
 bundle="$1"
 certdir="$2"
 
-if ! command -v openssl > /dev/null; then
-    echo "install-certs.sh: openssl is needed to hash the certificates" >&2
+openssl="${OPENSSL:-openssl}"
+if ! command -v "$openssl" > /dev/null; then
+    echo "install-certs.sh: $openssl is needed to hash the certificates" >&2
+    exit 1
+fi
+if ! "$openssl" rehash -help > /dev/null 2>&1; then
+    echo "install-certs.sh: $openssl ($("$openssl" version 2>&1)) has no rehash command;" \
+        "use OpenSSL 1.1 or later (on macOS, Homebrew's openssl@3) first on PATH or as OPENSSL" >&2
     exit 1
 fi
 
@@ -43,7 +51,7 @@ awk -v dir="$work" '
 ' "$bundle"
 
 for split in "$work"/*; do
-    fingerprint="$(openssl x509 -in "$split" -noout -fingerprint -sha256)"
+    fingerprint="$("$openssl" x509 -in "$split" -noout -fingerprint -sha256)"
     fingerprint="${fingerprint#*=}"
     fingerprint="${fingerprint//:/}"
     name="$(printf '%s' "${fingerprint:0:16}" | tr 'A-F' 'a-f').pem"
@@ -51,7 +59,7 @@ for split in "$work"/*; do
         echo "install-certs.sh: $bundle holds the certificate $name twice" >&2
         exit 1
     fi
-    openssl x509 -in "$split" -out "$certdir/$name"
+    "$openssl" x509 -in "$split" -out "$certdir/$name"
 done
 
 installed="$(find "$certdir" -maxdepth 1 -name '*.pem' -type f | wc -l)"
@@ -61,5 +69,5 @@ if [ "$installed" -ne "$blocks" ]; then
 fi
 
 rm -rf "$work"
-openssl rehash -compat "$certdir"
+"$openssl" rehash -compat "$certdir"
 cp "$bundle" "$certdir/ca-certificates.crt"

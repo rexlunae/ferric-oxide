@@ -486,12 +486,16 @@ the title and message.
 The smoke configuration builds `ca-certificates` from source, so image builds do
 not download it from Redox's package server. Its recipe takes Mozilla's CA
 bundle from a pinned certifi release (checked by BLAKE3) and installs it with
-`recipes/data/ca-certificates/install-certs.sh`, which needs `openssl` on the
-build host. `scripts/ferric-ci/test-ca-certificates.sh` (host-tools CI) runs
+`recipes/data/ca-certificates/install-certs.sh`, which needs OpenSSL 1.1 or
+later on the build host (`openssl` on `PATH`, or the command named by `OPENSSL`).
+macOS's own `openssl` is LibreSSL, which has no `rehash`; `native_bootstrap.sh`
+puts Homebrew's keg-only `openssl@3` first on `PATH`.
+`scripts/ferric-ci/test-ca-certificates.sh` (host-tools CI) runs
 that script on generated bundles: each certificate is installed once with its
 current and pre-1.0 OpenSSL hash links and verifies through `-CApath`, and an
 empty bundle, a repeated certificate or a block that is not a certificate fails
-the build.
+the build. An `openssl` without `rehash` is refused before anything is
+installed, with its version in the error, and `OPENSSL` is used for every call.
 
 `.github/workflows/image.yml` generates feature settings, forces KPTI on,
 enables IOMMU `auto`, shadow-stack policy `auto`, registered buffers,
