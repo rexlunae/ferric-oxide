@@ -382,6 +382,20 @@ cargo clippy --locked --manifest-path recipes/tests/ferric-xstate-test/files/Car
   --all-targets --target x86_64-unknown-redox -- -D warnings
 ```
 
+`crates/relibc/redox-rt/tests/signal_defaults.rs` compiles the runtime's table of
+default signal actions (`redox-rt/src/signal/defaults.rs`) the same way and checks
+that `SIGCHLD`, `SIGCONT`, `SIGURG` and `SIGWINCH` are ignored by default, the
+job-control stops stop, and every other signal terminates. The table sets the
+`IGNORED` flag procmgr reads before it interrupts a blocked call, so a missing
+entry lets the signal fail the call with `EINTR` although no handler runs
+([#377](https://github.com/rexlunae/ferric-oxide/issues/377)):
+
+```sh
+rustc --edition=2024 --test -D warnings \
+  crates/relibc/redox-rt/tests/signal_defaults.rs -o /tmp/ferric-signal-defaults-tests
+/tmp/ferric-signal-defaults-tests
+```
+
 Host CI runs these checks, strict runtime/recipe Clippy and Rustdoc, and the
 recipe's host program (a capability skip when AVX-512 is unavailable).
 Its test job uses the same cached pinned-submodule setup as image builds,
@@ -424,6 +438,7 @@ See [the network queue test](ferric-io.md#kernel-bypass-network-queues) for manu
 | `ferric-borrow-test` | A scheme call whose buffer cannot be borrowed leaves the caller's shared file mappings unpinned; RedoxFS maps a written or reused file with its current contents, `read` sees stores through a live shared mapping, `fsync` does not write an unmapped page back over a later `pwrite`, and a `pwrite` reaches live shared mappings; prints `FERRIC_BENCH borrow-pwrite`, page writes to an unmapped and a mapped file |
 | `ferric-futex-test` | Compare/wait/wake races and expired waiters |
 | `ferric-exit-test` | Process exit while a second thread is busy reading a pipe or parking on a futex: the force-killed thread must not block in its next wait, so every child exits ([#200](https://github.com/rexlunae/ferric-oxide/issues/200)) |
+| `ferric-sigcont-test` | relibc's `signals/sigcont-default` test: in eight rounds a child blocks reading a pipe, receives `SIGCONT` with the default action, and must still read the byte written after it. Shells send `SIGCONT` to every job they start, so before the fix a program still loading its libraries failed its read with `EINTR` ([#377](https://github.com/rexlunae/ferric-oxide/issues/377)); prints `FERRIC_TEST_PASS sigcont-default` through the smoke script |
 | `ferric-scheme-self-test` | A process opens and reads a file on a scheme it created on the same thread and serves from another, which used to spin the caller's CPU in the kernel |
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
 | `ferric-blkgrant-test` | `nvmed` DMA into an attached grant: reads and writes against `pread`, refusals, revocation, detach and a copy versus grant read benchmark |
