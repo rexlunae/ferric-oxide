@@ -17,7 +17,8 @@
 //!   (`EACCES`); root then finds neither file carrying the explicit times.
 //! - `owner-times-allowed`: on root's writable file it may set both times to the current
 //!   time, and on its own file it may set the access time while `UTIME_OMIT` keeps the
-//!   modification time; root then finds exactly those times.
+//!   modification time; root then finds exactly those times, the current ones within the
+//!   clock readings it took before and after the child.
 //! - `owner-truncate`: `ftruncate` through a descriptor opened read-only is refused (`EBADF`
 //!   or `EINVAL`), even on its own file, and allowed through one opened for writing; root
 //!   then finds the sizes it expects.
@@ -33,11 +34,13 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::Write;
 use std::io::{self, ErrorKind};
+use std::ops::RangeInclusive;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, chown, fchown};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
 use std::ptr;
+use std::time::SystemTime;
 
 use ferric_abi::time::UTIME_OMIT;
 
@@ -142,6 +145,17 @@ fn futimens(file: &File, times: Option<[(i64, i64); 2]>) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+/// The current realtime clock, as (seconds, nanoseconds), the clock ramfs reads for
+/// `UTIME_NOW`.
+fn now() -> Result<(i64, i64), Failure> {
+    let since_epoch = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|err| Failure::Check(format!("the clock is before the epoch: {err}")))?;
+    let seconds = i64::try_from(since_epoch.as_secs())
+        .map_err(|err| Failure::Check(format!("the clock is out of range: {err}")))?;
+    Ok((seconds, i64::from(since_epoch.subsec_nanos())))
 }
 
 /// A file's access and modification times, as (seconds, nanoseconds).
@@ -259,12 +273,14 @@ fn run() -> Result<(), Failure> {
     create_files()?;
     let [_, mine_modified] = times(MINE)?;
     let exe = std::env::current_exe().map_err(io("current_exe"))?;
+    let before = now()?;
     let status = Command::new(exe)
         .arg(AS_USER)
         .uid(USER)
         .gid(USER)
         .status()
         .map_err(io("spawn as user 1000"))?;
+    let after = now()?;
     if !status.success() {
         return Err(Failure::Check(format!(
             "user {USER}'s checks failed ({status})"
@@ -287,7 +303,7 @@ fn run() -> Result<(), Failure> {
     }
     println!("FERRIC_TEST_PASS owner-allowed");
 
-    check_times(mine_modified)?;
+    check_times(mine_modified, before..=after)?;
 
     check_sizes()?;
     println!("FERRIC_TEST_PASS owner-truncate");
@@ -295,9 +311,13 @@ fn run() -> Result<(), Failure> {
 }
 
 /// Root's view of the times after the child: its locked file untouched, its writable file
-/// touched (`UTIME_NOW` applied as the current time, not stored), and the user's file
-/// carrying the explicit access time with [`UTIME_OMIT`] honoured.
-fn check_times(mine_modified: (i64, i64)) -> Result<(), Failure> {
+/// touched (`UTIME_NOW` applied as a time within `child_ran`, the clock readings around
+/// the child, not stored), and the user's file carrying the explicit access time with
+/// [`UTIME_OMIT`] honoured.
+fn check_times(
+    mine_modified: (i64, i64),
+    child_ran: RangeInclusive<(i64, i64)>,
+) -> Result<(), Failure> {
     let locked = times(LOCKED)?;
     if locked != [OLD, OLD] {
         return Err(Failure::Check(format!(
@@ -305,9 +325,9 @@ fn check_times(mine_modified: (i64, i64)) -> Result<(), Failure> {
         )));
     }
     for time in times(THEIRS)? {
-        if time == OLD || time == EXPLICIT || !(0..1_000_000_000).contains(&time.1) {
+        if !child_ran.contains(&time) {
             return Err(Failure::Check(format!(
-                "root's touched file has time {time:?}, expected the current time"
+                "root's touched file has time {time:?}, expected one in {child_ran:?}"
             )));
         }
     }

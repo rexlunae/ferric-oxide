@@ -1492,7 +1492,8 @@ and one user 1000 owns with mode `6755`, then runs itself as user 1000:
   may not write (`EACCES`); root then finds that file's times unchanged;
 - `owner-times-allowed`: it may set both times of root's writable file to the
   current time, and its own file's access time while `UTIME_OMIT` keeps the
-  modification time; root then finds exactly those times;
+  modification time; root then finds exactly those times, the current ones
+  within the realtime clock readings it took before and after the child;
 - `owner-truncate`: `ftruncate` through a descriptor opened read-only is
   refused (`EBADF` or `EINVAL`), even on its own file, and allowed through one
   opened for writing; root then finds the sizes it expects.
