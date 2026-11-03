@@ -156,7 +156,9 @@ image user space does no tracing work either: the kernel hands out no
 Nothing is traced until events are turned on: with `FERRIC_TRACE=` in the same
 boot environment, or at run time through the scheme. `kernel.trace_boot` and the
 initfs options need `kernel.trace`, which builds tracing into the normal kernel
-too.
+too. So the [test harness](ferric-harness.md#modes)'s trace mode sets
+`FERRIC_TRACE=sched` itself when it is given no `FERRIC_TRACE`, the events CI's
+traced smoke image turns on with `kernel.trace_boot = "sched"`.
 
 ### Setting the boot environment
 
