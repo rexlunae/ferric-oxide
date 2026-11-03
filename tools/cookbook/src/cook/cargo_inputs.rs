@@ -22,13 +22,18 @@
 //!   count whatever features the recipe enables. `[dev-dependencies]` do not
 //!   change the built package and are skipped.
 //! - `<name>.workspace = true`, resolved through `[workspace.dependencies]` of
-//!   the package's workspace root: the manifest named by `package.workspace`,
-//!   or the nearest ancestor (including the package itself) whose manifest has
-//!   a `[workspace]` table.
-//! - `path` entries in the workspace root's `[patch.<source>]` tables.
+//!   the package's workspace root: the package itself if its manifest has a
+//!   `[workspace]` table, the manifest named by `package.workspace`, or the
+//!   nearest ancestor whose `[workspace]` does not `exclude` the package. A
+//!   package without one (such as `userspace/base/bootstrap`, excluded from
+//!   both `userspace/base` and the repository root) is its own root.
+//! - `path` entries in the `[patch.<source>]` tables of the workspace roots
+//!   the path source's packages are built in.
 //!
-//! Each workspace root contributes its `Cargo.toml` and, when present, its
-//! `Cargo.lock`.
+//! Every workspace root met, including a standalone package, contributes its
+//! `Cargo.toml`. The roots the path source's packages are built in also
+//! contribute their `Cargo.lock`, when present: Cargo resolves dependencies of
+//! a path dependency with the building workspace's lockfile, not its own.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
@@ -67,15 +72,6 @@ pub enum CargoInputsError {
         /// The underlying error.
         #[source]
         source: toml::de::Error,
-    },
-    /// A package inherits a dependency from a workspace, but has no
-    /// workspace root.
-    #[error("{} inherits {name:?} from a workspace, but has no workspace root", .manifest.display())]
-    NoWorkspace {
-        /// The package manifest.
-        manifest: PathBuf,
-        /// The inherited dependency.
-        name: String,
     },
     /// A package inherits a dependency its workspace root does not declare.
     #[error("{} inherits {name:?}, which {} does not declare", .manifest.display(), .workspace.display())]
@@ -129,7 +125,6 @@ impl CargoInputs {
 /// Returns [`CargoInputsError::Walk`] if `source_dir` cannot be searched,
 /// [`CargoInputsError::Read`] if a manifest or dependency directory
 /// cannot be read, [`CargoInputsError::Parse`] if a manifest is not TOML, and
-/// [`CargoInputsError::NoWorkspace`] or
 /// [`CargoInputsError::MissingWorkspaceDependency`] if an inherited dependency
 /// cannot be resolved. Cargo itself would reject such a package.
 pub fn cargo_inputs(source_dir: &Path) -> Result<CargoInputs, CargoInputsError> {
@@ -144,7 +139,9 @@ fn cargo_inputs_below(source_dir: &Path, ceiling: &Path) -> Result<CargoInputs, 
     let mut walk = Walk {
         ceiling,
         queue: VecDeque::new(),
+        seeds: BTreeSet::new(),
         workspaces: BTreeMap::new(),
+        built_roots: BTreeSet::new(),
     };
     let entries = WalkDir::new(source_dir)
         .sort_by_file_name()
@@ -154,7 +151,9 @@ fn cargo_inputs_below(source_dir: &Path, ceiling: &Path) -> Result<CargoInputs, 
         let entry = entry?;
         if entry.file_name() == MANIFEST && entry.file_type().is_file() {
             let package = entry.path().parent().unwrap_or(source_dir);
-            walk.queue.push_back(canonical(package)?);
+            let package = canonical(package)?;
+            walk.seeds.insert(package.clone());
+            walk.queue.push_back(package);
         }
     }
     while let Some(dir) = walk.queue.pop_front() {
@@ -169,8 +168,13 @@ fn cargo_inputs_below(source_dir: &Path, ceiling: &Path) -> Result<CargoInputs, 
 struct Walk<'a> {
     ceiling: &'a Path,
     queue: VecDeque<PathBuf>,
+    /// The packages in the path source, which Cargo builds within their own
+    /// workspace; the others are only dependencies of them.
+    seeds: BTreeSet<PathBuf>,
     /// Parsed workspace roots by directory, so each is read once.
     workspaces: BTreeMap<PathBuf, Table>,
+    /// Workspace roots of seeds, whose lockfile and `[patch]` were recorded.
+    built_roots: BTreeSet<PathBuf>,
 }
 
 impl Walk<'_> {
@@ -181,9 +185,10 @@ impl Walk<'_> {
     ) -> Result<(), CargoInputsError> {
         let manifest_path = dir.join(MANIFEST);
         let manifest = read_manifest(&manifest_path)?;
-        let workspace_root = workspace_root(dir, &manifest, self.ceiling)?;
-        if let Some(root) = &workspace_root {
-            self.load_workspace(root, inputs)?;
+        let root = workspace_root(dir, &manifest, self.ceiling)?;
+        self.load_workspace(&root, inputs)?;
+        if self.seeds.contains(dir) {
+            self.record_build_root(&root, inputs)?;
         }
         for (name, spec) in dependencies(&manifest) {
             let Some(spec) = spec.as_table() else {
@@ -191,23 +196,17 @@ impl Walk<'_> {
             };
             if let Some(path) = path_key(spec) {
                 self.queue.push_back(canonical(&dir.join(path))?);
-            } else if spec.get("workspace").and_then(Value::as_bool) == Some(true) {
-                let Some(root) = &workspace_root else {
-                    return Err(CargoInputsError::NoWorkspace {
-                        manifest: manifest_path,
-                        name: name.clone(),
-                    });
-                };
-                if let Some(path) = self.workspace_dependency_path(root, &manifest_path, name)? {
-                    self.queue.push_back(canonical(&root.join(path))?);
-                }
+            } else if spec.get("workspace").and_then(Value::as_bool) == Some(true)
+                && let Some(path) = self.workspace_dependency_path(&root, &manifest_path, name)?
+            {
+                self.queue.push_back(canonical(&root.join(path))?);
             }
         }
         Ok(())
     }
 
-    /// Records a workspace root's files and queues its `[patch]` paths the
-    /// first time the root is seen.
+    /// Reads a workspace root's manifest, which a member's inherited
+    /// dependencies and settings come from, and records it as an input.
     fn load_workspace(
         &mut self,
         root: &Path,
@@ -219,23 +218,41 @@ impl Walk<'_> {
         let manifest_path = root.join(MANIFEST);
         let manifest = read_manifest(&manifest_path)?;
         inputs.files.insert(manifest_path);
+        self.workspaces.insert(root.to_path_buf(), manifest);
+        Ok(())
+    }
+
+    /// Records the lockfile and queues the `[patch]` paths of the loaded
+    /// workspace root `root` that a seed is built in. A dependency's own
+    /// workspace does not resolve versions or patches for the build.
+    fn record_build_root(
+        &mut self,
+        root: &Path,
+        inputs: &mut CargoInputs,
+    ) -> Result<(), CargoInputsError> {
+        if !self.built_roots.insert(root.to_path_buf()) {
+            return Ok(());
+        }
         let lockfile = root.join(LOCKFILE);
         if lockfile.is_file() {
             inputs.files.insert(lockfile);
         }
-        let patches = manifest
-            .get("patch")
+        let patches: Vec<PathBuf> = self
+            .workspaces
+            .get(root)
+            .and_then(|manifest| manifest.get("patch"))
             .and_then(Value::as_table)
             .into_iter()
             .flat_map(Table::values)
             .filter_map(Value::as_table)
             .flat_map(Table::values)
             .filter_map(Value::as_table)
-            .filter_map(path_key);
+            .filter_map(path_key)
+            .map(|path| root.join(path))
+            .collect();
         for path in patches {
-            self.queue.push_back(canonical(&root.join(path))?);
+            self.queue.push_back(canonical(&path)?);
         }
-        self.workspaces.insert(root.to_path_buf(), manifest);
         Ok(())
     }
 
@@ -284,21 +301,24 @@ fn path_key(spec: &Table) -> Option<&str> {
 }
 
 /// The workspace root directory of the canonical package directory `dir`,
-/// following Cargo's discovery rules.
+/// which owns the lockfile Cargo uses for it, following Cargo's discovery
+/// rules: the package itself if its manifest has `[workspace]`, the directory
+/// `package.workspace` names, else the nearest ancestor whose `[workspace]`
+/// does not `exclude` it. A package with none of these is its own root.
 fn workspace_root(
     dir: &Path,
     manifest: &Table,
     ceiling: &Path,
-) -> Result<Option<PathBuf>, CargoInputsError> {
+) -> Result<PathBuf, CargoInputsError> {
     if manifest.contains_key("workspace") {
-        return Ok(Some(dir.to_path_buf()));
+        return Ok(dir.to_path_buf());
     }
     if let Some(root) = manifest
         .get("package")
         .and_then(|package| package.get("workspace"))
         .and_then(Value::as_str)
     {
-        return canonical(&dir.join(root)).map(Some);
+        return canonical(&dir.join(root));
     }
     for ancestor in dir
         .ancestors()
@@ -306,11 +326,29 @@ fn workspace_root(
         .take_while(|ancestor| ancestor.starts_with(ceiling))
     {
         let candidate = ancestor.join(MANIFEST);
-        if candidate.is_file() && read_manifest(&candidate)?.contains_key("workspace") {
-            return Ok(Some(ancestor.to_path_buf()));
+        if !candidate.is_file() {
+            continue;
+        }
+        let candidate = read_manifest(&candidate)?;
+        if let Some(workspace) = candidate.get("workspace")
+            && !excludes(workspace, ancestor, dir)
+        {
+            return Ok(ancestor.to_path_buf());
         }
     }
-    Ok(None)
+    Ok(dir.to_path_buf())
+}
+
+/// Whether the `[workspace]` table of the root `root` lists `dir` (or a
+/// directory containing it) in `exclude`.
+fn excludes(workspace: &Value, root: &Path, dir: &Path) -> bool {
+    workspace
+        .get("exclude")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|excluded| dir.starts_with(root.join(excluded)))
 }
 
 /// Every dependency that affects the built package: normal and build
@@ -443,7 +481,10 @@ mod tests {
         );
         write(root, "base/target/CACHEDIR.TAG", "");
         package(root, "iommu", "");
+        write(root, "iommu/Cargo.lock", "");
         package(root, "abi", "");
+        write(root, "base/Cargo.lock", "");
+        write(root, "base/bootstrap/Cargo.lock", "");
 
         let found = inputs(root, "base").unwrap();
         let expected: BTreeSet<_> = ["base/drivers/pci", "base/bootstrap", "iommu", "abi"]
@@ -452,10 +493,20 @@ mod tests {
             .chain([canon(root, "base")])
             .collect();
         assert_eq!(found.packages, expected);
-        assert_eq!(
-            found.files,
-            BTreeSet::from([canon(root, "base/Cargo.toml")])
-        );
+        // bootstrap is excluded from base's workspace, so it is built with its
+        // own lockfile; iommu's lockfile is not used when it is a dependency.
+        let expected: BTreeSet<_> = [
+            "base/Cargo.toml",
+            "base/Cargo.lock",
+            "base/bootstrap/Cargo.toml",
+            "base/bootstrap/Cargo.lock",
+            "iommu/Cargo.toml",
+            "abi/Cargo.toml",
+        ]
+        .iter()
+        .map(|file| canon(root, file))
+        .collect();
+        assert_eq!(found.files, expected);
     }
 
     #[test]
@@ -479,11 +530,16 @@ mod tests {
             found.packages,
             BTreeSet::from([canon(root, "app"), canon(root, "lib")])
         );
-        assert_eq!(found.files, BTreeSet::from([canon(root, "ws/Cargo.toml")]));
+        // lib is in no workspace, so it is its own root; as a dependency its
+        // lockfile would not be used, but its manifest is still read.
+        assert_eq!(
+            found.files,
+            BTreeSet::from([canon(root, "ws/Cargo.toml"), canon(root, "lib/Cargo.toml")])
+        );
 
         let found = inputs(root, "lib").unwrap();
         assert_eq!(found.packages, BTreeSet::from([canon(root, "lib")]));
-        assert!(found.files.is_empty());
+        assert_eq!(found.files, BTreeSet::from([canon(root, "lib/Cargo.toml")]));
     }
 
     /// The in-tree recipes this exists for: fox and the installer build from
@@ -512,6 +568,18 @@ mod tests {
             base.packages.contains(&canon(&repo, "crates/iommu")),
             "{base:?}"
         );
+        // Excluded from the base and repository workspaces, bootstrap is
+        // built with its own lockfile, and base does not use the host one.
+        for lockfile in [
+            "userspace/base/Cargo.lock",
+            "userspace/base/bootstrap/Cargo.lock",
+        ] {
+            assert!(base.files.contains(&canon(&repo, lockfile)), "{base:?}");
+        }
+        assert!(
+            !base.files.contains(&canon(&repo, "Cargo.lock")),
+            "{base:?}"
+        );
         for source in ["crates/kernel", "crates/bootloader", "userspace/redoxfs"] {
             cargo_inputs(&repo.join(source)).unwrap();
         }
@@ -534,7 +602,7 @@ mod tests {
         package(root, "orphan", "[dependencies]\nlib.workspace = true\n");
         assert!(matches!(
             inputs(root, "orphan"),
-            Err(CargoInputsError::NoWorkspace { name, .. }) if name == "lib"
+            Err(CargoInputsError::MissingWorkspaceDependency { name, .. }) if name == "lib"
         ));
 
         write(root, "ws/Cargo.toml", "[workspace]\n");

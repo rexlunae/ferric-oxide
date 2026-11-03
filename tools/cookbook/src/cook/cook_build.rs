@@ -1418,8 +1418,14 @@ mod tests {
         };
         write(
             "Cargo.toml",
-            "[workspace]\n[workspace.dependencies]\nshared = { path = \"crates/shared\" }\n",
+            "[workspace]\nexclude = [\"tools/app/bootstrap\"]\n\
+             [workspace.dependencies]\nshared = { path = \"crates/shared\" }\n",
         );
+        write(
+            "tools/app/bootstrap/Cargo.toml",
+            "[package]\nname = \"bootstrap\"\n",
+        );
+        write("tools/app/bootstrap/Cargo.lock", "");
         write("Cargo.lock", "");
         write(
             "tools/app/Cargo.toml",
@@ -1478,6 +1484,10 @@ mod tests {
         touch(&root.join("Cargo.lock"), new);
         assert!(check(), "the workspace lockfile changed");
         touch(&root.join("Cargo.lock"), old);
+
+        touch(&root.join("tools/app/bootstrap/Cargo.lock"), new);
+        assert!(check(), "an excluded package's own lockfile changed");
+        touch(&root.join("tools/app/bootstrap/Cargo.lock"), old);
 
         assert!(!check());
         std::fs::remove_file(root.join("crates/dep/Cargo.toml")).unwrap();
