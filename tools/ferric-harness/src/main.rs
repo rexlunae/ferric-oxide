@@ -298,7 +298,8 @@ struct UpOptions {
     /// A VGA display (read through QMP), or none as in CI's smoke boots.
     #[arg(long, value_enum, default_value_t = Display::Std)]
     display: Display,
-    /// A boot environment entry KEY=VALUE (repeatable).
+    /// A boot environment entry KEY=VALUE (repeatable). Trace mode sets FERRIC_TRACE=sched
+    /// unless one is given here (FERRIC_TRACE= turns no events on at boot).
     #[arg(long = "boot-env", value_parser = bootenv::parse_assignment)]
     boot_env: Vec<(String, String)>,
     /// How the boot environment reaches the bootloader.
