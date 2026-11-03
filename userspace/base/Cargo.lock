@@ -684,6 +684,7 @@ dependencies = [
  "redox-scheme",
  "redox_syscall 0.9.4",
  "scheme-utils",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

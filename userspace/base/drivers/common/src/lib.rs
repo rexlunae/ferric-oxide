@@ -17,12 +17,14 @@ pub mod dma;
 /// MMIO utilities
 pub mod io;
 mod logger;
+mod report;
 /// The Scatter Gather List (SGL) API for drivers.
 pub mod sgl;
 /// Low latency timeout for driver loops
 pub mod timeout;
 
 pub use logger::{file_level, output_level, setup_logging};
+pub use report::{error_chain, exit_with_error};
 
 static MEMORY_ROOT_FD: OnceLock<libredox::Fd> = OnceLock::new();
 

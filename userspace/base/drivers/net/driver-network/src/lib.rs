@@ -38,6 +38,27 @@ pub trait NetworkAdapter {
     fn write_packet(&mut self, buf: &[u8]) -> Result<usize>;
 }
 
+/// Failures while [`NetworkScheme::new`] sets up a driver's network scheme.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum NetworkSchemeError {
+    /// The scheme socket could not be created.
+    #[error("cannot create the network scheme socket")]
+    Socket(#[source] Error),
+    /// The bypass wake pipe could not be created or made non-blocking.
+    #[error("cannot create the bypass wake pipe")]
+    WakePipe(#[source] io::Error),
+    /// The scheme could not be registered under its name.
+    #[error("cannot register the network scheme {name:?}")]
+    Register {
+        /// The scheme name that was being registered.
+        name: String,
+        /// Why the kernel refused the registration.
+        #[source]
+        source: Error,
+    },
+}
+
 pub struct NetworkScheme<T: NetworkAdapter> {
     scheme: NetworkSchemeImpl<T>,
     handler: ReadinessBased<Rc<Socket>>,
@@ -53,26 +74,48 @@ fn post_fevent(socket: &Socket, id: usize, flags: usize) -> Result<()> {
 }
 
 impl<T: NetworkAdapter> NetworkScheme<T> {
+    /// Create the scheme socket, initialise the adapter with `adapter_fn`, register the
+    /// scheme as `scheme_name` and tell `daemon`'s parent that the driver is ready.
+    ///
+    /// The socket and the bypass wake pipe are made before `adapter_fn` runs, so a failure
+    /// there leaves the device untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkSchemeError`] when the scheme socket, the bypass wake pipe or the
+    /// scheme registration cannot be set up. `daemon` is then dropped without reporting
+    /// readiness, so its parent sees the start fail.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `scheme_name` does not start with `network`: netstack only looks for
+    /// adapters under that prefix, so any other name is a bug in the calling driver.
     pub fn new(
         adapter_fn: impl FnOnce() -> T,
         daemon: daemon::Daemon,
         scheme_name: String,
-    ) -> Self {
+    ) -> std::result::Result<Self, NetworkSchemeError> {
         assert!(scheme_name.starts_with("network"));
-        let socket = Rc::new(Socket::nonblock().expect("failed to create network scheme"));
+        let socket = Rc::new(Socket::nonblock().map_err(NetworkSchemeError::Socket)?);
+        let bypass =
+            bypass::State::new(Rc::clone(&socket)).map_err(NetworkSchemeError::WakePipe)?;
         let adapter = adapter_fn();
         let mut scheme = NetworkSchemeImpl::new(
             scheme_name.clone(),
-            NetworkSchemeData::new(adapter, Rc::clone(&socket)),
+            NetworkSchemeData { adapter, bypass },
             NetworkResource::SchemeRoot(SchemeRoot::<T>(PhantomData)),
         );
-        redox_scheme::scheme::register_sync_scheme(&socket, &scheme_name, &mut scheme)
-            .expect("failed to regitster network scheme");
+        redox_scheme::scheme::register_sync_scheme(&socket, &scheme_name, &mut scheme).map_err(
+            |source| NetworkSchemeError::Register {
+                name: scheme_name,
+                source,
+            },
+        )?;
         daemon.ready();
-        Self {
+        Ok(Self {
             scheme,
             handler: ReadinessBased::new(socket, 16),
-        }
+        })
     }
 
     pub fn event_handle(&self) -> &Fd {
@@ -159,16 +202,6 @@ resource_scheme! {
 struct NetworkSchemeData<T: NetworkAdapter> {
     adapter: T,
     bypass: bypass::State,
-}
-
-impl<T: NetworkAdapter> NetworkSchemeData<T> {
-    pub fn new(adapter: T, socket: Rc<Socket>) -> Self {
-        Self {
-            adapter,
-            bypass: bypass::State::new(socket)
-                .expect("driver-network: failed to create the bypass wake pipe"),
-        }
-    }
 }
 
 struct SchemeRoot<T>(PhantomData<T>);
