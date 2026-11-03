@@ -631,7 +631,10 @@ The codes in the memory, IRQ and IOMMU events have one definition, next to the e
     `reserved` (a reserved bit in a page table entry).
   - `outcome` is a `PageFaultOutcome`: 0 `mapped` (demand paging or copy on
     write; the access is retried), 1 `copy failed` (the kernel faulted copying
-    to or from user memory, and the call fails with `EFAULT`), 2 `unhandled`.
+    to or from user memory, and the call fails with `EFAULT`), 2 `unhandled`,
+    3 `out of memory` (no frame to map a user page: a kernel copy, without the
+    `user` flag, fails with `EFAULT`; a user access fails the thread as
+    `unhandled` does).
 - `irq.deliver` is recorded when the irq scheme (`crates/kernel/src/scheme/irq.rs`)
   counts an interrupt and wakes the `irq:` handles that get it.
   - `cpu` is the CPU it is counted for: the one that took it with
