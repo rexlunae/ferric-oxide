@@ -20,12 +20,20 @@
 //! ([`RingSize::parse`], a power of two from 4 to 1048576 KiB): the kernel would otherwise
 //! boot without host rings.
 //!
+//! Trace mode also turns on [`TRACE_MODE_EVENTS`] from boot with `FERRIC_TRACE`, unless the
+//! user gives `FERRIC_TRACE` themselves (an empty value turns nothing on). The trace-mode
+//! kernel has no build-time `trace.boot` of its own to rely on: that option needs
+//! `kernel.trace` in the image's normal kernel, which trace mode exists to keep free of
+//! tracing. Without it nothing is recorded until a guest program enables events, and the
+//! smoke tests, which expect `sched.switch` on from boot as CI's `trace.boot = "sched"`
+//! gives them, fail.
+//!
 //! The key names, the fw_cfg file name, the size limit and the key rule are those of
 //! [`ferric_abi::boot_env`], the definitions the bootloader and kernel use.
 
 use ferric_abi::boot_env::{
-    self, FERRIC_BOOT_RESOLUTION, FERRIC_KERNEL, FERRIC_TRACE_HOST, Kernel, MAX_PRESET_BYTES,
-    Resolution,
+    self, FERRIC_BOOT_RESOLUTION, FERRIC_KERNEL, FERRIC_TRACE, FERRIC_TRACE_HOST, Kernel,
+    MAX_PRESET_BYTES, Resolution,
 };
 use ferric_trace::host::{RingSize, RingSizeError};
 use thiserror::Error;
@@ -34,6 +42,10 @@ use crate::input;
 use crate::machine::{Display, Mode};
 
 pub use ferric_abi::boot_env::FW_CFG_FILE;
+
+/// The `FERRIC_TRACE` selection trace mode sets when the user gives none: the scheduler
+/// events, as CI's smoke image turns on with `kernel.trace_boot = "sched"`.
+pub const TRACE_MODE_EVENTS: &str = "sched";
 
 /// How the boot environment reaches the bootloader.
 #[derive(
@@ -116,7 +128,8 @@ pub struct BootEnv {
 
 impl BootEnv {
     /// The environment for a run: the mode's keys, `FERRIC_BOOT_RESOLUTION=auto` when the
-    /// run has a display and uses fw_cfg, then the user's entries.
+    /// run has a display and uses fw_cfg, then the user's entries, then, in trace mode
+    /// without a user `FERRIC_TRACE`, `FERRIC_TRACE=`[`TRACE_MODE_EVENTS`].
     ///
     /// # Errors
     ///
@@ -147,6 +160,9 @@ impl BootEnv {
                 });
             }
             env.set(key, value)?;
+        }
+        if mode == Mode::Trace && env.get(FERRIC_TRACE).is_none() {
+            env.set(FERRIC_TRACE, TRACE_MODE_EVENTS)?;
         }
         if let Some(value) = env.get(FERRIC_TRACE_HOST) {
             RingSize::parse(value).map_err(|source| BootEnvError::RingSize {
@@ -304,6 +320,96 @@ mod tests {
                 "FERRIC_TRACE=sched.switch"
             ]
         );
+    }
+
+    /// Without a user `FERRIC_TRACE`, trace mode turns the scheduler events on from boot, as
+    /// CI's `trace.boot` does; normal mode adds nothing.
+    #[test]
+    fn trace_mode_defaults_to_sched_events() {
+        for (display, via, rendered, typed) in [
+            (
+                Display::None,
+                BootEnvVia::FwCfg,
+                "FERRIC_KERNEL=trace\nFERRIC_TRACE_HOST=4096\nFERRIC_TRACE=sched\n",
+                &[
+                    "FERRIC_KERNEL=trace",
+                    "FERRIC_TRACE_HOST=4096",
+                    "FERRIC_TRACE=sched",
+                ][..],
+            ),
+            (
+                Display::Std,
+                BootEnvVia::FwCfg,
+                "FERRIC_KERNEL=trace\nFERRIC_TRACE_HOST=4096\nFERRIC_BOOT_RESOLUTION=auto\nFERRIC_TRACE=sched\n",
+                &[
+                    "FERRIC_KERNEL=trace",
+                    "FERRIC_TRACE_HOST=4096",
+                    "FERRIC_TRACE=sched",
+                ][..],
+            ),
+            (
+                Display::Std,
+                BootEnvVia::Keys,
+                "FERRIC_KERNEL=trace\nFERRIC_TRACE_HOST=4096\nFERRIC_TRACE=sched\n",
+                &[
+                    "FERRIC_KERNEL=trace",
+                    "FERRIC_TRACE_HOST=4096",
+                    "FERRIC_TRACE=sched",
+                ][..],
+            ),
+        ] {
+            let env = BootEnv::for_run(&[], Mode::Trace, 4096, display, via).expect("valid");
+            assert_eq!(env.render(), rendered, "{display:?} {via:?}");
+            assert_eq!(env.typed_lines(), typed, "{display:?} {via:?}");
+            assert_eq!(env.get("FERRIC_TRACE"), Some(TRACE_MODE_EVENTS));
+        }
+        let other = BootEnv::for_run(
+            &[kv("A", "1")],
+            Mode::Trace,
+            4096,
+            Display::None,
+            BootEnvVia::FwCfg,
+        )
+        .expect("valid");
+        assert_eq!(other.get("FERRIC_TRACE"), Some("sched"));
+        let normal = BootEnv::for_run(&[], Mode::Normal, 4096, Display::None, BootEnvVia::FwCfg)
+            .expect("valid");
+        assert_eq!(normal.get("FERRIC_TRACE"), None);
+    }
+
+    /// A user `FERRIC_TRACE` replaces the default and is passed on as given, once; an empty
+    /// one turns no events on at boot.
+    #[test]
+    fn user_trace_selection_replaces_the_default() {
+        for value in ["syscall,sched", "sched.switch", "all", ""] {
+            let env = BootEnv::for_run(
+                &[kv("FERRIC_TRACE", value)],
+                Mode::Trace,
+                4096,
+                Display::None,
+                BootEnvVia::FwCfg,
+            )
+            .expect("valid");
+            assert_eq!(env.get("FERRIC_TRACE"), Some(value));
+            assert_eq!(
+                env.lines()
+                    .filter(|l| l.starts_with("FERRIC_TRACE="))
+                    .count(),
+                1,
+                "{value:?}"
+            );
+        }
+        // A user selection in normal mode is passed on too; the normal kernel ignores it
+        // unless it was built with kernel.trace.
+        let normal = BootEnv::for_run(
+            &[kv("FERRIC_TRACE", "irq")],
+            Mode::Normal,
+            4096,
+            Display::None,
+            BootEnvVia::FwCfg,
+        )
+        .expect("valid");
+        assert_eq!(normal.render(), "FERRIC_TRACE=irq\n");
     }
 
     /// The ring sizes are the kernel's: a power of two from 4 KiB to 1 GiB, whether they

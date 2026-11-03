@@ -684,10 +684,11 @@ impl AddrSpaceWrapper {
                     PageSpan::new(base, new_page_count),
                     &unmapped,
                 );
-                let notify_files = unmapped?;
-                // Ferric Oxide: see `munmap`.
+                // Ferric Oxide: see `munmap`. Released before the error is returned, since
+                // the grants removed before an error are gone too.
                 #[cfg(iommu_enabled)]
                 crate::scheme::iommu::release(dst_lock, PageSpan::new(base, new_page_count));
+                let notify_files = unmapped?;
                 if let Some(notify_files_out) = notify_files_out.as_mut() {
                     notify_files_out.extend(notify_files);
                 }
@@ -722,21 +723,25 @@ impl AddrSpaceWrapper {
         if PageSpan::new(dst_base, new_page_count).intersects(src_span) {
             return Err(Error::new(EBUSY));
         }
+        // Ferric Oxide: the source's DMA mappings are released only for memory that has left
+        // it (`ferric_iommu::dma::moved`), so a move that fails part way keeps the device
+        // reach of what stayed. The destination span is never released here.
         #[cfg(iommu_enabled)]
-        crate::scheme::iommu::release(src_owner, src_span);
+        let released = |left: PageSpan| crate::scheme::iommu::release(src_owner, left);
+        #[cfg(not(iommu_enabled))]
+        let released = |_: PageSpan| ();
 
         if new_page_count < src_span.count {
             let unpin = false;
-            let notify_files = AddrSpace::munmap_inner(
-                src_grants,
-                src_mapper,
-                src_flusher,
-                PageSpan::new(
-                    src_span.base.next_by(new_page_count),
-                    src_span.count - new_page_count,
-                ),
-                unpin,
-            )?;
+            let shrunk = PageSpan::new(
+                src_span.base.next_by(new_page_count),
+                src_span.count - new_page_count,
+            );
+            let unmapped =
+                AddrSpace::munmap_inner(src_grants, src_mapper, src_flusher, shrunk, unpin);
+            // As in `munmap`: whatever was removed before an error has left as well.
+            released(shrunk);
+            let notify_files = unmapped?;
             if let Some(notify_files_out) = notify_files_out.as_mut() {
                 notify_files_out.extend(notify_files);
             }
@@ -752,78 +757,82 @@ impl AddrSpaceWrapper {
 
         let mut prev_grant_end = src_span.base;
 
-        //while let Some(grant_base) = next(src_opt.as_mut().map(|s| &mut **s), dst, remaining_src_span) {
-        for grant_base in to_remap {
-            if prev_grant_end < grant_base {
-                let hole_page_count = grant_base.offset_from(prev_grant_end);
-                let hole_span = PageSpan::new(
-                    dst_base.next_by(prev_grant_end.offset_from(src_span.base)),
-                    hole_page_count,
-                );
-                dst.grants.insert(Grant::zeroed(
-                    hole_span,
-                    page_flags(new_flags),
-                    &mut dst.table.utable,
-                    &mut dst_flusher,
-                    false,
-                )?);
-            }
+        ferric_iommu::dma::moved::move_pieces(
+            to_remap,
+            |grant_base| {
+                if prev_grant_end < grant_base {
+                    let hole_page_count = grant_base.offset_from(prev_grant_end);
+                    let hole_span = PageSpan::new(
+                        dst_base.next_by(prev_grant_end.offset_from(src_span.base)),
+                        hole_page_count,
+                    );
+                    dst.grants.insert(Grant::zeroed(
+                        hole_span,
+                        page_flags(new_flags),
+                        &mut dst.table.utable,
+                        &mut dst_flusher,
+                        false,
+                    )?);
+                }
 
-            let src_grants = src_opt
-                .as_mut()
-                .map_or(&mut dst.grants, |(g, _, _)| &mut *g);
-            let grant = src_grants
-                .remove_containing(grant_base)
-                .expect("grant cannot disappear");
-            let grant_span = PageSpan::new(grant.base, grant.info.page_count());
-            let (before, middle, after) = grant
-                .extract(remaining_src_span.intersection(grant_span))
-                .expect("called intersect(), must succeed");
-
-            if let Some(before) = before {
-                src_grants.insert(before);
-            }
-            if let Some(after) = after {
-                src_grants.insert(after);
-            }
-
-            let dst_grant_base = dst_base.next_by(middle.base.offset_from(src_span.base));
-            let middle_span = middle.span();
-
-            let mut middle = middle;
-            let moved = match src_opt.as_mut() {
-                Some((_, other_mapper, other_flusher)) => middle.transfer(
-                    dst_grant_base,
-                    page_flags(new_flags),
-                    other_mapper,
-                    Some(&mut dst.table.utable),
-                    other_flusher,
-                    &mut dst_flusher,
-                ),
-                None => middle.transfer(
-                    dst_grant_base,
-                    page_flags(new_flags),
-                    &mut dst.table.utable,
-                    None,
-                    &mut dst_flusher,
-                    &mut NopFlusher,
-                ),
-            };
-            if let Err(err) = moved {
-                // `transfer` left the pages mapped in the source: give the grant back to it.
-                src_opt
+                let src_grants = src_opt
                     .as_mut()
-                    .map_or(&mut dst.grants, |(g, _, _)| &mut *g)
-                    .insert(middle);
-                return Err(err);
-            }
-            dst.grants.insert(middle);
+                    .map_or(&mut dst.grants, |(g, _, _)| &mut *g);
+                let grant = src_grants
+                    .remove_containing(grant_base)
+                    .expect("grant cannot disappear");
+                let grant_span = PageSpan::new(grant.base, grant.info.page_count());
+                let (before, middle, after) = grant
+                    .extract(remaining_src_span.intersection(grant_span))
+                    .expect("called intersect(), must succeed");
 
-            prev_grant_end = middle_span.base.next_by(middle_span.count);
-            let pages_advanced = prev_grant_end.offset_from(remaining_src_span.base);
-            remaining_src_span =
-                PageSpan::new(prev_grant_end, remaining_src_span.count - pages_advanced);
-        }
+                if let Some(before) = before {
+                    src_grants.insert(before);
+                }
+                if let Some(after) = after {
+                    src_grants.insert(after);
+                }
+
+                let dst_grant_base = dst_base.next_by(middle.base.offset_from(src_span.base));
+                let middle_span = middle.span();
+
+                let mut middle = middle;
+                let moved = match src_opt.as_mut() {
+                    Some((_, other_mapper, other_flusher)) => middle.transfer(
+                        dst_grant_base,
+                        page_flags(new_flags),
+                        other_mapper,
+                        Some(&mut dst.table.utable),
+                        other_flusher,
+                        &mut dst_flusher,
+                    ),
+                    None => middle.transfer(
+                        dst_grant_base,
+                        page_flags(new_flags),
+                        &mut dst.table.utable,
+                        None,
+                        &mut dst_flusher,
+                        &mut NopFlusher,
+                    ),
+                };
+                if let Err(err) = moved {
+                    // `transfer` left the pages mapped in the source: give the grant back to it.
+                    src_opt
+                        .as_mut()
+                        .map_or(&mut dst.grants, |(g, _, _)| &mut *g)
+                        .insert(middle);
+                    return Err(err);
+                }
+                dst.grants.insert(middle);
+
+                prev_grant_end = middle_span.base.next_by(middle_span.count);
+                let pages_advanced = prev_grant_end.offset_from(remaining_src_span.base);
+                remaining_src_span =
+                    PageSpan::new(prev_grant_end, remaining_src_span.count - pages_advanced);
+                Ok(middle_span)
+            },
+            released,
+        )?;
 
         if prev_grant_end < src_span.base.next_by(new_page_count) {
             let last_hole_span = PageSpan::new(
@@ -3113,11 +3122,16 @@ impl Drop for Table {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AccessMode {
-    Read,
-    Write,
-    InstrFetch,
+pub use super::fault_access::AccessMode;
+use super::fault_access::{self, PtePermissions};
+
+/// The user permissions of a present entry, as [`fault_access`] classifies them.
+fn pte_permissions(flags: PageFlags<RmmA>) -> PtePermissions {
+    PtePermissions {
+        user: flags.has_user(),
+        write: flags.has_write(),
+        execute: flags.has_execute(),
+    }
 }
 
 #[derive(Debug)]
@@ -3191,21 +3205,40 @@ fn cow(
     })
 }
 
+/// Maps a new zeroed frame at `page` in `mapper`, whose address space `flusher` shoots down.
+///
+/// # Errors
+///
+/// [`PfError::Oom`] if no frame is free, or if a page table on `page`'s path cannot be
+/// allocated. In the second case the new frame and any page tables linked for it are queued
+/// on `flusher` to be freed, so a failed fault leaks nothing.
 fn map_zeroed(
     mapper: &mut PageMapper,
     page: Page,
     page_flags: PageFlags<RmmA>,
-    _writable: bool,
+    flusher: &mut impl GenericFlusher,
 ) -> Result<Frame, PfError> {
     let must_be_zero = true;
     let new_frame = init_frame(RefCount::One, must_be_zero)?;
 
-    unsafe {
+    // SAFETY: the caller holds the lock of `mapper`'s address space and `page` is not mapped,
+    // so no TLB holds an entry for it and the new mapping needs no flush; the tables this
+    // unlinks on failure go to `flusher`, which frees them only after its shootdown.
+    // TODO: huge pages?
+    let mapped = unsafe {
         mapper
-            // TODO: huge pages?
-            .map_phys(page.start_address(), new_frame.base(), page_flags, 0)
-            .ok_or(PfError::Oom)?
-            .ignore();
+            .map_phys_or_unlink(
+                page.start_address(),
+                new_frame.base(),
+                page_flags,
+                &mut queue_undone_borrow(flusher),
+            )
+            .map(|flush| flush.ignore())
+    };
+    if mapped.is_none() {
+        // Nothing maps the frame; dropping its only reference frees it.
+        flusher.queue(Some(page), new_frame, None, TlbShootdownActions::FREE);
+        return Err(PfError::Oom);
     }
 
     Ok(new_frame)
@@ -3287,14 +3320,30 @@ fn correct_inner<'l>(
         _ => (),
     }
 
+    let present = addr_space
+        .table
+        .utable
+        .translate(faulting_page.start_address());
+
+    // The entry may already permit the access: another CPU corrected it while this one waited for
+    // the lock, or this CPU still caches an older translation. Asking the provider again would
+    // take a second page reference (`External`) or send another fmap request (`FmapBorrowed`),
+    // so only the local translation is invalidated.
+    if fault_access::is_spurious(access, present.map(|(_, flags)| pte_permissions(flags)))
+        && let Some((phys, _)) = present
+    {
+        drop(flusher);
+        return Ok((
+            Frame::containing(phys),
+            PageFlush::new(faulting_page.start_address()),
+            addr_space,
+        ));
+    }
+
     // By now, the memory at the faulting page is actually valid, but simply not yet mapped, either
     // at all, or with the required flags.
 
-    let faulting_frame_opt = addr_space
-        .table
-        .utable
-        .translate(faulting_page.start_address())
-        .map(|(phys, _page_flags)| Frame::containing(phys));
+    let faulting_frame_opt = present.map(|(phys, _page_flags)| Frame::containing(phys));
     let faulting_pageinfo_opt = faulting_frame_opt.map(|frame| (frame, get_page_info(frame)));
 
     // TODO: Aligned readahead? AMD Zen3+ CPUs can smash 4 4k pages that are 16k-aligned, into a
@@ -3305,6 +3354,9 @@ fn correct_inner<'l>(
     // TODO: Readahead backwards, i.e. MAP_GROWSDOWN.
 
     let mut allow_writable = true;
+    // Whether `frame` carries a reference taken for this mapping alone, which a failed mapping
+    // must give back. Other frames are already mapped here or not reference counted.
+    let mut frame_ref_taken = false;
 
     let frame = match grant_info.provider {
         Provider::Allocated { .. } | Provider::AllocatedShared { .. }
@@ -3332,7 +3384,7 @@ fn correct_inner<'l>(
                     &mut addr_space.table.utable,
                     faulting_page,
                     grant_flags,
-                    true,
+                    &mut flusher,
                 )?,
             }
         }
@@ -3341,8 +3393,8 @@ fn correct_inner<'l>(
             match faulting_pageinfo_opt {
                 Some((_, None)) => unreachable!("allocated page needs frame to be valid"),
 
-                // TODO: Can this match arm even be reached? In other words, can the TLB cache
-                // remember that pages are not present?
+                // The entry is present but lacks a permission the grant allows; spurious faults
+                // returned above.
                 Some((frame, Some(page_info))) => {
                     // Keep in mind that allow_writable must always be true if this code is reached
                     // for AllocatedShared, since shared pages cannot be mapped lazily (without
@@ -3358,12 +3410,19 @@ fn correct_inner<'l>(
                         &mut addr_space.table.utable,
                         faulting_page,
                         grant_flags,
-                        false,
+                        &mut flusher,
                     )?
                 }
             }
         }
         Provider::PhysBorrowed { base } => base.next_by(pages_from_grant_start),
+        // The page already holds the reference taken when it was mapped, and only lacks a
+        // permission `Grant::remap` left to be added here (a write after `mprotect`). Borrowing
+        // the source page again would leak a second reference.
+        Provider::External { .. } if let Some((frame, page_info)) = faulting_pageinfo_opt => {
+            allow_writable = page_info.is_none_or(PageInfo::allows_writable);
+            frame
+        }
         Provider::External {
             address_space: ref foreign_address_space,
             src_base,
@@ -3430,7 +3489,10 @@ fn correct_inner<'l>(
                         get_page_info(src_frame).expect("all allocated frames need a PageInfo");
 
                     match info.add_ref(RefKind::Shared) {
-                        Ok(()) => src_frame,
+                        Ok(()) => {
+                            frame_ref_taken = true;
+                            src_frame
+                        }
                         Err(AddRefError::CowToShared) => {
                             let CowResult {
                                 new_frame,
@@ -3456,6 +3518,8 @@ fn correct_inner<'l>(
                                     });
                             }
 
+                            // `cow` gave the new frame a reference for this mapping.
+                            frame_ref_taken = true;
                             new_frame
                         }
                         Err(AddRefError::SharedToCow) => unreachable!(),
@@ -3471,11 +3535,12 @@ fn correct_inner<'l>(
 
                     // TODO: Should this be called?
                     crate::warn!("Mapped zero page since grant didn't exist");
+                    let mut foreign_flusher = Flusher::with_cpu_set(&foreign_address_space.used_by);
                     map_zeroed(
                         &mut guard.table.utable,
                         src_page,
                         grant_flags,
-                        access == AccessMode::Write,
+                        &mut foreign_flusher,
                     )?
                 }
             }
@@ -3550,14 +3615,21 @@ fn correct_inner<'l>(
     };
 
     let new_flags = grant_flags.write(grant_flags.has_write() && allow_writable);
-    let Some(flush) = (unsafe {
-        addr_space
-            .table
-            .utable
-            // TODO: huge pages?
-            .map_phys(faulting_page.start_address(), frame.base(), new_flags, 0)
-    }) else {
-        // TODO
+    // SAFETY: `addr_space` is locked for writing and the grant covers `faulting_page`; the
+    // tables this unlinks on failure go to `flusher`, which frees them only after its shootdown.
+    // TODO: huge pages?
+    let mapped = unsafe {
+        addr_space.table.utable.map_phys_or_unlink(
+            faulting_page.start_address(),
+            frame.base(),
+            new_flags,
+            &mut queue_undone_borrow(&mut flusher),
+        )
+    };
+    let Some(flush) = mapped else {
+        if frame_ref_taken {
+            flusher.queue(Some(faulting_page), frame, None, TlbShootdownActions::FREE);
+        }
         return Err(PfError::Oom);
     };
 
@@ -3855,13 +3927,12 @@ impl GenericFlusher for Flusher<'_> {
         // `MAP_FIXED` has unmapped and flushed the old one, or a page `translate` just found
         // unmapped), and queues remaps and frees with their own actions.
         //
-        // This matters because a spurious fault is not harmless everywhere: `correct_inner`
-        // remaps an already-present page idempotently for `Allocated`, `AllocatedShared` and
-        // `PhysBorrowed` grants, but takes an extra page reference for `External` and asks the
-        // scheme again for `FmapBorrowed`. AArch64 does not cache invalid descriptors either, but
-        // without a DSB and a context synchronization on the other PEs a walk can still see the
-        // old invalid entry; RISC-V lets harts cache invalid PTEs until an SFENCE.VMA. Both keep
-        // the shootdown.
+        // Elsewhere a remote CPU can still fault on the new page: AArch64 does not cache invalid
+        // descriptors either, but without a DSB and a context synchronization on the other PEs a
+        // walk can still see the old invalid entry; RISC-V lets harts cache invalid PTEs until an
+        // SFENCE.VMA. `correct_inner` resolves such a spurious fault with a local invalidation
+        // for every grant provider (see `context::fault_access`), so these architectures could
+        // drop the shootdown as well; they keep it until that is validated on hardware.
         let new_mapping = actions.contains(TlbShootdownActions::NEW_MAPPING);
         let actions = actions & !TlbShootdownActions::NEW_MAPPING;
         if cfg!(any(target_arch = "x86", target_arch = "x86_64"))

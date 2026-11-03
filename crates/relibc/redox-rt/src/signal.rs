@@ -28,6 +28,10 @@ use redox_protocols::protocol::{
     SIGWINCH, ThreadCall,
 };
 
+mod defaults;
+
+use defaults::{DefaultAction, default_action};
+
 #[cfg(target_arch = "x86_64")]
 static CPUID_EAX1_ECX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -188,7 +192,11 @@ unsafe fn inner(stack: &mut SigStack) {
         // _ if sigaction.flags.contains(SigactionFlags::IGNORED) => {
         //     panic!("ctl2 {:#x?} signal {}", os.control, stack.sig_num)
         // }
-        SigactionKind::Default if usize::from(sig) == SIGCONT => SignalHandler { handler: None },
+        // A default-ignored signal can still arrive here if it was pending before the
+        // disposition was set, or raced a sigaction; it must not terminate the process.
+        SigactionKind::Default if default_action(usize::from(sig)) == DefaultAction::Ignore => {
+            SignalHandler { handler: None }
+        }
         SigactionKind::Default => {
             let _ = sys_call(
                 current_proc_fd().as_raw_fd(),
@@ -560,53 +568,42 @@ fn sigaction_inner(
     let sig_group = (signal - 1) / 32;
     let sig_idx = (signal - 1) % 32;
 
-    let (mask, flags, handler) = match (usize::from(signal), new.kind) {
-        (_, SigactionKind::Ignore) | (SIGURG | SIGWINCH, SigactionKind::Default) => {
-            // TODO: relibc and procmgr have access to all threads, redox_rt doesn't currently.
-            // Do this for all threads!
-            ctl.word[usize::from(sig_group)].fetch_and(!(1 << sig_idx), Ordering::Relaxed);
-            PROC_CONTROL_STRUCT
-                .pending
-                .fetch_and(!sig_bit(signal.into()), Ordering::Relaxed);
+    // Setting a disposition that ignores the signal discards it if it is pending.
+    let discard_pending = || {
+        // TODO: relibc and procmgr have access to all threads, redox_rt doesn't currently.
+        // Do this for all threads!
+        ctl.word[usize::from(sig_group)].fetch_and(!(1 << sig_idx), Ordering::Relaxed);
+        PROC_CONTROL_STRUCT
+            .pending
+            .fetch_and(!sig_bit(signal.into()), Ordering::Relaxed);
+    };
+    let default_ip = default_handler as *const () as usize;
 
-            // TODO: handle tmp_disable_signals
-            (
-                MASK_DONTCARE,
-                SigactionFlags::IGNORED,
-                if matches!(new.kind, SigactionKind::Default) {
-                    default_handler as *const () as usize
-                } else {
-                    0
-                },
-            )
+    // TODO: handle tmp_disable_signals
+    let (mask, flags, handler) = match new.kind {
+        SigactionKind::Ignore => {
+            discard_pending();
+            (MASK_DONTCARE, SigactionFlags::IGNORED, 0)
         }
-        // TODO: Handle pending signals before these flags are set.
-        (SIGTSTP | SIGTTOU | SIGTTIN, SigactionKind::Default) => (
-            MASK_DONTCARE,
-            SigactionFlags::SIG_SPECIFIC,
-            default_handler as *const () as usize,
-        ),
-        (SIGCHLD, SigactionKind::Default) => {
+        SigactionKind::Default if usize::from(signal) == SIGCHLD => {
+            discard_pending();
             let nocldstop_bit = new.flags & SigactionFlags::SIG_SPECIFIC;
-
-            // Default action is to ignore. Hence all pending SIGCHLD signals should be discarded.
-
-            // TODO: relibc and procmgr have access to all threads, redox_rt doesn't currently.
-            // Do this for all threads!
-            ctl.word[usize::from(sig_group)].fetch_and(!(1 << sig_idx), Ordering::Relaxed);
-            PROC_CONTROL_STRUCT
-                .pending
-                .fetch_and(!sig_bit(signal.into()), Ordering::Relaxed);
-
             (
                 MASK_DONTCARE,
                 SigactionFlags::IGNORED | nocldstop_bit,
-                default_handler as *const () as usize,
+                default_ip,
             )
         }
-
-        (_, SigactionKind::Default) => (new.mask, new.flags, default_handler as *const () as usize),
-        (_, SigactionKind::Handled { .. }) => (new.mask, new.flags, explicit_handler),
+        SigactionKind::Default => match default_action(signal.into()) {
+            DefaultAction::Ignore => {
+                discard_pending();
+                (MASK_DONTCARE, SigactionFlags::IGNORED, default_ip)
+            }
+            // TODO: Handle pending signals before these flags are set.
+            DefaultAction::Stop => (MASK_DONTCARE, SigactionFlags::SIG_SPECIFIC, default_ip),
+            DefaultAction::Terminate => (new.mask, new.flags, default_ip),
+        },
+        SigactionKind::Handled { .. } => (new.mask, new.flags, explicit_handler),
     };
     let new_first = (handler as u64) | (u64::from(flags.bits() & STORED_FLAGS) << 32);
     action.first.store(new_first, Ordering::Relaxed);
@@ -781,12 +778,10 @@ pub fn setup_sighandler(tcb: &RtTcb, first_thread: bool) {
         let _guard = SIGACTIONS_LOCK.lock();
         for (sig_idx, action) in PROC_CONTROL_STRUCT.actions.iter().enumerate() {
             let sig = sig_idx + 1;
-            let bits = if matches!(sig, SIGTSTP | SIGTTIN | SIGTTOU) {
-                SigactionFlags::SIG_SPECIFIC
-            } else if matches!(sig, SIGCHLD | SIGURG | SIGWINCH) {
-                SigactionFlags::IGNORED
-            } else {
-                SigactionFlags::empty()
+            let bits = match default_action(sig) {
+                DefaultAction::Stop => SigactionFlags::SIG_SPECIFIC,
+                DefaultAction::Ignore => SigactionFlags::IGNORED,
+                DefaultAction::Terminate => SigactionFlags::empty(),
             };
             action.first.store(
                 (u64::from(bits.bits()) << 32) | default_handler as *const () as u64,

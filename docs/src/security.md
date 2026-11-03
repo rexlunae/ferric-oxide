@@ -78,10 +78,13 @@ caller's effective IDs with `fchown` and the other direct scheme calls, but a
 `StdFsCall` (how relibc sends `fchmod`, `ftruncate` and `futimens`) carries only
 its pid, and its caller IDs read as root. A scheme that checks permissions on
 one asks procmgr for the pid's credentials through its
-`proc-creds-capability` handle (`scheme_utils::proc_credentials`), as `ramfs`
-does for `fchmod` and `futimens`. The
+`proc-creds-capability` handle, as `ramfs` and `ext4d` do for `fchmod` and
+`futimens`. The lookup is the shared `ferric-proc-creds` crate
+(`crates/proc-creds`), which `scheme_utils::proc_credentials` wraps for the base
+workspace. The
 [`ferric-owner-test`](./ferric-testing.md#ramfs-ownership-changes) regression
-checks `ramfs` as root and as user 1000.
+checks `ramfs` as root and as user 1000; `ferric-ext4-test`'s `ext4-owner` step
+checks `ext4d` as user 2000 when its writer (`fs.ext4_write`) is built in.
 
 The kernel passes each `read` and `write` the descriptor's open flags but does
 not check its access mode itself, so `ramfs` refuses a `read` through a

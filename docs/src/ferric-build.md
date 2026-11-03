@@ -37,7 +37,10 @@ recipes that need it.
 Recipes that need the build-time Python (`host:python312`, for example libxcb
 through xcb-proto) also need OpenSSL 3 headers on the build machine; on macOS,
 Homebrew's `openssl@3` is found even though it is keg-only. OpenSSL 4 does not
-work with CPython 3.12.
+work with CPython 3.12. Building `ca-certificates` from source runs the
+`openssl` command (1.1 or later, for `rehash`); macOS's own is LibreSSL, so put
+`$(brew --prefix openssl@3)/bin` ahead of it on `PATH`, or name the command in
+`OPENSSL`.
 `./native_bootstrap.sh` installs all of these with Homebrew, `apt-get` or `dnf`
 and then runs setup; its package lists are the reference. Setup itself never
 invokes Homebrew, a system package manager or sudo, so existing installations
@@ -54,9 +57,13 @@ The cookbook always builds recipes whose
 source is in this repository (a `path` source, or `same_as` one: the kernel,
 UEFI bootloader, relibc, base services/drivers, RedoxFS, fox and the test
 recipes) from source, even with `build.repo_binary = true` and in every image
-configuration, because a package server cannot have this checkout's build. The selected package manager is added by the
-catalog. Existing configurations are preserved, so their image choice and
-package policy still apply. The first build downloads Rust components, target
+configuration, because a package server cannot have this checkout's build.
+Such a recipe is rebuilt when its source changes, and also when a crate its
+Cargo packages use by `path` (for example `crates/fox-core` for fox and the
+installer) or the workspace's `Cargo.toml` or `Cargo.lock` changes; see
+`make rebuild` in the [build-system reference](./build-system-reference.md).
+The selected package manager is added by the catalog. Existing configurations
+are preserved, so their image choice and package policy still apply. The first build downloads Rust components, target
 runtime data, Cargo dependencies and application packages.
 
 The native toolchain (`build.toolchain = "llvm"`, `mk/llvm.mk`) uses host Clang
@@ -665,7 +672,9 @@ fetches from upstream Redox at build time.
 - Nothing in this repository syncs from upstream Redox. Recipes that fetch
   their own component trees from upstream Redox, and the prebuilt toolchain
   and package downloads from `static.redox-os.org`, are outside this list and
-  remain to be migrated.
+  remain to be migrated. `ca-certificates` has been: its recipe builds
+  Mozilla's CA bundle from a pinned certifi release on PyPI, and the smoke
+  configuration builds it from source.
 
 Device-tree parsing for the kernel and ARM64/RISC-V bootloader goes through
 `crates/devicetree/` (`ferric-devicetree`), which uses crates.io's

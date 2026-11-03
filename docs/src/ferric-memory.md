@@ -184,12 +184,43 @@ covers, decided from the object's first 4 KiB (`crates/relibc/src/ld_so/`,
 as debug information and the full symbol table, usually follow and stay
 unmapped; an object whose headers are not in its first 4 KiB is mapped whole.
 This matters because a scheme fills a file mapping when it is made: RedoxFS
-reads the whole range and keeps the buffer after the last unmap
-([#373](https://github.com/rexlunae/ferric-oxide/issues/373)). With
+reads the whole mapped range into a buffer of its own and holds it while the
+file is in use (see [RedoxFS mapping buffers](#redoxfs-mapping-buffers)). With
 `build.debug = true`, `cosmic-comp` is a 392 MiB file of which loading uses
 26 MiB, and mapping it and the libcosmic example whole ran a 2 GiB guest out of
 memory, which panics the kernel
 ([#372](https://github.com/rexlunae/ferric-oxide/issues/372)).
+
+## RedoxFS mapping buffers
+
+RedoxFS backs each mapped file with one buffer of its own
+(`userspace/redoxfs/src/fmap.rs`). It reads a range into the buffer when the
+range is first mapped, counts the mappings of every page range, and writes a
+range back, clamped to the file's size, when the kernel unmaps a shared writable
+mapping of it. Stores through a private mapping are never written back. Writes
+through the file update the buffered copy, so later mappings see them.
+
+The buffer and its accounting are freed once the file is no longer in use: no
+open description of it remains and every mapping is gone, whichever happens
+last. A file that stays open keeps its buffer between mappings, so mapping it
+again does not read it again. Before this, RedoxFS kept every buffer until it
+exited, and a removal spanning several ranges left all but the first counted, a
+`range-tree` 0.1.0 bug fixed in 0.1.1
+([#373](https://github.com/rexlunae/ferric-oxide/issues/373)). Host tests in
+`userspace/redoxfs/src/fmap/tests.rs` cover release, write-back, multiple
+mappers and partial unmaps.
+
+Freeing a buffer never leaves a process mapping freed memory. Each mapping holds
+its own reference to every frame: shared mappings take `RefKind::Shared` in
+`Grant::borrow_fmap`, and private ones take copy-on-write references through
+`Grant::copy_mappings`. A frame is deallocated only when its last reference goes,
+after the TLB shootdown (`handle_free_action`). The kernel also sends `funmap`
+only after it has unmapped the process's pages and shot them down, whether the
+mapping goes through `munmap` (of all or part of it), process exit or `MAP_FIXED`
+replacement. `mremap` used to drop the `funmap`s for mappings that shrinking or
+a fixed destination removed, so their buffers and descriptions were never released
+and shared write-back was lost. It now sends them (`syscall::fs::mremap`). The
+`fmap` module documentation gives the code references.
 
 ## Mapping ranges stay inside user space
 
@@ -243,6 +274,44 @@ reply-slot state machine is included in host/Miri helper tests for both
 reply/park orders, stale replies, duplicates and failed dispatch cleanup;
 those tests do not emulate a user-copy fault or a hardware context switch.
 
+### Out of memory in a page fault
+
+A fault on a user address, raised by user mode or by a kernel copy to or from
+user memory (usercopy), first tries to map the page: demand paging, copy on
+write, or a borrowed mapping. That can fail for lack of memory, when no
+physical frame is free or a page reference count would overflow
+(`PfError::Oom`). The handler used to panic there (`todo!("oom")`,
+[#372](https://github.com/rexlunae/ferric-oxide/issues/372)); it now fails
+the faulting operation instead, through the same paths as a refused access:
+
+- A usercopy fault makes the copy fail, and the system call returns `EFAULT`.
+  `futex`, which corrects the page tables itself, still returns `ENOMEM`.
+- A user-mode fault is unhandled. On every architecture the fault path
+  delivers it as an exception to the faulting thread, which `redox-rt` turns
+  into a signal (`SIGSEGV` for a page fault on x86_64, whose default action
+  ends the process); a thread with no
+  exception handler, or one that faults again while handling the exception
+  (for example because its handler also needs a page), is ended by the kernel
+  with the exception as its status.
+
+A failed fault does not leak memory. When a page table on the path cannot be
+allocated, the handler unlinks the empty tables it added and frees them, along
+with a zeroed frame it allocated for the page, after the TLB shootdown. It
+also gives back a reference it took on a frame borrowed from another address
+space. Without that, each retried fault would hold more memory. One mapping
+can remain: a fault on a page borrowed from another address space may first
+map the missing source page there. That page belongs to the source's grant,
+which frees it, and a retried fault reuses it.
+
+The kernel logs a warning naming the address, and with `kernel.trace_mm` the
+`mm.page_fault` record has the `out of memory` outcome. No process is exempt:
+a service the system needs, such as `redoxfs`, fails as it would on any other
+fatal fault, and the kernel keeps running. Choosing a victim to free memory
+(an OOM killer), a distinct signal such as `SIGBUS`, or protecting essential
+services are not implemented. The decision is in
+`crates/kernel/src/memory/fault_outcome.rs` and is host-tested by
+`crates/kernel/tests`; no boot test exhausts memory yet.
+
 ## KPTI and PCID
 
 `kernel.cpu.kpti` defaults to `auto`. It enables kernel page-table isolation
@@ -280,6 +349,18 @@ the scheme daemon, and each anonymous `mmap`. AArch64 and RISC-V still flush
 after new mappings (`TlbShootdownActions::NEW_MAPPING` in
 `context/memory.rs`). Remaps, permission changes and unmaps flush on every
 architecture.
+
+A user page fault on a page whose present entry already permits the access is
+spurious: another CPU resolved it while this one waited for the address-space
+lock, or this CPU still uses an older translation (an AArch64 walk that has not
+yet seen the new descriptor, or a RISC-V hart caching the invalid entry). The
+fault handler then only invalidates the page on the faulting CPU, for every
+grant provider. It does not take another frame reference for a borrowed
+(`External`) grant or send another fmap request to the scheme for an
+`FmapBorrowed` grant. A write to an `External` page whose entry is still read-only
+after `mprotect` added `PROT_WRITE` reuses the frame already mapped, which
+holds its reference. The decision is in `context/fault_access.rs`. AArch64 and
+RISC-V still keep the new-mapping shootdown described above.
 
 A shootdown round invalidates only the pages it changed when there are at most
 32 of them (`TLB_SINGLE_PAGE_FLUSH_CEILING` in `memory/tlb.rs`); a larger round
@@ -452,7 +533,11 @@ returns to the source address space
 destination first also means a source unmap cannot empty, and so queue for
 freeing, a page table that a later destination page needs: such tables are
 never reused before the shootdown. Grants already moved by an earlier step of
-the same `r#move` stay moved; only the failing grant is rolled back.
+the same `r#move` stay moved; only the failing grant is rolled back. The
+source's IOMMU translations are released per grant after it moves, so the
+grant that is rolled back keeps its device access
+([Registered buffers and IOMMUs](ferric-io.md),
+[#306](https://github.com/rexlunae/ferric-oxide/issues/306)).
 
 ### Branch predictor barriers between processes
 

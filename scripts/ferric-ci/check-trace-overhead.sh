@@ -19,7 +19,41 @@
 #   difference of two medians over all boots does not.
 #   "on" vs "pairoff" pairs the two states of one boot, whose rounds alternate.
 # The median of the paired differences keeps one unlucky pair (a stall that
-# hit one boot of it) from deciding. The budgets:
+# hit one boot of it) from deciding. Each median comes with distribution-free
+# one-sided bounds from the sign test (sign-test.awk): with n pairs, the k-th
+# smallest difference is a lower bound on the true median paired difference,
+# and the k-th largest an upper one. The sign test assumes only that the pairs
+# are independent, not that the differences are normal or symmetric: a stall
+# only ever slows one boot down. Only the lower bound decides; the upper one
+# shows the spread.
+#
+# The job judges two comparisons (syscall "off" vs "out" and io "on" vs
+# "pairoff") on the same boots, and either can fail it, so the 5% chance of a
+# false failure is split between them (Bonferroni, which holds however the two
+# depend on each other): each bound alone holds with 97.5% confidence
+# (together they form a 95% interval), and the job's false-failure chance
+# stays at or under 5%.
+#
+# When the job may judge the same growing set of pairs several times (image.yml
+# adds pairs while a comparison is inconclusive), TRACE_OVERHEAD_LOOKS lists the
+# pair counts at which it may run, ascending, such as "10 15 20 25 30". Every
+# look then uses the same stricter per-look level, chosen so that each
+# comparison's chance of a false failure over all the looks is at most 2.5%;
+# without it the looks would add up to about 4.7%. Without TRACE_OVERHEAD_LOOKS
+# the current pair count is the only look. A pair count not in the list is a usage error.
+#
+# A judged comparison has three outcomes:
+#   pass          the median is within the budget;
+#   fail          the lower bound is over the budget: a regression that the
+#                 runner's noise cannot explain;
+#   inconclusive  the median is over the budget but the lower bound is not:
+#                 the runner's noise (the spread of the pairs, shown as the
+#                 bounds) is larger than the budget, so the job cannot tell.
+#                 It is reported as a warning; image.yml boots more pairs and
+#                 runs the check again, and accepts the result with the warning
+#                 when the pairs run out.
+# Fewer than 6 pairs give no 97.5% bound, so over the budget they are always
+# inconclusive. The budgets:
 #   compiled in, all off ("off") at most OFF_BUDGET_PCT (default 1) percent
 #   slower than compiled out ("out"), on the "syscall" workload, a null system
 #   call;
@@ -27,7 +61,14 @@
 #   percent slower than all off in the rounds paired with it ("pairoff"), on
 #   the "io" workload, requests to RedoxFS.
 # Every result is reported, with each state's median over the boots for
-# reference. "off" and "out" run on two kernels built separately, so their
+# reference.
+#
+# Exit status: 0 when every judged comparison passes, 1 when one fails or
+# results are missing, 2 for a usage error (including a pair count that is not
+# in TRACE_OVERHEAD_LOOKS), and 3 when none fails but one is
+# inconclusive.
+#
+# "off" and "out" run on two kernels built separately, so their
 # comparison also measures where the linker put the hot code. On the null
 # system call that is small and repeatable (+0.53% and +0.54% in two runs),
 # and the tracepoints are the largest share of the work, so a disabled
@@ -66,6 +107,21 @@ if [ "${#out_logs[@]}" -ne "${#in_logs[@]}" ]; then
     exit 2
 fi
 pairs="${#out_logs[@]}"
+here="$(cd "$(dirname "$0")" && pwd)"
+
+looks="${TRACE_OVERHEAD_LOOKS:-$pairs}"
+# The comparisons judged, among which the job's 5% false-failure chance is split.
+judged=2
+alpha="$(awk -v j="$judged" 'BEGIN { print 0.05 / j }')"
+conf="$(awk -v a="$alpha" 'BEGIN { print (1 - a) * 100 }')%"
+looks_note=""
+if [ "$looks" != "$pairs" ]; then
+    looks_note=" over looks at $looks pairs"
+fi
+if ! grep -qxF "$pairs" <(tr -s ' ' '\n' <<< "$looks"); then
+    echo "check-trace-overhead: $pairs pairs is not one of TRACE_OVERHEAD_LOOKS ($looks)" >&2
+    exit 2
+fi
 
 # Sets `result` to each log's first min_ns for WORKLOAD in STATE, one per line
 # in LOGS order, and `missing` to the logs that have no such line. `result` is
@@ -108,12 +164,51 @@ paired_pct() {
         | awk '{ printf "%.9f\n", ($1 / $2 - 1) * 100 }'
 }
 
-# True when the median paired difference PCT is more than BUDGET percent. It
-# compares the unrounded value: the percentages printed in the summary are
-# rounded to three places, and an increase just over a budget must not pass
-# once rounded.
+# The sign test's lower and upper bounds on the median of the numbers on
+# standard input, one per line, for the planned looks, unrounded and separated
+# by a space; "none none" when there are too few numbers for a bound at the
+# level (see sign-test.awk).
+bounds() {
+    local b
+    b="$(awk -v alpha="$alpha" -v looks="$looks" -f "$here/sign-test.awk")"
+    echo "${b#* }"
+}
+
+# True when PCT is more than BUDGET percent. It compares unrounded values: the
+# percentages printed in the summary are rounded to three places, and an
+# increase just over a budget must not pass once rounded. A PCT of "none" (no
+# bound) is never over.
 over_budget() {
-    awk -v pct="$1" -v b="$2" 'BEGIN { exit !(pct > b) }'
+    [ "$1" != none ] && awk -v pct="$1" -v b="$2" 'BEGIN { exit !(pct > b) }'
+}
+
+# A bound for the summary: "+1.234%", or "none" when there is no bound.
+shown() {
+    if [ "$1" = none ]; then echo none; else awk -v v="$1" 'BEGIN { printf "%+.3f%%\n", v }'; fi
+}
+
+# Judges the paired differences DIFFS (one per line) against BUDGET percent and
+# sets `verdict` to pass, fail or inconclusive, `median_pct` to their unrounded
+# median and `low` and `high` to its bounds (see `bounds`).
+judge() {
+    local diffs="$1" budget="$2" b
+    median_pct="$(median %.9f <<< "$diffs")"
+    b="$(bounds <<< "$diffs")"
+    low="${b% *}"
+    high="${b#* }"
+    if ! over_budget "$median_pct" "$budget"; then
+        verdict=pass
+    elif over_budget "$low" "$budget"; then
+        verdict=fail
+    else
+        verdict=inconclusive
+    fi
+}
+
+# The sentence that reports an inconclusive comparison NAME (median MEDIAN,
+# bounds LOW and HIGH, BUDGET percent).
+inconclusive_text() {
+    echo "$1: the median of $pairs pairs, $(shown "$2"), is over the $5% budget, but runner noise exceeds the budget: its one-sided $conf lower bound is $(shown "$3") (upper $(shown "$4")$looks_note), so it is not over the budget and the overhead cannot be judged on this runner (not failed; more pairs narrow the bounds)"
 }
 
 # The paired differences, rounded for the summary: "+0.123 -0.456 ...".
@@ -122,6 +217,7 @@ listed() {
 }
 
 status=0
+inconclusive=0
 for workload in io syscall; do
     complete=1
     for state in out off pairoff on; do
@@ -144,17 +240,35 @@ for workload in io syscall; do
     on_pairs="$(paired_pct "$on" "$pairoff")"
     off_pct="$(median <<< "$off_pairs")"
     on_pct="$(median <<< "$on_pairs")"
-    summary="$workload ($pairs pairs of boots' fastest rounds): off ${off_pct}% vs out (median of pairs; each pair $(listed "$off_pairs")), on ${on_pct}% vs pairoff (median of pairs; each boot $(listed "$on_pairs")); medians over boots: out $(median <<< "$out") ns, off $(median <<< "$off") ns, pairoff $(median <<< "$pairoff") ns, on $(median <<< "$on") ns"
+    off_bounds="$(bounds <<< "$off_pairs")"
+    on_bounds="$(bounds <<< "$on_pairs")"
+    summary="$workload ($pairs pairs of boots' fastest rounds): off ${off_pct}% vs out (median of pairs, one-sided $conf bounds $(shown "${off_bounds% *}") and $(shown "${off_bounds#* }")$looks_note; each pair $(listed "$off_pairs")), on ${on_pct}% vs pairoff (median of pairs, one-sided $conf bounds $(shown "${on_bounds% *}") and $(shown "${on_bounds#* }")$looks_note; each boot $(listed "$on_pairs")); medians over boots: out $(median <<< "$out") ns, off $(median <<< "$off") ns, pairoff $(median <<< "$pairoff") ns, on $(median <<< "$on") ns"
     echo "$summary"
     echo "::notice title=trace overhead ($workload)::$summary"
-    if [ "$workload" = syscall ] && over_budget "$(median %.9f <<< "$off_pairs")" "$off_budget"; then
-        echo "::error title=trace overhead::a system call with tracing compiled in but off is ${off_pct}% slower than compiled out, as the median of paired boots (budget ${off_budget}%): $summary"
-        status=1
-    fi
-    if [ "$workload" = io ] && over_budget "$(median %.9f <<< "$on_pairs")" "$on_budget"; then
-        echo "::error title=trace overhead::io with every event on is ${on_pct}% slower than all off in paired rounds (budget ${on_budget}%): $summary"
-        status=1
-    fi
+    case "$workload" in
+        syscall)
+            judge "$off_pairs" "$off_budget"
+            name="syscall off vs out"
+            failure="a system call with tracing compiled in but off is ${off_pct}% slower than compiled out, as the median of paired boots (budget ${off_budget}%)"
+            budget="$off_budget"
+            ;;
+        io)
+            judge "$on_pairs" "$on_budget"
+            name="io on vs pairoff"
+            failure="io with every event on is ${on_pct}% slower than all off in paired rounds (budget ${on_budget}%)"
+            budget="$on_budget"
+            ;;
+    esac
+    case "$verdict" in
+        fail)
+            echo "::error title=trace overhead::$failure, and its one-sided $conf lower bound, $(shown "$low")$looks_note, is over the budget too: $summary"
+            status=1
+            ;;
+        inconclusive)
+            echo "::warning title=trace overhead inconclusive::$(inconclusive_text "$name" "$median_pct" "$low" "$high" "$budget"): $summary"
+            inconclusive=1
+            ;;
+    esac
 done
 # A full ring drops records, which is cheaper than writing them, so losses make "on" look
 # better than it is.
@@ -176,5 +290,8 @@ if [ "${#no_count[@]}" -gt 0 ]; then
     status=1
 elif [ "$lost" -gt 0 ]; then
     echo "::warning title=trace overhead::$lost records were dropped during the on rounds; the on figure is low"
+fi
+if [ "$status" -eq 0 ] && [ "$inconclusive" -eq 1 ]; then
+    status=3
 fi
 exit "$status"
