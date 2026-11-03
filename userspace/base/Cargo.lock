@@ -922,6 +922,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferric-proc-creds"
+version = "0.1.0"
+dependencies = [
+ "libredox",
+ "plain",
+ "redox_syscall 0.9.4",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "ferric-regbuf"
 version = "0.1.0"
 
@@ -2370,8 +2380,8 @@ dependencies = [
 name = "scheme-utils"
 version = "0.0.0"
 dependencies = [
+ "ferric-proc-creds",
  "libredox",
- "plain",
  "redox-scheme",
  "redox_syscall 0.9.4",
 ]

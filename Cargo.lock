@@ -1500,6 +1500,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferric-proc-creds"
+version = "0.1.0"
+dependencies = [
+ "libredox",
+ "plain",
+ "redox_syscall 0.9.4",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "ferric-procinfo"
 version = "0.1.0"
 dependencies = [
