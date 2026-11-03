@@ -147,12 +147,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arg_parser"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9bcdf9185a4ea0d8afa7c8ad387cc3a93c3ecfa918125e000a57a42e71268d7"
-
-[[package]]
 name = "argon2"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4229,7 +4223,7 @@ name = "redox_installer"
 version = "0.2.42"
 dependencies = [
  "anyhow",
- "arg_parser",
+ "clap",
  "fatfs",
  "fox-core",
  "fox-store",

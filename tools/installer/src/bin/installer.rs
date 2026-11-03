@@ -1,49 +1,118 @@
-extern crate arg_parser;
-extern crate redox_installer;
-extern crate serde;
-extern crate toml;
+//! `redox_installer`: build a Redox file system image from a configuration,
+//! or parse a configuration and report on it.
 
-use std::path::Path;
-use std::{env, fs, process};
+use std::path::{Path, PathBuf};
+use std::{fs, process};
 
-use arg_parser::ArgParser;
+use clap::{Args, CommandFactory, Parser};
 
 use redox_installer::{Config, PackageConfig};
 
-const HELP_STR: &str = r#"
-redox_installer - Redox Installer.
-                  Refer to link below for filesystem config reference:
-                  https://doc.redox-os.org/book/configuration-settings.html
+/// The command line. `--opt value`, `--opt=value` and, where a short form
+/// exists, `-o value` and `-ovalue` are all accepted. A repeated option takes
+/// its last value.
+#[derive(Debug, Parser)]
+#[command(
+    name = "redox_installer",
+    version,
+    about = "Redox Installer: build a Redox file system image, or parse a filesystem configuration",
+    after_help = "Refer to the link below for the filesystem config reference:\n  \
+                  https://doc.redox-os.org/book/configuration-settings.html",
+    override_usage = "redox_installer <diskpath.img> [--config=file.toml] [--write-bootloader=file.img] [--live] [--no-mount] [--skip-partition]\n       \
+                      redox_installer --config=file.toml [--cookbook=dir] [--list-packages|--filesystem-size|--output-config path]",
+    args_override_self = true
+)]
+struct Cli {
+    /// Disk file to write
+    #[arg(value_name = "diskpath.img")]
+    disk: Option<PathBuf>,
 
-Using redox_installer as an installer:
-  redox_installer <diskpath.img> [--config=file.toml] [--write-bootloader=file.img] [--live] [--no-mount] [--skip-partition]
-    <diskpath.img>        Disk file to write
-    --config              Path to filesystem config TOML
-    --write-bootloader    Path to write UEFI bootloader to in addition to the embedded ESP
-    --skip-partition      Skip writing GPT partition tables
-                          Use this only if you plan to use other partition tool
-    --live                Use bootloader configured for live disk
-    --no-mount            Use RedoxFS AR instead of FUSE to write files
-    --cookbook            Build system checkout whose repo/<target>/ holds the packages to install
-    --size                Exact image size in MiB; fail before writing if the packages do not fit
-                          (without it the image grows past filesystem_size to fit them)
-    --config-name         Name of the filesystem configuration used for os-release VARIANT
-    --build-tools-list    File naming the recipes the image builds with, one per line;
-                          installed alongside the packages when general.build_tools is set
-    --fox                 Host fox binary to finish the image root with: sync a
-                          package set and write the image SBOM
-    --fox-packages        With --fox: fox package set to sync into the image
-                          (fox sync --target <image target>, fox.lock beside it)
-    --fox-locked          With --fox-packages: fail unless fox.lock pins every package
-    --fox-level           With --fox-packages: x86-64 level (v3 or v4) to install for
-    --fox-sbom            With --fox: write the image's CycloneDX SBOM to this path
+    /// Path to filesystem config TOML
+    #[arg(short = 'c', long, value_name = "file.toml")]
+    config: Option<PathBuf>,
 
-Using redox_installer as a configuration parser:
-  redox_installer --config=file.toml [--cookbook=dir] [--list-packages|--filesystem-size|--output-config path]
-    --list-packages      List packages will be installed
-    --filesystem-size    Output the image size in MiB: with --cookbook, grown to fit the packages
-    --output-config      Path to write the parsed config as another TOML
-"#;
+    /// Path to write UEFI bootloader to in addition to the embedded ESP
+    #[arg(long, value_name = "file.img")]
+    write_bootloader: Option<String>,
+
+    /// Skip writing GPT partition tables. Use this only if you plan to use
+    /// other partition tool
+    #[arg(long)]
+    skip_partition: bool,
+
+    /// Use bootloader configured for live disk
+    #[arg(long)]
+    live: bool,
+
+    /// Use RedoxFS AR instead of FUSE to write files
+    #[arg(long)]
+    no_mount: bool,
+
+    /// Build system checkout whose repo/<target>/ holds the packages to install
+    #[arg(short = 'b', long, value_name = "dir")]
+    cookbook: Option<String>,
+
+    /// Exact image size in MiB; fail before writing if the packages do not
+    /// fit (without it the image grows past filesystem_size to fit them)
+    #[arg(long, value_name = "MiB")]
+    size: Option<u32>,
+
+    /// Name of the filesystem configuration used for os-release VARIANT
+    #[arg(long, value_name = "name")]
+    config_name: Option<String>,
+
+    /// File naming the recipes the image builds with, one per line; installed
+    /// alongside the packages when general.build_tools is set
+    #[arg(long, value_name = "file")]
+    build_tools_list: Option<String>,
+
+    #[command(flatten)]
+    fox: FoxArgs,
+
+    /// List packages will be installed
+    #[arg(short = 'l', long, help_heading = "Configuration parser")]
+    list_packages: bool,
+
+    /// Output the image size in MiB: with --cookbook, grown to fit the packages
+    #[arg(long, help_heading = "Configuration parser")]
+    filesystem_size: bool,
+
+    /// Path to write the parsed config as another TOML
+    #[arg(
+        short = 'o',
+        long,
+        value_name = "path",
+        help_heading = "Configuration parser"
+    )]
+    output_config: Option<PathBuf>,
+}
+
+/// The `--fox*` options, which finish the image root with a host `fox`.
+#[derive(Debug, Args)]
+#[command(next_help_heading = "Finishing the image with fox")]
+struct FoxArgs {
+    /// Host fox binary to finish the image root with: sync a package set and
+    /// write the image SBOM
+    #[arg(long, value_name = "path")]
+    fox: Option<PathBuf>,
+
+    /// With --fox: fox package set to sync into the image (fox sync --target
+    /// <image target>, fox.lock beside it)
+    #[arg(long, value_name = "file.toml", requires = "fox")]
+    fox_packages: Option<PathBuf>,
+
+    /// With --fox-packages: fail unless fox.lock pins every package
+    #[arg(long, requires = "fox_packages")]
+    fox_locked: bool,
+
+    /// With --fox-packages: x86-64 level (v3 or v4) to install for
+    #[arg(long, value_name = "level", requires = "fox_packages")]
+    fox_level: Option<String>,
+
+    /// With --fox: write the image's CycloneDX SBOM to this path
+    #[arg(long, value_name = "path", requires = "fox")]
+    fox_sbom: Option<PathBuf>,
+}
 
 fn os_release_quote(value: &str) -> String {
     let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
@@ -109,88 +178,47 @@ fn sbom_name(config_name: Option<&str>) -> String {
     }
 }
 
-/// `parser` with the `--fox` options added.
-fn with_fox_options(parser: ArgParser) -> ArgParser {
-    parser
-        .add_opt("", "fox")
-        .add_opt("", "fox-packages")
-        .add_opt("", "fox-sbom")
-        .add_opt("", "fox-level")
-        .add_flag(&["fox-locked"])
+/// The image's fox finishing step, if `--fox` was given. Clap has already
+/// rejected options that need an option that is missing.
+fn fox_image(fox: FoxArgs, config_name: Option<&str>) -> Option<redox_installer::FoxImage> {
+    Some(redox_installer::FoxImage {
+        fox: fox.fox?,
+        packages: fox.fox_packages,
+        locked: fox.fox_locked,
+        target: redox_installer::get_target(),
+        level: fox.fox_level,
+        name: sbom_name(config_name),
+        sbom: fox.fox_sbom,
+    })
 }
 
-/// The `--fox` options, or an error message if they are inconsistent.
-fn fox_image(parser: &ArgParser) -> Result<Option<redox_installer::FoxImage>, &'static str> {
-    let Some(fox) = parser.get_opt("fox") else {
-        if parser.get_opt("fox-packages").is_some() || parser.get_opt("fox-sbom").is_some() {
-            return Err("--fox-packages and --fox-sbom need --fox");
-        }
-        return Ok(None);
-    };
-    let packages = parser.get_opt("fox-packages");
-    if parser.found("fox-locked") && packages.is_none() {
-        return Err("--fox-locked needs --fox-packages");
-    }
-    let level = parser.get_opt("fox-level");
-    if level.is_some() && packages.is_none() {
-        return Err("--fox-level needs --fox-packages");
-    }
-    Ok(Some(redox_installer::FoxImage {
-        fox: fox.into(),
-        packages: packages.map(Into::into),
-        locked: parser.found("fox-locked"),
-        target: redox_installer::get_target(),
-        level,
-        name: sbom_name(parser.get_opt("config-name").as_deref()),
-        sbom: parser.get_opt("fox-sbom").map(Into::into),
-    }))
+fn fail(message: impl std::fmt::Display) -> ! {
+    eprintln!("installer: {message}");
+    process::exit(1);
 }
 
 fn main() {
-    let mut parser = with_fox_options(ArgParser::new(4))
-        .add_opt("b", "cookbook")
-        .add_opt("", "config-name")
-        .add_opt("c", "config")
-        .add_opt("o", "output-config")
-        .add_opt("", "write-bootloader")
-        .add_opt("", "size")
-        .add_flag(&["skip-partition"])
-        .add_flag(&["filesystem-size"])
-        .add_flag(&["l", "list-packages"])
-        .add_flag(&["live"])
-        .add_flag(&["no-mount"])
-        .add_opt("", "build-tools-list");
-    parser.parse(env::args());
+    let cli = Cli::parse();
 
-    let skip_partition = parser.found("skip-partition");
-
-    let mut config = if let Some(path) = parser.get_opt("config") {
-        match Config::from_file(Path::new(&path)) {
-            Ok(config) => config,
-            Err(err) => {
-                eprintln!("installer: {err}");
-                process::exit(1);
-            }
-        }
-    } else {
-        redox_installer::Config::default()
+    let mut config = match &cli.config {
+        Some(path) => Config::from_file(path).unwrap_or_else(|err| fail(err)),
+        None => Config::default(),
     };
 
-    if let Some(size) = parser.get_opt("size") {
-        let Ok(mib) = size.parse::<u32>() else {
-            eprintln!("installer: --size wants a size in MiB, not {size:?}");
-            process::exit(1);
-        };
+    if let Some(mib) = cli.size {
         config.general.filesystem_size = Some(mib);
         config.general.filesystem_size_exact = Some(true);
     }
 
     // Get toml of merged config
-    let merged_toml = toml::to_string_pretty(&config).unwrap();
+    let merged_toml = toml::to_string_pretty(&config)
+        .unwrap_or_else(|err| fail(format_args!("failed to serialize the configuration: {err}")));
 
     // Just output merged config and exit
-    if let Some(path) = parser.get_opt("output-config") {
-        fs::write(path, merged_toml).unwrap();
+    if let Some(path) = &cli.output_config {
+        if let Err(err) = fs::write(path, merged_toml) {
+            fail(format_args!("failed to write '{}': {err}", path.display()));
+        }
         return;
     }
 
@@ -201,22 +229,19 @@ fn main() {
         ..Default::default()
     });
 
-    if skip_partition {
+    if cli.skip_partition {
         config.general.skip_partitions = Some(true);
     }
 
-    if parser.found("filesystem-size") {
-        match parser.get_opt("cookbook") {
-            Some(cookbook) => match redox_installer::image_size(&config, Some(&cookbook)) {
+    if cli.filesystem_size {
+        match &cli.cookbook {
+            Some(cookbook) => match redox_installer::image_size(&config, Some(cookbook)) {
                 Ok(size) => println!("{}", size.mib),
-                Err(err) => {
-                    eprintln!("installer: {err:#}");
-                    process::exit(1);
-                }
+                Err(err) => fail(format_args!("{err:#}")),
             },
             None => println!("{}", config.general.filesystem_size.unwrap_or(0)),
         }
-    } else if parser.found("list-packages") {
+    } else if cli.list_packages {
         // List the packages that should be fetched or built by the cookbook
         for (packagename, package) in &config.packages {
             match package {
@@ -229,69 +254,51 @@ fn main() {
             }
         }
     } else {
-        let cookbook = if let Some(path) = parser.get_opt("cookbook") {
-            if !Path::new(&path).is_dir() {
-                eprintln!("installer: {}: cookbook not found", path);
-                process::exit(1);
-            }
+        install(cli, config);
+    }
+}
 
-            Some(path)
-        } else {
-            None
-        };
+/// Apply the installation options to `config` and write the image.
+fn install(cli: Cli, mut config: Config) {
+    if let Some(path) = &cli.cookbook
+        && !Path::new(path).is_dir()
+    {
+        fail(format_args!("{path}: cookbook not found"));
+    }
 
-        let build_id = cookbook.as_deref().and_then(local_repo_build_id);
-        append_os_release_metadata(
-            &mut config,
-            parser.get_opt("config-name").as_deref(),
-            build_id,
-        );
+    let build_id = cli.cookbook.as_deref().and_then(local_repo_build_id);
+    append_os_release_metadata(&mut config, cli.config_name.as_deref(), build_id);
 
-        if cookbook.is_some() {
-            config.general.cookbook = cookbook;
+    if cli.cookbook.is_some() {
+        config.general.cookbook = cli.cookbook;
+    }
+    if cli.live {
+        config.general.live_disk = Some(true);
+    }
+    if cli.no_mount {
+        config.general.no_mount = Some(true);
+    }
+    // The build tools are listed by `repo build-tools-list`, in a file the
+    // build generates; passing the path keeps the installer from having to
+    // read recipes. Only a configuration that asks for build tools
+    // (`general.build_tools`) installs any.
+    if let Some(list) = cli.build_tools_list {
+        match config.general.build_tools.as_mut() {
+            Some(build_tools) => build_tools.list = Some(list),
+            None => fail("--build-tools-list needs general.build_tools in the configuration"),
         }
-        if parser.found("live") {
-            config.general.live_disk = Some(true);
-        }
-        if parser.found("no-mount") {
-            config.general.no_mount = Some(true);
-        }
-        // The build tools are listed by `repo build-tools-list`, in a file the
-        // build generates; passing the path keeps the installer from having to
-        // read recipes. Only a configuration that asks for build tools
-        // (`general.build_tools`) installs any.
-        if let Some(list) = parser.get_opt("build-tools-list") {
-            match config.general.build_tools.as_mut() {
-                Some(build_tools) => build_tools.list = Some(list),
-                None => {
-                    eprintln!(
-                        "installer: --build-tools-list needs general.build_tools in the configuration"
-                    );
-                    process::exit(1);
-                }
-            }
-        }
-        let write_bootloader = parser.get_opt("write-bootloader");
-        if write_bootloader.is_some() {
-            config.general.write_bootloader = write_bootloader;
-        }
-        match fox_image(&parser) {
-            Ok(fox) => config.fox = fox,
-            Err(message) => {
-                eprintln!("installer: {message}");
-                process::exit(1);
-            }
-        }
+    }
+    if cli.write_bootloader.is_some() {
+        config.general.write_bootloader = cli.write_bootloader;
+    }
+    config.fox = fox_image(cli.fox, cli.config_name.as_deref());
 
-        if let Some(path) = parser.args.first() {
-            if let Err(err) = redox_installer::install(config, path) {
-                eprintln!("installer: failed to install: {:?}", err);
-                process::exit(1);
-            }
-        } else {
-            eprint!("{}", HELP_STR);
-            process::exit(1);
-        }
+    let Some(path) = cli.disk else {
+        eprint!("{}", Cli::command().render_help());
+        process::exit(1);
+    };
+    if let Err(err) = redox_installer::install(config, path) {
+        fail(format_args!("failed to install: {err:?}"));
     }
 }
 
@@ -299,38 +306,128 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> ArgParser {
-        let mut parser = with_fox_options(ArgParser::new(4).add_opt("", "config-name"));
-        parser.parse(
-            std::iter::once("redox_installer")
-                .chain(args.iter().copied())
-                .map(str::to_string),
-        );
-        parser
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("redox_installer").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn command_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn config_value_forms_are_equivalent() {
+        for args in [
+            &["--config", "some.toml", "disk.img"][..],
+            &["--config=some.toml", "disk.img"],
+            &["-c", "some.toml", "disk.img"],
+            &["-csome.toml", "disk.img"],
+            &["disk.img", "--config", "some.toml"],
+        ] {
+            let cli = parse(args).unwrap();
+            assert_eq!(
+                cli.config.as_deref(),
+                Some(Path::new("some.toml")),
+                "{args:?}"
+            );
+            assert_eq!(cli.disk.as_deref(), Some(Path::new("disk.img")), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn long_options_take_separate_values() {
+        let cli = parse(&[
+            "--cookbook",
+            ".",
+            "--config-name",
+            "desktop",
+            "--output-config",
+            "out.toml",
+            "--write-bootloader",
+            "boot.efi",
+            "--size",
+            "512",
+            "--build-tools-list",
+            "tools.txt",
+        ])
+        .unwrap();
+        assert_eq!(cli.cookbook.as_deref(), Some("."));
+        assert_eq!(cli.config_name.as_deref(), Some("desktop"));
+        assert_eq!(cli.output_config.as_deref(), Some(Path::new("out.toml")));
+        assert_eq!(cli.write_bootloader.as_deref(), Some("boot.efi"));
+        assert_eq!(cli.size, Some(512));
+        assert_eq!(cli.build_tools_list.as_deref(), Some("tools.txt"));
+        assert_eq!(cli.disk, None);
+    }
+
+    #[test]
+    fn short_forms() {
+        let cli = parse(&["-b", ".", "-o", "out.toml", "-l"]).unwrap();
+        assert_eq!(cli.cookbook.as_deref(), Some("."));
+        assert_eq!(cli.output_config.as_deref(), Some(Path::new("out.toml")));
+        assert!(cli.list_packages);
+    }
+
+    #[test]
+    fn flags() {
+        let cli = parse(&[
+            "--skip-partition",
+            "--filesystem-size",
+            "--list-packages",
+            "--live",
+            "--no-mount",
+            "disk.img",
+        ])
+        .unwrap();
+        assert!(cli.skip_partition && cli.filesystem_size && cli.list_packages);
+        assert!(cli.live && cli.no_mount);
+        let cli = parse(&["disk.img"]).unwrap();
+        assert!(!(cli.skip_partition || cli.filesystem_size || cli.list_packages));
+        assert!(!(cli.live || cli.no_mount));
+    }
+
+    #[test]
+    fn repeated_options_take_the_last_value() {
+        let cli = parse(&["-c", "a.toml", "--config=b.toml", "--live", "--live"]).unwrap();
+        assert_eq!(cli.config.as_deref(), Some(Path::new("b.toml")));
+        assert!(cli.live);
+    }
+
+    #[test]
+    fn rejects_malformed_arguments() {
+        assert!(parse(&["--config"]).is_err());
+        assert!(parse(&["--size", "big"]).is_err());
+        assert!(parse(&["--no-such-option", "disk.img"]).is_err());
+        assert!(parse(&["a.img", "b.img"]).is_err());
     }
 
     #[test]
     fn fox_options_need_fox() {
-        assert_eq!(fox_image(&parse(&["image.img"])), Ok(None));
-        assert!(fox_image(&parse(&["--fox-packages=set.toml"])).is_err());
-        assert!(fox_image(&parse(&["--fox=fox", "--fox-locked"])).is_err());
-        assert!(fox_image(&parse(&["--fox=fox", "--fox-level=v4"])).is_err());
-        let fox = fox_image(&parse(&[
+        assert!(parse(&["image.img"]).unwrap().fox.fox.is_none());
+        assert!(parse(&["--fox-packages=set.toml"]).is_err());
+        assert!(parse(&["--fox-sbom=sbom.json"]).is_err());
+        assert!(parse(&["--fox=fox", "--fox-locked"]).is_err());
+        assert!(parse(&["--fox=fox", "--fox-level=v4"]).is_err());
+        let cli = parse(&[
             "--fox=target/release/fox",
-            "--fox-packages=set.toml",
+            "--fox-packages",
+            "set.toml",
             "--fox-locked",
             "--fox-level=v4",
             "--fox-sbom=build/image.cdx.json",
             "--config-name=desktop",
-        ]))
-        .unwrap()
+        ])
         .unwrap();
+        let fox = fox_image(cli.fox, cli.config_name.as_deref()).unwrap();
         assert_eq!(fox.fox, Path::new("target/release/fox"));
         assert_eq!(fox.packages.as_deref(), Some(Path::new("set.toml")));
         assert!(fox.locked);
         assert_eq!(fox.level.as_deref(), Some("v4"));
+        assert_eq!(fox.sbom.as_deref(), Some(Path::new("build/image.cdx.json")));
         assert_eq!(fox.name, "ferric-oxide-desktop");
         assert_eq!(fox.target, redox_installer::get_target());
         assert_eq!(sbom_name(None), "ferric-oxide");
+        let cli = parse(&["image.img"]).unwrap();
+        assert!(fox_image(cli.fox, None).is_none());
     }
 }
