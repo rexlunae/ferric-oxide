@@ -31,7 +31,8 @@ ferric-exit-test = "source"
 ferric-proc-test = "source"
 # Requests port-I/O access as root and as unprivileged children; no port accesses.
 ferric-ioport-test = "source"
-# Changes owners and modes of ramfs files as root and as user 1000 (#246).
+# Changes owners and modes of ramfs files as root and as user 1000 (#246), and writes
+# through read-only and write-only descriptors (#400).
 ferric-owner-test = "source"
 ferric-syscall-fuzz = "source"
 # pcid-spawner starts it for QEMU's edu device (boot-smoke.sh adds one): it gets a
