@@ -833,17 +833,12 @@ fn parse_args(args: Vec<String>) -> Result<(CliConfig, CliCommand, Vec<CookRecip
             if let Some(gitrev) = lock
                 .get(recipe.name.as_str())
                 .and_then(|r| r.gitrev.clone())
+                && !recipe.pin_rev(gitrev)
             {
-                if let Some(SourceRecipe::Git { rev, branch, .. }) = &mut recipe.recipe.source {
-                    *rev = Some(gitrev.clone());
-                    *branch = None;
-                } else {
-                    println!(
-                        "DEBUG: Recipe {:?} contains into git rev but recipe source is not git",
-                        recipe.name.as_str()
-                    );
-                }
-                recipe.pinned = true;
+                println!(
+                    "DEBUG: Recipe {:?} contains into git rev but recipe source is not git",
+                    recipe.name.as_str()
+                );
             }
         }
     }

@@ -251,7 +251,8 @@ Without a remote, or when its index cannot be fetched, `binary` recipes,
 and those whose packages the index does not all list (the main package
 and every optional package, such as `<name>.dev`), are built from source with their build
 and dev dependencies (such as `host:python312` for `xcb-proto`), and the
-cookbook says why once. A remote without a
+cookbook says why once. A recipe whose git revision `make repo-lock`
+pinned builds that revision when it falls back. A remote without a
 key is refused: nothing from a remote is unpacked unless a key pinned on
 this side signed it. The index is cached in `build/remotes/` for eight
 hours (indefinitely with `COOKBOOK_OFFLINE`). `[mirrors]` rewrites apply to
