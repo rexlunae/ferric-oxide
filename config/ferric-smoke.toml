@@ -39,6 +39,8 @@ ferric-ioport-test = "source"
 # Changes owners and modes of ramfs files as root and as user 1000 (#246), and writes
 # through read-only and write-only descriptors (#400).
 ferric-owner-test = "source"
+# Appends to RedoxFS and ramfs files and checks the cursor ends at the end (#244).
+ferric-append-test = "source"
 ferric-syscall-fuzz = "source"
 # pcid-spawner starts it for QEMU's edu device (boot-smoke.sh adds one): it gets a
 # DMA domain from pcid and has the device DMA through it.
@@ -150,6 +152,7 @@ ferric-sigcont-test && echo FERRIC_TEST_PASS sigcont-default || echo FERRIC_TEST
 ferric-proc-test || echo FERRIC_TEST_FAIL proc exited with an error
 ferric-ioport-test || echo FERRIC_TEST_FAIL ioport exited with an error
 ferric-owner-test || echo FERRIC_TEST_FAIL owner exited with an error
+ferric-append-test || echo FERRIC_TEST_FAIL append exited with an error
 ferric-scheme-self-test || echo FERRIC_TEST_FAIL scheme-self-open exited with an error
 ferric-trace-test || echo FERRIC_TEST_FAIL trace exited with an error
 # Saves a capture through the ring mappings and reads it back, on a kernel with kernel.trace. The /scheme listing says

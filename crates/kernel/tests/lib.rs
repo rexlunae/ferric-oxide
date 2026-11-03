@@ -29,6 +29,8 @@ mod apic_id;
 mod chown;
 #[path = "../src/cpu_set.rs"]
 mod cpu_set;
+#[path = "../src/syscall/cursor.rs"]
+mod cursor;
 #[path = "../src/context/fault_access.rs"]
 mod fault_access;
 #[path = "../src/memory/fault_outcome.rs"]

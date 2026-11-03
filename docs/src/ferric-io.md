@@ -1557,11 +1557,12 @@ remains available to other mounts of the same daemon binary.
   refused (`EOPNOTSUPP`) before anything is written. Immutable and append-only
   files are refused (`EPERM`); inline-data, encrypted, verity and journaled-data
   files are not written yet (`EOPNOTSUPP`). Opening for writing needs write
-  permission (and read permission unless `O_WRONLY`). `O_APPEND` opens and
-  writes fail with `EOPNOTSUPP`, including a flag enabled after open through
-  `F_SETFL`: the current scheme response cannot return an append's actual
-  ending position to the kernel
-  ([#244](https://github.com/rexlunae/ferric-oxide/issues/244)). The inode's
+  permission (and read permission unless `O_WRONLY`). A write with
+  `O_APPEND` (set at open or later through `F_SETFL`; each write's flags
+  decide) goes to the end of the file whatever the cursor, and the kernel then
+  moves the cursor to the size `fsize` reports
+  ([#244](https://github.com/rexlunae/ferric-oxide/issues/244); see
+  [Architecture](ferric-architecture.md#schemes-descriptors-and-services)). The inode's
   size and flags use a generated `simple_endian` native/wire layout, with a byte
   fixture protecting unchanged fields. Every open file is opened again in
   `ext4-view` after a write, so reads see it.
@@ -1634,9 +1635,10 @@ FreeBSD (`s_creator_os` 3), and a crash before each write of an `fchmod`.
 and past the end inside the last block, checks the permission rules, that
 other open handles read the new bytes, that unwritten extents are refused with
 nothing written (the `write-data` fixture, which also has immutable and
-append-only files), that append opens and writes at an earlier cursor or EOF
-fail without changing any image bytes, size or timestamps, and that ordinary
-offset writes still work, and crashes a write before each of its nine writes.
+append-only files), that appends from an earlier cursor, from EOF and past
+it all write at the end (and are refused on read-only mounts), that
+`append_data` returns where it wrote, and that ordinary offset writes still
+work, and crashes a write before each of its nine writes.
 `tests/alloc.rs` runs on `alloc.ext4.gz` (`metadata_csum`) and
 `alloc-gdt.ext4.gz` (`gdt_csum`, 32-byte descriptors): writes past the end and
 into holes, extents that grow in place, a full root and a leaf under the root,

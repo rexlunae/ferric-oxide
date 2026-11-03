@@ -814,17 +814,54 @@ pub fn write_data<R: WriteAt>(
     if data.is_empty() {
         return Ok(());
     }
+    write_at(window, number, Some(offset), data, changed)?;
+    Ok(())
+}
+
+/// Writes `data` at the end of the regular file inode `number` (`O_APPEND`), as
+/// [`write_data`] does at an offset, and returns the offset it was written at: the file's
+/// size before the write, read from the inode in the same call.
+///
+/// The file's size afterwards, which the scheme's `fsize` reports and the kernel makes an
+/// appending description's cursor, is the returned offset plus `data.len()`. An empty
+/// `data` writes nothing and returns the current size.
+///
+/// # Errors
+///
+/// Those of [`write_data`].
+pub fn append_data<R: WriteAt>(
+    window: &mut Window<R>,
+    number: u32,
+    data: &[u8],
+    changed: Timestamp,
+) -> Result<u64, WriteError> {
+    write_at(window, number, None, data, changed)
+}
+
+/// Writes `data` at `offset` of inode `number`, or at its end for `None`, and returns the
+/// offset it was written at.
+fn write_at<R: WriteAt>(
+    window: &mut Window<R>,
+    number: u32,
+    offset: Option<u64>,
+    data: &[u8],
+    changed: Timestamp,
+) -> Result<u64, WriteError> {
     let target = writable_volume(window)?;
     let inode = target.volume.read_inode(window, number)?;
     check_inode(&target, number, &inode)?;
     check_data_writable(number, &inode)?;
+    let size = size_of(&inode)?;
+    let offset = offset.unwrap_or(size);
+    if data.is_empty() {
+        return Ok(offset);
+    }
     let end = offset
         .checked_add(data.len() as u64)
         .ok_or(WriteError::FileTooLarge {
             number,
             size: u64::MAX,
         })?;
-    let size = size_of(&inode)?;
     let written = Written {
         size: (end > size).then_some(end),
         changed,
@@ -844,9 +881,10 @@ pub fn write_data<R: WriteAt>(
     zero_gap(window, &target, &plan.gap, size)?;
     window.flush()?;
     match plan.transaction {
-        None => change(window, number, &Change::Written(written)),
-        Some(transaction) => commit(window, &target, &journal, transaction),
+        None => change(window, number, &Change::Written(written))?,
+        Some(transaction) => commit(window, &target, &journal, transaction)?,
     }
+    Ok(offset)
 }
 
 /// The bytes a write covers (`offset..end`) and the file's size before it.
