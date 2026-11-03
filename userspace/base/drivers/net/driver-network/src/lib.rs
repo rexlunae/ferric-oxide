@@ -64,6 +64,26 @@ pub struct NetworkScheme<T: NetworkAdapter> {
     handler: ReadinessBased<Rc<Socket>>,
 }
 
+/// The order [`NetworkScheme::new`] sets a driver up in: open the scheme socket, make the
+/// bypass wake pipe from it, only then initialise the adapter, and register the scheme
+/// last. Each failure maps to its [`NetworkSchemeError`] variant, and nothing after a
+/// failed step runs. Generic over the resources so the order is host-testable.
+fn start<Sock, Wake, Adapter, Out>(
+    scheme_name: String,
+    open_socket: impl FnOnce() -> Result<Sock>,
+    make_wake: impl FnOnce(&Sock) -> io::Result<Wake>,
+    adapter_fn: impl FnOnce() -> Adapter,
+    register: impl FnOnce(Sock, Wake, Adapter, &str) -> Result<Out>,
+) -> std::result::Result<Out, NetworkSchemeError> {
+    let socket = open_socket().map_err(NetworkSchemeError::Socket)?;
+    let wake = make_wake(&socket).map_err(NetworkSchemeError::WakePipe)?;
+    let adapter = adapter_fn();
+    register(socket, wake, adapter, &scheme_name).map_err(|source| NetworkSchemeError::Register {
+        name: scheme_name,
+        source,
+    })
+}
+
 fn post_fevent(socket: &Socket, id: usize, flags: usize) -> Result<()> {
     let fevent_response = Response::post_fevent(id, flags);
     match socket.write_response(fevent_response, SignalBehavior::Restart) {
@@ -96,19 +116,19 @@ impl<T: NetworkAdapter> NetworkScheme<T> {
         scheme_name: String,
     ) -> std::result::Result<Self, NetworkSchemeError> {
         assert!(scheme_name.starts_with("network"));
-        let socket = Rc::new(Socket::nonblock().map_err(NetworkSchemeError::Socket)?);
-        let bypass =
-            bypass::State::new(Rc::clone(&socket)).map_err(NetworkSchemeError::WakePipe)?;
-        let adapter = adapter_fn();
-        let mut scheme = NetworkSchemeImpl::new(
-            scheme_name.clone(),
-            NetworkSchemeData { adapter, bypass },
-            NetworkResource::SchemeRoot(SchemeRoot::<T>(PhantomData)),
-        );
-        redox_scheme::scheme::register_sync_scheme(&socket, &scheme_name, &mut scheme).map_err(
-            |source| NetworkSchemeError::Register {
-                name: scheme_name,
-                source,
+        let (socket, scheme) = start(
+            scheme_name,
+            || Socket::nonblock().map(Rc::new),
+            |socket| bypass::State::new(Rc::clone(socket)),
+            adapter_fn,
+            |socket, bypass, adapter, scheme_name| {
+                let mut scheme = NetworkSchemeImpl::new(
+                    scheme_name.to_owned(),
+                    NetworkSchemeData { adapter, bypass },
+                    NetworkResource::SchemeRoot(SchemeRoot::<T>(PhantomData)),
+                );
+                redox_scheme::scheme::register_sync_scheme(&socket, scheme_name, &mut scheme)?;
+                Ok((socket, scheme))
             },
         )?;
         daemon.ready();
@@ -365,5 +385,99 @@ impl<T: NetworkAdapter> ResourceSync for Mac<T> {
         stat.st_mode = MODE_FILE | 0o400;
         stat.st_size = 6;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::error::Error as _;
+
+    use syscall::{EEXIST, EMFILE};
+
+    use super::*;
+
+    const NAME: &str = "network.test";
+
+    #[test]
+    fn socket_failure_stops_before_the_adapter() {
+        let adapter_ran = Cell::new(false);
+        let error = start(
+            NAME.to_owned(),
+            || Err::<(), _>(Error::new(EMFILE)),
+            |_| -> io::Result<()> { panic!("wake pipe made without a socket") },
+            || adapter_ran.set(true),
+            |_, _, _, _| -> Result<()> { panic!("registered without a socket") },
+        )
+        .unwrap_err();
+        assert!(matches!(error, NetworkSchemeError::Socket(e) if e.errno == EMFILE));
+        assert!(!adapter_ran.get());
+    }
+
+    #[test]
+    fn wake_pipe_failure_stops_before_the_adapter() {
+        let adapter_ran = Cell::new(false);
+        let error = start(
+            NAME.to_owned(),
+            || Ok(()),
+            |_| Err::<(), _>(io::Error::other("no pipes")),
+            || adapter_ran.set(true),
+            |_, _, _, _| -> Result<()> { panic!("registered without a wake pipe") },
+        )
+        .unwrap_err();
+        let NetworkSchemeError::WakePipe(source) = &error else {
+            panic!("expected WakePipe, got {error:?}");
+        };
+        assert_eq!(source.to_string(), "no pipes");
+        assert!(error.source().is_some());
+        assert!(!adapter_ran.get());
+    }
+
+    #[test]
+    fn registration_failure_names_the_scheme_after_initialising_the_adapter() {
+        let adapter_ran = Cell::new(false);
+        let error = start(
+            NAME.to_owned(),
+            || Ok(()),
+            |_| Ok(()),
+            || adapter_ran.set(true),
+            |_, _, _, _| -> Result<()> { Err(Error::new(EEXIST)) },
+        )
+        .unwrap_err();
+        match error {
+            NetworkSchemeError::Register { name, source } => {
+                assert_eq!(name, NAME);
+                assert_eq!(source.errno, EEXIST);
+            }
+            other => panic!("expected Register, got {other:?}"),
+        }
+        assert!(adapter_ran.get());
+    }
+
+    #[test]
+    fn success_passes_every_resource_to_registration_in_order() {
+        let order = std::cell::RefCell::new(Vec::new());
+        let out = start(
+            NAME.to_owned(),
+            || {
+                order.borrow_mut().push("socket");
+                Ok(1)
+            },
+            |&socket| {
+                order.borrow_mut().push("wake");
+                Ok(socket + 1)
+            },
+            || {
+                order.borrow_mut().push("adapter");
+                3
+            },
+            |socket, wake, adapter, name| {
+                order.borrow_mut().push("register");
+                Ok((socket, wake, adapter, name.to_owned()))
+            },
+        )
+        .unwrap();
+        assert_eq!(out, (1, 2, 3, NAME.to_owned()));
+        assert_eq!(*order.borrow(), ["socket", "wake", "adapter", "register"]);
     }
 }
