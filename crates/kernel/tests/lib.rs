@@ -31,6 +31,8 @@ mod chown;
 mod cpu_set;
 #[path = "../src/context/fault_access.rs"]
 mod fault_access;
+#[path = "../src/memory/fault_outcome.rs"]
+mod fault_outcome;
 #[path = "../src/context/fmap_reply.rs"]
 mod fmap_reply;
 #[path = "../src/percpu/global_flush.rs"]

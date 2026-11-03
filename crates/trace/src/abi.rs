@@ -169,10 +169,39 @@ impl fmt::Display for Access {
 /// the ring is empty. A buffer too small for the next record gets `EINVAL` and the record stays:
 /// a buffer of [`READ_MIN`] bytes always holds one. While another reader is reading the same
 /// CPU, a read gets `EAGAIN`.
+///
+/// A reader that drains a ring must stop once [`read_caught_up`] says so, not when a read
+/// returns 0: while `syscall` events are on, each `read` adds its own `syscall.enter` and
+/// `syscall.exit` records to the ring of the CPU it runs on, so that ring never empties.
 pub const CPU_DIR: &str = "cpu";
 
 /// The smallest buffer a read of `cpu/<n>` always succeeds with: the longest record.
 pub const READ_MIN: usize = crate::record::MAX_RECORD_WORDS * crate::record::WORD_BYTES;
+
+/// Whether a read of `cpu/<n>` that returned `read` bytes into a buffer of `buf_len` bytes
+/// took every record the ring held when it ran.
+///
+/// A read copies whole records until the next one does not fit, so one that left room for the
+/// longest record ([`READ_MIN`]) found no more. Records written after it, including the
+/// reader's own `syscall` records, are left for the next drain (see [`CPU_DIR`]).
+///
+/// This detects that the reader has caught up with the writers; it is not a snapshot of the
+/// backlog. While writers keep every read full, a drain that stops only here goes on. A reader
+/// that needs a hard bound also stops after the bytes [`STATS_PATH`] listed as `pending`
+/// before it started, as `ferric-trace capture` does.
+///
+/// # Examples
+///
+/// ```
+/// use ferric_trace::abi::{READ_MIN, read_caught_up};
+///
+/// assert!(read_caught_up(0, 4096));
+/// assert!(read_caught_up(88, 4096));
+/// assert!(!read_caught_up(4096 - READ_MIN + 8, 4096));
+/// ```
+pub const fn read_caught_up(read: usize, buf_len: usize) -> bool {
+    read == 0 || buf_len.saturating_sub(read) >= READ_MIN
+}
 
 /// The data words of each CPU's ring: 64 KiB of records.
 pub const CPU_RING_WORDS: usize = 8192;

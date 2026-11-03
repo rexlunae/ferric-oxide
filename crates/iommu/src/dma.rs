@@ -16,6 +16,8 @@
 //! - when the process takes write access away from memory (`mprotect`), the writable
 //!   mappings that memory reaches are found ([`DmaMappings::writable_reached_by`]) for the
 //!   kernel to make read-only for the device too;
+//! - memory that moves away (`mremap`) is released piece by piece as each piece leaves, so a
+//!   move that fails part way keeps the mappings of the memory that stayed ([`moved`]);
 //! - closing the domain hands back everything ([`DmaMappings::drain`]);
 //! - an installation that failed without confirming its invalidation may still be reachable by
 //!   a device, and no mapping record names it, so [`Retained`] keeps its resources owned until a
@@ -526,6 +528,9 @@ pub mod links;
 
 /// Grant installation, rollback and publication of possibly reachable mappings.
 pub mod grant;
+
+/// Releasing the DMA reach of memory that moves away, one piece at a time.
+pub mod moved;
 
 #[cfg(test)]
 mod tests {

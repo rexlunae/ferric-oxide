@@ -27,10 +27,13 @@ use crate::{
 pub use rmm::{Arch as RmmArch, PageFlags, PhysicalAddress, TableKind, VirtualAddress};
 use rmm::{BumpAllocator, FrameAllocator, FrameCount, FrameUsage, MemoryArea};
 
+mod fault_outcome;
 mod kernel_mapper;
 pub mod page;
 pub mod tlb;
 pub use page::*;
+
+use fault_outcome::{Cause, Correction, Fault, Outcome};
 
 pub type PageMapper = rmm::PageMapper<RmmA, crate::memory::TheFrameAllocator>;
 
@@ -1466,14 +1469,35 @@ pub fn page_fault_handler(
         faulting_address.data(),
         ip,
         flags.raw(),
-        match handled {
-            Ok(Handled::Mapped) => ferric_trace::kernel::PageFaultOutcome::Mapped,
-            Ok(Handled::CopyFailed) => ferric_trace::kernel::PageFaultOutcome::CopyFailed,
-            Err(Segv) => ferric_trace::kernel::PageFaultOutcome::Unhandled,
+        {
+            use ferric_trace::kernel::PageFaultOutcome as O;
+            match handled {
+                Ok(Handled::Mapped) => O::Mapped,
+                Ok(Handled::CopyFailed(Cause::OutOfMemory))
+                | Err(Unhandled(Cause::OutOfMemory)) => O::OutOfMemory,
+                Ok(Handled::CopyFailed(Cause::NotMapped)) => O::CopyFailed,
+                Err(Unhandled(Cause::NotMapped)) => O::Unhandled,
+            }
         }
         .raw(),
     );
-    handled.map(|_| ())
+    match handled {
+        Ok(Handled::CopyFailed(Cause::OutOfMemory)) => {
+            crate::warn!(
+                "out of memory mapping {:#x} for a kernel copy; returning EFAULT",
+                faulting_address.data()
+            );
+        }
+        Err(Unhandled(Cause::OutOfMemory)) => {
+            crate::warn!(
+                "out of memory mapping {:#x}; failing the faulting thread",
+                faulting_address.data()
+            );
+        }
+        Ok(Handled::Mapped | Handled::CopyFailed(Cause::NotMapped))
+        | Err(Unhandled(Cause::NotMapped)) => (),
+    }
+    handled.map(|_| ()).map_err(|_| Segv)
 }
 
 /// Ferric Oxide: how [`handle_page_fault`] dealt with a fault it could handle.
@@ -1481,8 +1505,11 @@ enum Handled {
     /// The page tables were corrected; the access is retried.
     Mapped,
     /// A kernel copy to or from user memory faulted; the copy returns `EFAULT`.
-    CopyFailed,
+    CopyFailed(Cause),
 }
+
+/// Ferric Oxide: a fault [`handle_page_fault`] could not handle, and why.
+struct Unhandled(Cause);
 
 /// Ferric Oxide: `code` as `mm.page_fault`'s flags.
 #[cfg(feature = "trace")]
@@ -1503,7 +1530,7 @@ fn handle_page_fault(
     stack: &mut impl ArchIntCtx,
     code: GenericPfFlags,
     faulting_address: VirtualAddress,
-) -> Result<Handled, Segv> {
+) -> Result<Handled, Unhandled> {
     let faulting_page = Page::containing_address(faulting_address);
 
     let usercopy_region = __usercopy_start()..__usercopy_end();
@@ -1513,11 +1540,8 @@ fn handle_page_fault(
     let address_is_user = faulting_address.kind() == TableKind::User;
 
     let invalid_page_tables = code.contains(GenericPfFlags::INVL);
-    let caused_by_user = code.contains(GenericPfFlags::USER_NOT_SUPERVISOR);
-    let caused_by_kernel = !caused_by_user;
     let caused_by_write = code.contains(GenericPfFlags::INVOLVED_WRITE);
     let caused_by_instr_fetch = code.contains(GenericPfFlags::INSTR_NOT_DATA);
-    let is_usercopy = usercopy_region.contains(&stack.ip());
 
     let mode = match (caused_by_write, caused_by_instr_fetch) {
         (true, false) => AccessMode::Write,
@@ -1530,26 +1554,37 @@ fn handle_page_fault(
 
     if invalid_page_tables {
         // TODO: Better error code than Segv?
-        return Err(Segv);
+        return Err(Unhandled(Cause::NotMapped));
     }
 
-    if address_is_user && (caused_by_user || is_usercopy) {
+    let fault = Fault {
+        address_is_user,
+        from_user: code.contains(GenericPfFlags::USER_NOT_SUPERVISOR),
+        usercopy: usercopy_region.contains(&stack.ip()),
+        instr_fetch: mode == AccessMode::InstrFetch,
+    };
+    let outcome = fault_outcome::resolve(fault, || {
+        // SAFETY: user-mode faults hold no kernel locks; for a usercopy fault this relies, as
+        // the inherited handler did, on callers not copying user memory under ordered locks.
         let mut token = unsafe { CleanLockToken::new() };
         match context::memory::try_correcting_page_tables(faulting_page, mode, &mut token) {
-            Ok(()) => return Ok(Handled::Mapped),
-            Err(PfError::Oom) => todo!("oom"),
-            Err(PfError::Segv | PfError::RecursionLimitExceeded) => (),
+            Ok(()) => Correction::Mapped,
+            Err(PfError::Oom) => Correction::OutOfMemory,
+            Err(PfError::Segv | PfError::RecursionLimitExceeded) => Correction::Refused,
             Err(PfError::NonfatalInternalError) => todo!(),
         }
-    }
+    });
 
-    if address_is_user && caused_by_kernel && mode != AccessMode::InstrFetch && is_usercopy {
-        stack.recover_and_efault();
-        return Ok(Handled::CopyFailed);
+    match outcome {
+        Outcome::Mapped => Ok(Handled::Mapped),
+        Outcome::CopyFailed(cause) => {
+            stack.recover_and_efault();
+            Ok(Handled::CopyFailed(cause))
+        }
+        Outcome::Unhandled(cause) => Err(Unhandled(cause)),
     }
-
-    Err(Segv)
 }
+
 static THE_ZEROED_FRAME: SyncUnsafeCell<Option<(Frame, &'static PageInfo)>> =
     SyncUnsafeCell::new(None);
 

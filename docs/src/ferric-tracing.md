@@ -156,7 +156,9 @@ image user space does no tracing work either: the kernel hands out no
 Nothing is traced until events are turned on: with `FERRIC_TRACE=` in the same
 boot environment, or at run time through the scheme. `kernel.trace_boot` and the
 initfs options need `kernel.trace`, which builds tracing into the normal kernel
-too.
+too. So the [test harness](ferric-harness.md#modes)'s trace mode sets
+`FERRIC_TRACE=sched` itself when it is given no `FERRIC_TRACE`, the events CI's
+traced smoke image turns on with `kernel.trace_boot = "sched"`.
 
 ### Setting the boot environment
 
@@ -631,7 +633,10 @@ The codes in the memory, IRQ and IOMMU events have one definition, next to the e
     `reserved` (a reserved bit in a page table entry).
   - `outcome` is a `PageFaultOutcome`: 0 `mapped` (demand paging or copy on
     write; the access is retried), 1 `copy failed` (the kernel faulted copying
-    to or from user memory, and the call fails with `EFAULT`), 2 `unhandled`.
+    to or from user memory, and the call fails with `EFAULT`), 2 `unhandled`,
+    3 `out of memory` (no frame to map a user page: a kernel copy, without the
+    `user` flag, fails with `EFAULT`; a user access fails the thread as
+    `unhandled` does).
 - `irq.deliver` is recorded when the irq scheme (`crates/kernel/src/scheme/irq.rs`)
   counts an interrupt and wakes the `irq:` handles that get it.
   - `cpu` is the CPU it is counted for: the one that took it with
@@ -830,6 +835,20 @@ open. A `cpu/<n>` read follows these rules:
 - It fails with `EINVAL` when the buffer cannot hold the next record.
   `abi::READ_MIN` bytes always hold one.
 - It fails with `EAGAIN` while another reader is reading the same CPU.
+
+A reader that drains a ring must stop once a read leaves room for another record
+(`abi::read_caught_up`), not when a read returns 0 bytes. While `syscall` events
+are on, each `read` adds its own `syscall.enter` and `syscall.exit` records (88
+bytes) to the ring of the CPU it runs on, so that ring never empties. Before
+this rule, `ferric-iommu-test` drained until 0 bytes. A trace-mode smoke boot with
+`FERRIC_TRACE=syscall,sched,scheme,irq,mm` then stalled in that test: it read
+cpu 2 about two million times a second, and the host capture grew by about
+200 MB/s. `ferric-trace-test` and `ferric-trace-bench` drain with the same rule.
+
+The rule detects that a reader has caught up; it does not snapshot the backlog.
+While other writers fill every read, a drain that stops only on it keeps going.
+A reader that needs a hard bound also stops after the `pending` words that
+`stats` listed before the drain started, as `ferric-trace capture` does.
 
 A write naming no known event gives `ENOENT`. A write naming only events that
 are not compiled in gives `EOPNOTSUPP`.

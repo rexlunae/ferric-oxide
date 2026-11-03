@@ -31,8 +31,10 @@ fn main() {
 }
 
 fn daemon_runner(redox_daemon: daemon::Daemon, pcid_handle: PciFunctionHandle) -> ! {
-    daemon(redox_daemon, pcid_handle).unwrap();
-    unreachable!();
+    match daemon(redox_daemon, pcid_handle) {
+        Ok(()) => unreachable!("virtio-netd: the event loop never returns Ok"),
+        Err(error) => common::exit_with_error("virtio-netd", error.as_ref()),
+    }
 }
 
 fn daemon(
@@ -105,7 +107,7 @@ fn daemon(
         },
         daemon,
         format!("network.{name}"),
-    );
+    )?;
 
     let mut event_queue = File::open("/scheme/event")?;
     event_queue.write(&syscall::Event {

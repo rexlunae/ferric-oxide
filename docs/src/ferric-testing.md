@@ -30,7 +30,8 @@ Rustdoc with `RUSTDOCFLAGS="-D warnings"`. Its selected-package Clippy check use
 `--no-deps` because imported host tools still have upstream lint warnings,
 including when they are dependencies of a Ferric integration test. It separately
 runs `cargo test --locked --lib` in
-`userspace/redoxfs/`; that is not covered by the root workspace test. Its `ext4d`
+`userspace/redoxfs/`, which includes the host tests of the scheme's mapping
+buffers (`src/fmap/tests.rs`); that is not covered by the root workspace test. Its `ext4d`
 job tests `userspace/ext4d/` twice, on the committed ext4 images in
 `tests/fixtures/` and on ones `make-fixtures.sh` builds with the runner's
 e2fsprogs (`EXT4D_FIXTURES`); the generator fixes tested permissions and ownership
@@ -382,6 +383,20 @@ cargo clippy --locked --manifest-path recipes/tests/ferric-xstate-test/files/Car
   --all-targets --target x86_64-unknown-redox -- -D warnings
 ```
 
+`crates/relibc/redox-rt/tests/signal_defaults.rs` compiles the runtime's table of
+default signal actions (`redox-rt/src/signal/defaults.rs`) the same way and checks
+that `SIGCHLD`, `SIGCONT`, `SIGURG` and `SIGWINCH` are ignored by default, the
+job-control stops stop, and every other signal terminates. The table sets the
+`IGNORED` flag procmgr reads before it interrupts a blocked call, so a missing
+entry lets the signal fail the call with `EINTR` although no handler runs
+([#377](https://github.com/rexlunae/ferric-oxide/issues/377)):
+
+```sh
+rustc --edition=2024 --test -D warnings \
+  crates/relibc/redox-rt/tests/signal_defaults.rs -o /tmp/ferric-signal-defaults-tests
+/tmp/ferric-signal-defaults-tests
+```
+
 Host CI runs these checks, strict runtime/recipe Clippy and Rustdoc, and the
 recipe's host program (a capability skip when AVX-512 is unavailable).
 Its test job uses the same cached pinned-submodule setup as image builds,
@@ -424,6 +439,7 @@ See [the network queue test](ferric-io.md#kernel-bypass-network-queues) for manu
 | `ferric-borrow-test` | A scheme call whose buffer cannot be borrowed leaves the caller's shared file mappings unpinned; RedoxFS maps a written or reused file with its current contents, `read` sees stores through a live shared mapping, `fsync` does not write an unmapped page back over a later `pwrite`, and a `pwrite` reaches live shared mappings; prints `FERRIC_BENCH borrow-pwrite`, page writes to an unmapped and a mapped file |
 | `ferric-futex-test` | Compare/wait/wake races and expired waiters |
 | `ferric-exit-test` | Process exit while a second thread is busy reading a pipe or parking on a futex: the force-killed thread must not block in its next wait, so every child exits ([#200](https://github.com/rexlunae/ferric-oxide/issues/200)) |
+| `ferric-sigcont-test` | relibc's `signals/sigcont-default` test: in eight rounds a child blocks reading a pipe, receives `SIGCONT` with the default action, and must still read the byte written after it. Shells send `SIGCONT` to every job they start, so before the fix a program still loading its libraries failed its read with `EINTR` ([#377](https://github.com/rexlunae/ferric-oxide/issues/377)); prints `FERRIC_TEST_PASS sigcont-default` through the smoke script |
 | `ferric-scheme-self-test` | A process opens and reads a file on a scheme it created on the same thread and serves from another, which used to spin the caller's CPU in the kernel |
 | `ferric-regbuf-test` | Registration, file-backed refusal, access modes, pinning, re-sharing refusal, forwarding, revocation, unmap/close, shared memory and byte/bounce behavior |
 | `ferric-blkgrant-test` | `nvmed` DMA into an attached grant: reads and writes against `pread`, refusals, revocation, detach and a copy versus grant read benchmark |
@@ -604,7 +620,7 @@ Read the lines in pairs as well as one at a time:
 - The `mmap` lines split the work differently on Redox and on Linux, so compare
   their sum across systems. On Redox, RedoxFS reads the file into a buffer of its
   own on the first mapping (the untimed warm-up) and keeps it while the file is
-  unchanged, and the kernel maps every page of a private file mapping
+  open and unchanged (it frees it once no description or mapping uses the file), and the kernel maps every page of a private file mapping
   copy-on-write from that buffer before `mmap` returns: a timed `mmap-map` is a
   request to RedoxFS plus mapping 8192 pages, `mmap-touch` takes no page faults
   (only TLB misses), and `mmap-unmap` removes the 8192 pages. On Linux, `mmap`
@@ -733,8 +749,13 @@ assumed to share this cause.
 ld.so's fatal message is followed by a second `[ld.so]:` line with the reason
 for the failing attempt: the path, original errno and exact operation (`open`,
 `fstat`, the `pread` of the object's headers, or `mmap`, including the requested
-mapping length), or the search paths
-a library is in none of. Thus an `ENOMEM` while loading a library does not by
+mapping length), the search paths
+a library is in none of, or why an opened object could not be loaded (invalid
+ELF headers, a missing `PT_LOAD` or `PT_DYNAMIC` segment, an invalid dynamic
+segment or section with the `object` crate's error, a segment outside the file
+or the mapping, or the `mmap` of its segments with the requested length and
+errno). `dlerror` returns a distinct message for each of these load failures
+instead of one generic "malformed" message. Thus an `ENOMEM` while loading a library does not by
 itself establish physical memory exhaustion or even that `open` failed. The next
 occurrence names the file and error without `LD_DEBUG`. Context is carried
 by the typed load error, with its original errno, so a later malformed object
@@ -743,7 +764,10 @@ or TLS failure cannot reuse an earlier search diagnostic. The host check
 mapping ownership, error, fatal-message formatter and errno modules. It checks
 candidate order,
 successful fallback, missing and inaccessible libraries reaching the fatal
-output, isolation from a later parse/TLS failure, stable `dlerror` messages,
+output, isolation from a later parse/TLS failure, stable `dlerror` messages
+(one per load failure kind), load failures naming the object and keeping their
+`object::Error` or errno source, every loader error's `core::error::Error`
+source chain down to that error,
 and descriptor cleanup after failed stat, header-read and map operations. File
 descriptors are owned immediately after open, including on error paths; a
 successful mapping retains its descriptor until after unmap. It also checks that
@@ -1294,6 +1318,19 @@ an intervening flush cleans the recorded pages, then the hint writes just one
 later dirty run while a concurrent rewrite remains dirty. This pins the
 intentional start-hint semantics and the take-size work bound.
 
+### Network driver startup errors
+
+`cargo test --locked --manifest-path userspace/base/Cargo.toml -p driver-network
+-p common` covers how a network driver starts and reports failure. The
+`driver-network` tests drive the setup order behind `NetworkScheme::new` with
+injected failures: a socket or wake-pipe failure returns `Socket` or
+`WakePipe` without running the adapter initialiser, a registration failure
+returns `Register` naming the scheme, and on success the steps run as socket,
+wake pipe, adapter, registration. The `common` tests check that
+`error_chain` lists an error and every cause, outermost first, which is what
+`exit_with_error` logs. The real socket and registration calls need a Redox
+target, so they are only compile-checked here.
+
 ### Driver executor event reads
 
 `cargo test --locked --manifest-path userspace/base/Cargo.toml -p executor`
@@ -1487,23 +1524,28 @@ alone does not exercise the credential check.
 ## ramfs ownership changes
 
 `ferric-owner-test` runs in the smoke image and checks `ramfs`'s `fchown` and
-`fchmod` (#246) on `/scheme/logging`, the instance every image runs. As root it
-creates a file root owns that anyone may open for writing, and one user 1000
-owns with mode `6755`, then runs itself as user 1000:
+`fchmod` (#246), and its `write` access check (#400), on `/scheme/logging`,
+the instance every image runs. As root it creates a file root owns that anyone
+may open for writing, and one user 1000 owns with mode `6755`, then runs itself
+as user 1000:
 
 - `owner-refused`: on root's file, `fchown` to its own user or group and
   `fchmod` are refused, and root then finds the file unchanged;
 - `owner-allowed`: on its own file it may set its own group, which clears the
   set-ID bits, and change the mode, but not give the file to root; root then
-  finds the owner, group and mode it set.
+  finds the owner, group and mode it set;
+- `owner-write`: `write` through a descriptor it opened read-only is refused
+  (`EBADF`), even on its own file, and allowed through one it opened
+  write-only on root's writable file; root then finds its own file empty and
+  root's holding the bytes written (#400).
 
 `fchown` reaches `ramfs` as the kernel's direct call and `fchmod` as a
-`StdFsCall`, so the two steps cover both ways `ramfs` learns the caller's IDs.
+`StdFsCall`, so the first two steps cover both ways `ramfs` learns the caller's IDs.
 Without `/scheme/logging` it prints a skip. The rules themselves have host
 tests in `crates/abi` (`ferric_abi::id`) and `userspace/base/ramfs`, which the
 base-workspace job in `host-tools.yml` runs with `scheme-utils`' credential
 decoding. `host-tools.yml` also checks the test's formatting, target Clippy and
-Rustdoc; the image workflow requires both steps.
+Rustdoc; the image workflow requires all three steps.
 
 ## Documentation checks
 

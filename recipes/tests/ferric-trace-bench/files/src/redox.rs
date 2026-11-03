@@ -143,13 +143,14 @@ impl Trace {
             .map_err(io_failure(&path))
     }
 
-    /// Empties every CPU's ring.
+    /// Empties every CPU's ring of the records it held when the drain reached it.
     fn drain(&self) -> Result<(), Failure> {
         let mut buf = vec![0u8; 64 * 1024];
         for cpu in &self.cpus {
             let path = scheme_path(&format!("{}/{cpu}", abi::CPU_DIR));
             let mut file = File::open(&path).map_err(io_failure(&path))?;
-            while file.read(&mut buf).map_err(io_failure(&path))? != 0 {}
+            while !abi::read_caught_up(file.read(&mut buf).map_err(io_failure(&path))?, buf.len()) {
+            }
         }
         Ok(())
     }

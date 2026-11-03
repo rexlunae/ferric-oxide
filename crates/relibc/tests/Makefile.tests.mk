@@ -252,6 +252,7 @@ VARIED_NAMES=\
 	signals/killpg0-self \
 	signals/kill-group \
 	signals/kill-child \
+	signals/sigcont-default \
 	signals/killpg-child \
 	signals/killpg-self \
 	signals/pthread_kill-invalid \

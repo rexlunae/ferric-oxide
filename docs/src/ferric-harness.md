@@ -290,7 +290,13 @@ binary, and `--mode` chooses between the two kernels:
   `kernel.trace` prints none.
 - **`--mode trace`** adds `FERRIC_KERNEL=trace` (load
   `usr/lib/boot/kernel-trace`) and `FERRIC_TRACE_HOST=<--trace-ring-kib>` to
-  the boot environment. It also backs guest RAM with
+  the boot environment, and `FERRIC_TRACE=sched` unless `--boot-env` gives a
+  `FERRIC_TRACE` (`--boot-env FERRIC_TRACE=` turns no events on at boot). The
+  trace-mode kernel cannot take events from `kernel.trace_boot`, which needs
+  `kernel.trace` in the normal kernel, so without this nothing would be
+  recorded until the guest enabled events. `sched` is what CI's traced smoke
+  image turns on with `kernel.trace_boot = "sched"`, and the smoke tests
+  (`ferric-trace-test`) expect `sched.switch` on from boot. It also backs guest RAM with
   `/dev/shm/ferric-harness-<run>` (`memory-backend-file`, `share=on`). The
   `mode` check fails unless the kernel logs `trace: trace-mode kernel`. When the
   kernel logs `trace: host rings at phys 0x<hex>, <n> CPUs x <KiB> KiB`, the
@@ -493,7 +499,8 @@ catalog defaults plus `kernel.trace_mode = true` and
   trace tests skip: the normal kernel has no `kernel.trace` scheme).
 - **`ferric-smoke` in trace mode**, with `--boot-env FERRIC_TRACE=sched`
   (the smoke tests expect `sched.switch` on from boot, as CI's `trace.boot`
-  gives them) and `--trace-ring-kib 16384`: 74 passed, 34 skipped, 0 failed.
+  gives them; trace mode now sets it by default, #389) and
+  `--trace-ring-kib 16384`: 74 passed, 34 skipped, 0 failed.
   The guest's own trace tests drained the host rings while `follow` captured
   them from the host with nothing lost. Only the steps that map the rings in
   the guest (`trace-mmap`, `trace-mapping`, `trace-clock`, `trace-capture`)
