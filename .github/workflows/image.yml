@@ -698,7 +698,8 @@ jobs:
   # calls and RedoxFS requests on the image without kernel.trace and, with all events
   # off and then alternating off and on, on the image with it. Ten boots of each, interleaved, and
   # the median of each boot's fastest round of each kind keep boot-to-boot noise out
-  # of the comparison. scripts/ferric-ci/check-trace-overhead.sh holds the budgets.
+  # of the comparison. scripts/ferric-ci/check-trace-overhead.sh holds the budgets; when the
+  # runner's noise leaves a comparison inconclusive, the job boots more pairs (issue #340).
   # The crash dump across a warm reboot (kernel.trace_crash). The crash image's kernel has the
   # test hook: on the first boot ferric-trace-test panics it, the panic handler writes the dump
   # and resets the machine, and QEMU (without -no-reboot) boots again with RAM as it was. The
@@ -793,7 +794,14 @@ jobs:
     needs: build
     if: github.event_name != 'schedule' && (inputs.config || 'ferric-smoke') == 'ferric-smoke'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Up to BENCH_MAX_BOOTS pairs of boots of about 20 seconds each.
+    timeout-minutes: 90
+    env:
+      # Pairs of boots run first, pairs added each time a comparison is inconclusive, and
+      # the most pairs before an inconclusive comparison is accepted with a warning.
+      BENCH_BOOTS: "10"
+      BENCH_EXTRA_BOOTS: "5"
+      BENCH_MAX_BOOTS: "30"
     steps:
       - uses: actions/checkout@v4
 
@@ -821,67 +829,59 @@ jobs:
 
       # Log downloads are not always readable, so every result and failure is an annotation.
       - name: Boot both images ten times
-        env:
-          # A boot takes about 20 seconds. The spread between boots (3% to 20% on a loaded
-          # runner) is larger than the 1% budget, so the check pairs each run's two boots and
-          # takes the median of the pairs' differences.
-          BENCH_BOOTS: "10"
         run: |
           for image in notrace trace; do
             zstd -q -d "$image/harddrive.img.zst" -o "$image/harddrive.img"
           done
-          failed=0
-          for run in $(seq 1 "$BENCH_BOOTS"); do
-            # The two boots of a run are a pair. Alternating which goes first keeps a
-            # steady drift in the runner's load from always landing on the same image.
-            if [ $((run % 2)) -eq 1 ]; then order="notrace trace"; else order="trace notrace"; fi
-            for image in $order; do
-              # Two-digit run numbers, so the two images' log globs list the pairs in the
-              # same order.
-              log="bench-$image-$(printf '%02d' "$run").log"
-              status=0
-              scripts/ferric-ci/boot-smoke.sh "$image/harddrive.img" "$log" host > /dev/null || status=$?
-              tr -d '\r' < "$log" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' > "$log.clean" || true
-              results="$(grep -aoE 'FERRIC_BENCH (io|syscall|lost) .*|FERRIC_TEST_[A-Z]+ trace(-bench|-capture|:).*' "$log.clean" || true)"
-              # GitHub keeps ten notices per step and 4 KiB of each, so the boots' results
-              # are collected and printed in parts, below.
-              printf 'boot %s exit %s\n%s\n' "$run" "$status" "$results" >> "results-$image.txt"
-              # Test results and crash lines first: an unhandled exception's process name
-              # is printed above its register dump, out of reach of a short tail.
-              tail="$({ grep -aE 'FERRIC_TEST_|EXCEPTION|panic|PANIC' "$log.clean" | grep -av 'funmap passed' | tail -n 40
-                grep -av 'funmap passed' "$log.clean" | tail -n 30; } | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
-              if [ "$status" -ne 0 ] || ! grep -qaF "FERRIC_TEST_PASS trace-bench" "$log.clean"; then
-                failed=1
-                echo "::error title=$image boot $run::boot exit $status, or no FERRIC_TEST_PASS trace-bench. Results and crash lines, then the serial tail:%0A$tail"
-                # The boot's own output went to /dev/null above, and the annotation keeps
-                # only the last markers: print every failed test with the 40 lines before
-                # it, so a failure early in the boot can be read from the job log.
-                scripts/ferric-ci/print-test-fails.sh "$log.clean" "$image boot $run"
-              fi
-              # The kernel without kernel.trace must make ferric-trace-test skip, not fail.
-              if [ "$image" = notrace ] && ! grep -qaF "FERRIC_TEST_SKIP trace: no" "$log.clean"; then
-                failed=1
-                echo "::error title=$image boot $run::ferric-trace-test did not skip on the kernel without kernel.trace"
-              fi
-              if [ "$image" = notrace ] && ! grep -qaF "FERRIC_TEST_SKIP trace-capture: no" "$log.clean"; then
-                failed=1
-                echo "::error title=$image boot $run::the trace capture check did not skip on the kernel without kernel.trace"
-              fi
-            done
+          # A boot takes about 20 seconds. The spread between boots (3% to 20% on a loaded
+          # runner) is larger than the 1% budget, so the check pairs each run's two boots and
+          # takes the median of the pairs' differences, with sign-test bounds.
+          scripts/ferric-ci/boot-trace-bench.sh 1 "$BENCH_BOOTS"
+
+      - name: Check the overhead budget
+        run: |
+          # The Nth notrace and trace logs are the two boots of run N. When the runner's
+          # noise leaves a comparison inconclusive (exit 3: the median is over budget but its
+          # 97.5% lower bound is not), boot more pairs, which narrow the bounds, up to
+          # BENCH_MAX_BOOTS. An inconclusive result after that is a warning, not a failure;
+          # a lower bound over the budget fails at any point. The check is told every pair
+          # count it may be run at, so that the lower bounds of all the looks together, not
+          # each alone, hold at 97.5%; with the two comparisons, the job falsely fails at
+          # most 5% of the time.
+          looks="$(seq "$BENCH_BOOTS" "$BENCH_EXTRA_BOOTS" "$BENCH_MAX_BOOTS" | tr '\n' ' ')"
+          case " $looks" in *" $BENCH_MAX_BOOTS ") ;; *) looks="$looks$BENCH_MAX_BOOTS" ;; esac
+          export TRACE_OVERHEAD_LOOKS="${looks% }"
+          runs="$BENCH_BOOTS"
+          while :; do
+            status=0
+            scripts/ferric-ci/check-trace-overhead.sh --out bench-notrace-*.log --in bench-trace-*.log || status=$?
+            if [ "$status" -ne 3 ]; then
+              exit "$status"
+            fi
+            if [ "$runs" -ge "$BENCH_MAX_BOOTS" ]; then
+              echo "::warning title=trace overhead inconclusive::runner noise exceeded the budget after $runs pairs of boots; not judged (see the warnings above)"
+              exit 0
+            fi
+            next=$((runs + BENCH_EXTRA_BOOTS))
+            if [ "$next" -gt "$BENCH_MAX_BOOTS" ]; then next="$BENCH_MAX_BOOTS"; fi
+            echo "::notice title=trace overhead::inconclusive after $runs pairs; booting pairs $((runs + 1)) to $next"
+            scripts/ferric-ci/boot-trace-bench.sh "$((runs + 1))" "$next"
+            runs="$next"
           done
+
+      - name: Post the boots' results
+        if: always()
+        run: |
+          # GitHub keeps ten notices per step and 4 KiB of each, so the boots' results are
+          # printed in parts.
           for image in notrace trace; do
+            [ -f "results-$image.txt" ] || continue
             split -C 3500 "results-$image.txt" "results-$image.part."
             for part in results-"$image".part.*; do
               body="$(sed 's/%/%25/g' "$part" | sed ':a;N;$!ba;s/\n/%0A/g')"
               echo "::notice title=$image boots ($part)::$body"
             done
           done
-          exit "$failed"
-
-      - name: Check the overhead budget
-        run: |
-          # The Nth notrace and trace logs are the two boots of run N.
-          scripts/ferric-ci/check-trace-overhead.sh --out bench-notrace-*.log --in bench-trace-*.log
 
       - uses: actions/upload-artifact@v4
         if: always()
