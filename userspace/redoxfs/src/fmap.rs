@@ -24,6 +24,51 @@
 //! of a current range and reads covered by current ranges need not read the file again. A
 //! range written since it was read, or kept from before a reopen (the node ID may name a
 //! different file by then, see [`FileMmapInfo::invalidate`]), is read again.
+//!
+//! # Why freeing the buffer cannot leave a process with dangling pages
+//!
+//! The process never maps RedoxFS's memory by address; it maps the physical frames behind it,
+//! and each mapping holds its own reference to every frame (paths in `crates/kernel/src/`):
+//!
+//! - `scheme/user.rs`, `UserInner::fmap_inner`: the reply to `MmapPrep` is the buffer address.
+//!   The kernel builds the grant with `Grant::borrow_fmap` (`context/memory.rs`) from RedoxFS's
+//!   page tables before `fmap` returns. Lazy mappings are disabled there
+//!   (`mapping_is_lazy = false`), so no page is fetched from RedoxFS later.
+//! - A shared mapping takes `add_ref(RefKind::Shared)` on each frame in `borrow_fmap`. A
+//!   private one goes through `Grant::copy_mappings` with `CopyMappingsMode::Owned`, which takes
+//!   `RefKind::Cow` references. `borrow_fmap` refuses frames without a `PageInfo` (the only ones
+//!   it could not count) for private mappings. A shared mapping would map them unreferenced,
+//!   but the buffer is anonymous memory from the frame allocator, which always has a
+//!   `PageInfo`. `context/reshare.rs` stops a scheme from handing out pages it only borrows.
+//! - Unmapping a frame, whether in the process or in RedoxFS, queues
+//!   `TlbShootdownActions::FREE`. That runs `handle_free_action` after the TLB shootdown, and it
+//!   deallocates the frame only when `remove_ref` leaves no reference. Freeing the buffer
+//!   therefore drops only RedoxFS's own references. Frames a process still maps stay allocated
+//!   until it unmaps them.
+//!
+//! RedoxFS receives `funmap` only after the process's pages are gone. `AddrSpace::munmap`
+//! (`context/memory.rs`) unmaps the grants and drops its `Flusher` (shootdown and reference
+//! release) before `syscall::fs::funmap` calls `handle_notify_files`, which sends `funmap`
+//! through `UnmapResult::unmap` and `UserScheme::kfunmap`. Each case then goes as follows:
+//!
+//! - Unmapping part of a range: `munmap_inner` splits the grant with `Grant::extract`, which
+//!   moves `base_offset` to the first page removed. `funmap` names exactly the removed pages,
+//!   always whole pages (`UnmapResult::size`), and the rest of the grant keeps its references.
+//! - Process exit: `AddrSpace::inner_drop` unmaps every grant and calls
+//!   `UnmapResult::unmap` for each, so every mapping still held gets its `funmap`.
+//! - `mremap` of a mapping: `AddrSpace::r#move` carries the grant, its frame references and
+//!   its file reference to the new address without a `funmap`. Shrinking it, or replacing a
+//!   mapping at a fixed destination, unmaps pages, and `syscall::fs::mremap` sends those
+//!   `funmap`s through `handle_notify_files`. It used to drop them, which leaked the buffer
+//!   and the description and lost shared write-back (fixed with #373).
+//! - `mremap` of the buffer by RedoxFS itself, when a mapping needs it to grow: the move
+//!   transfers the page-table entries, so the frames are the same ones the processes map.
+//! - `MAP_FIXED` over a mapping: `AddrSpace::mmap` unmaps it first and its caller sends the
+//!   `funmap`.
+//!
+//! So [`release_unused`] runs only after every process mapping has been unmapped and shot
+//! down. Even a spurious early release would cost only coherence (a later mapping would read
+//! the file into a new buffer), never memory safety.
 
 use alloc::collections::BTreeMap;
 use core::ops::Range;

@@ -210,6 +210,18 @@ exited, and a removal spanning several ranges left all but the first counted, a
 `userspace/redoxfs/src/fmap/tests.rs` cover release, write-back, multiple
 mappers and partial unmaps.
 
+Freeing a buffer never leaves a process mapping freed memory. Each mapping holds
+its own reference to every frame: shared mappings take `RefKind::Shared` in
+`Grant::borrow_fmap`, and private ones take copy-on-write references through
+`Grant::copy_mappings`. A frame is deallocated only when its last reference goes,
+after the TLB shootdown (`handle_free_action`). The kernel also sends `funmap`
+only after it has unmapped the process's pages and shot them down, whether the
+mapping goes through `munmap` (of all or part of it), process exit or `MAP_FIXED`
+replacement. `mremap` used to drop the `funmap`s for mappings that shrinking or
+a fixed destination removed, so their buffers and descriptions were never released
+and shared write-back was lost. It now sends them (`syscall::fs::mremap`). The
+`fmap` module documentation gives the code references.
+
 ## Mapping ranges stay inside user space
 
 User space ends at `USER_END_OFFSET` (2^47, `0x0000_8000_0000_0000`, on
